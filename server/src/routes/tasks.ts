@@ -785,11 +785,6 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     return;
   }
 
-  if (!["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)) {
-    res.status(409).json({ error: "Task cannot be marked merge-ready from current state" });
-    return;
-  }
-
   const active = activeSessions(task.id);
   if (active.length) {
     try {
