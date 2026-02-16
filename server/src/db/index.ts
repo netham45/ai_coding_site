@@ -12,3 +12,10 @@ export {
   isProjectDbError,
   upsertProjectConfig
 } from "./projectDb.js";
+export {
+  SPLIT_PERSISTENCE_PHASES,
+  getSplitPersistencePhase,
+  isCleanupPhaseEnabled,
+  resolveProjectDatabase
+} from "./splitPersistence.js";
+export type { SplitPersistenceBackend, SplitPersistenceIntent, SplitPersistencePhase } from "./splitPersistence.js";

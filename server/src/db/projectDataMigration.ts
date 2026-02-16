@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { ensureProjectDb, upsertProjectConfig } from "./projectDb.js";
+import { isCleanupPhaseEnabled } from "./splitPersistence.js";
 import { nowIso } from "../utils/time.js";
 
 const PROJECT_DATA_MIGRATION_VERSION = 1;
@@ -1640,7 +1641,7 @@ function shouldEnableChecksums(): boolean {
 }
 
 function shouldEnableCleanup(): boolean {
-  return process.env.PROJECT_DATA_MIGRATION_CLEANUP_LEGACY === "1";
+  return process.env.PROJECT_DATA_MIGRATION_CLEANUP_LEGACY === "1" || isCleanupPhaseEnabled();
 }
 
 export function runProjectDataMigrationBackfill(db: Database.Database): void {

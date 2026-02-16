@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import { db as appDb, isProjectDbError, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import {
   cloneLocalBaseToWorkspace,
@@ -88,15 +88,26 @@ function memberProjectsForUser(userId: string): ProjectRow[] {
     .all(userId) as ProjectRow[];
 }
 
-function getProjectDbForProject(project: ProjectRow): Database.Database {
-  return getProjectDb({ projectId: project.id, basePath: project.base_path });
+function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Database.Database {
+  return resolveProjectDatabase({
+    appDb,
+    projectId: project.id,
+    basePath: project.base_path,
+    intent
+  }).database;
 }
 
-function taskForUser(taskId: string, userId: string): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
+function taskForUser(
+  taskId: string,
+  userId: string,
+  intent: "read" | "write"
+): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
   const projects = memberProjectsForUser(userId);
   for (const project of projects) {
-    const projectDb = getProjectDbForProject(project);
-    const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+    const projectDb = projectDatabaseFor(project, intent);
+    const task = projectDb
+      .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?")
+      .get(taskId, project.id) as TaskRow | undefined;
     if (task) {
       return { task, project, projectDb };
     }
@@ -491,7 +502,7 @@ function setTaskStatus(
 }
 
 function getProjectAccessOrRespond(
-  params: { projectId: string; userId: string; notFoundMessage: string },
+  params: { projectId: string; userId: string; notFoundMessage: string; intent: "read" | "write" },
   res: any
 ): { project: ProjectRow; projectDb: Database.Database } | null {
   const project = projectForUser(params.projectId, params.userId);
@@ -502,7 +513,7 @@ function getProjectAccessOrRespond(
   try {
     return {
       project,
-      projectDb: getProjectDbForProject(project)
+      projectDb: projectDatabaseFor(project, params.intent)
     };
   } catch (error) {
     if (respondProjectDbError(res, error)) {
@@ -513,11 +524,11 @@ function getProjectAccessOrRespond(
 }
 
 function getTaskAccessOrRespond(
-  params: { taskId: string; userId: string; notFoundMessage: string },
+  params: { taskId: string; userId: string; notFoundMessage: string; intent: "read" | "write" },
   res: any
 ): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | null {
   try {
-    const scoped = taskForUser(params.taskId, params.userId);
+    const scoped = taskForUser(params.taskId, params.userId, params.intent);
     if (!scoped) {
       res.status(404).json({ error: params.notFoundMessage });
       return null;
@@ -541,7 +552,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   }
 
   const scopedProject = getProjectAccessOrRespond(
-    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found" },
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
     res
   );
   if (!scopedProject) return;
@@ -645,7 +656,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
 
 tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
   const scopedProject = getProjectAccessOrRespond(
-    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found" },
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
     res
   );
   if (!scopedProject) return;
@@ -659,7 +670,10 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -694,7 +708,10 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
     return;
   }
 
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -726,7 +743,10 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
   if (taskIsBlocked(projectDb, task.id)) {
@@ -756,7 +776,10 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
     return;
   }
 
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
 
@@ -776,7 +799,10 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/stop", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task } = scopedTask;
 
@@ -786,7 +812,10 @@ tasksRouter.post("/tasks/:taskId/stop", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
 
@@ -855,7 +884,10 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
@@ -891,7 +923,10 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/in-progress", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
   if (task.status === "waiting_input") {
@@ -920,7 +955,10 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
     return;
   }
 
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -950,7 +988,10 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
   if (project.clone_status !== "ready") {
@@ -1039,7 +1080,10 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
   if (task.status !== "merge_ready") {
@@ -1167,7 +1211,10 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/merge-records", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
   const mergeRecords = projectDb
@@ -1177,7 +1224,10 @@ tasksRouter.get("/tasks/:taskId/merge-records", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/terminal-token", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task } = scopedTask;
 
@@ -1190,7 +1240,10 @@ tasksRouter.get("/tasks/:taskId/terminal-token", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -1208,7 +1261,10 @@ tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -1270,7 +1326,10 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/ide/token", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -1290,7 +1349,10 @@ tasksRouter.post("/tasks/:taskId/ide/token", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/ide/stop", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -1319,7 +1381,10 @@ tasksRouter.post("/tasks/:taskId/ide/stop", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
@@ -1351,7 +1416,10 @@ tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
 });
 
 tasksRouter.all("/tasks/:taskId/ide/proxy*", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 

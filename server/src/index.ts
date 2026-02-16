@@ -3,7 +3,7 @@ import express from "express";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { db as appDb, ensureLocalUser, getProjectDb, isProjectDbError } from "./db/index.js";
+import { db as appDb, ensureLocalUser, resolveProjectDatabase } from "./db/index.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { projectsRouter } from "./routes/projects.js";
 import { settingsRouter } from "./routes/settings.js";
@@ -73,17 +73,16 @@ startIdeHeartbeat((taskId) => {
     .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
     .all() as Array<{ id: string; base_path: string }>;
   for (const project of projects) {
-    try {
-      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
-      projectDb.prepare(
-        `UPDATE ide_instances
-         SET status = 'failed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?
-         WHERE task_id = ? AND status IN ('starting','running')`
-      ).run(now, now, taskId);
-    } catch (error) {
-      if (!isProjectDbError(error)) {
-        throw error;
-      }
-    }
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    scoped.database.prepare(
+      `UPDATE ide_instances
+       SET status = 'failed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?
+       WHERE task_id = ? AND status IN ('starting','running')`
+    ).run(now, now, taskId);
   }
 });

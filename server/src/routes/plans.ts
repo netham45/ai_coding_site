@@ -3,7 +3,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { Router } from "express";
 import { z } from "zod";
-import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import { db as appDb, isProjectDbError, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
@@ -121,18 +121,26 @@ function memberProjectsForUser(userId: string): ProjectRow[] {
     .all(userId) as ProjectRow[];
 }
 
-function getProjectDbForProject(project: ProjectRow): Database.Database {
-  return getProjectDb({ projectId: project.id, basePath: project.base_path });
+function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Database.Database {
+  return resolveProjectDatabase({
+    appDb,
+    projectId: project.id,
+    basePath: project.base_path,
+    intent
+  }).database;
 }
 
 function planForUser(
   planTaskId: string,
-  userId: string
+  userId: string,
+  intent: "read" | "write"
 ): { plan: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
   const projects = memberProjectsForUser(userId);
   for (const project of projects) {
-    const projectDb = getProjectDbForProject(project);
-    const plan = projectDb.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(planTaskId) as TaskRow | undefined;
+    const projectDb = projectDatabaseFor(project, intent);
+    const plan = projectDb
+      .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ? AND mode = 'plan'")
+      .get(planTaskId, project.id) as TaskRow | undefined;
     if (plan) {
       return { plan, project, projectDb };
     }
@@ -220,7 +228,7 @@ function getLatestSessionOutput(projectDb: Database.Database, taskId: string): s
 }
 
 function getProjectAccessOrRespond(
-  params: { projectId: string; userId: string; notFoundMessage: string },
+  params: { projectId: string; userId: string; notFoundMessage: string; intent: "read" | "write" },
   res: any
 ): { project: ProjectRow; projectDb: Database.Database } | null {
   const project = projectForUser(params.projectId, params.userId);
@@ -231,7 +239,7 @@ function getProjectAccessOrRespond(
   try {
     return {
       project,
-      projectDb: getProjectDbForProject(project)
+      projectDb: projectDatabaseFor(project, params.intent)
     };
   } catch (error) {
     if (respondProjectDbError(res, error)) {
@@ -242,11 +250,11 @@ function getProjectAccessOrRespond(
 }
 
 function getPlanAccessOrRespond(
-  params: { planId: string; userId: string; notFoundMessage: string },
+  params: { planId: string; userId: string; notFoundMessage: string; intent: "read" | "write" },
   res: any
 ): { plan: TaskRow; project: ProjectRow; projectDb: Database.Database } | null {
   try {
-    const scoped = planForUser(params.planId, params.userId);
+    const scoped = planForUser(params.planId, params.userId, params.intent);
     if (!scoped) {
       res.status(404).json({ error: params.notFoundMessage });
       return null;
@@ -270,7 +278,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   }
 
   const scopedProject = getProjectAccessOrRespond(
-    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found" },
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
     res
   );
   if (!scopedProject) return;
@@ -337,7 +345,10 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
 });
 
 plansRouter.get("/plans/:planId", (req, res) => {
-  const scopedPlan = getPlanAccessOrRespond({ planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found" }, res);
+  const scopedPlan = getPlanAccessOrRespond(
+    { planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found", intent: "read" },
+    res
+  );
   if (!scopedPlan) return;
   const { plan, projectDb } = scopedPlan;
 
@@ -422,7 +433,10 @@ plansRouter.get("/plans/:planId", (req, res) => {
 });
 
 plansRouter.post("/plans/:planId/extract", (req, res) => {
-  const scopedPlan = getPlanAccessOrRespond({ planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found" }, res);
+  const scopedPlan = getPlanAccessOrRespond(
+    { planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found", intent: "write" },
+    res
+  );
   if (!scopedPlan) return;
   const { plan, projectDb } = scopedPlan;
 
@@ -495,7 +509,10 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
     return;
   }
 
-  const scopedPlan = getPlanAccessOrRespond({ planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found" }, res);
+  const scopedPlan = getPlanAccessOrRespond(
+    { planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found", intent: "write" },
+    res
+  );
   if (!scopedPlan) return;
   const { plan, project, projectDb } = scopedPlan;
 
@@ -548,7 +565,10 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     return;
   }
 
-  const scopedPlan = getPlanAccessOrRespond({ planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found" }, res);
+  const scopedPlan = getPlanAccessOrRespond(
+    { planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found", intent: "write" },
+    res
+  );
   if (!scopedPlan) return;
   const { plan, project, projectDb } = scopedPlan;
 
