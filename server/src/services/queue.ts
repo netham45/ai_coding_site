@@ -1,4 +1,4 @@
-import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { startTaskRuntime } from "./runtime.js";
 
 const QUEUE_INTERVAL_MS = 1500;
@@ -18,41 +18,41 @@ async function processQueuedTasksPass(): Promise<void> {
   const candidates: Array<{ projectId: string; basePath: string; task: QueuedTaskRow }> = [];
 
   for (const project of projects) {
-    try {
-      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
-      const rows = projectDb
-        .prepare(
-          `SELECT t.id, t.created_by_user_id, t.created_at
-           FROM tasks t
-           WHERE t.status = 'queued'
-             AND NOT EXISTS (
-               SELECT 1
-               FROM task_dependencies td
-               JOIN tasks dep ON dep.id = td.dependency_task_id
-               WHERE td.task_id = t.id
-                 AND dep.status != 'merged'
-             )
-             AND NOT EXISTS (
-               SELECT 1
-               FROM task_sessions ts
-               WHERE ts.task_id = t.id
-                 AND ts.status IN ('starting','running','waiting_input')
-             )
-           ORDER BY t.created_at ASC
-           LIMIT ?`
-        )
-        .all(MAX_TASKS_PER_PASS) as QueuedTaskRow[];
-      for (const row of rows) {
-        candidates.push({
-          projectId: project.id,
-          basePath: project.base_path,
-          task: row
-        });
-      }
-    } catch (error) {
-      if (!isProjectDbError(error)) {
-        throw error;
-      }
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    const rows = scoped.database
+      .prepare(
+        `SELECT t.id, t.created_by_user_id, t.created_at
+         FROM tasks t
+         WHERE t.project_id = ?
+           AND t.status = 'queued'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM task_dependencies td
+             JOIN tasks dep ON dep.id = td.dependency_task_id
+             WHERE td.task_id = t.id
+               AND dep.status != 'merged'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM task_sessions ts
+             WHERE ts.task_id = t.id
+               AND ts.status IN ('starting','running','waiting_input')
+           )
+         ORDER BY t.created_at ASC
+         LIMIT ?`
+      )
+      .all(project.id, MAX_TASKS_PER_PASS) as QueuedTaskRow[];
+    for (const row of rows) {
+      candidates.push({
+        projectId: project.id,
+        basePath: project.base_path,
+        task: row
+      });
     }
   }
 

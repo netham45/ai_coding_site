@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import { db as appDb, resolveProjectDatabase, type SplitPersistenceBackend } from "../db/index.js";
 import type { AppProjectRow, ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -52,11 +52,13 @@ export type RuntimeTaskContext = {
   projectId: string;
   basePath?: string;
   projectDb?: Database.Database;
+  backend?: SplitPersistenceBackend;
 };
 
 type RuntimeProjectContext = {
   project: AppProjectRow;
   projectDb: Database.Database;
+  backend: SplitPersistenceBackend;
 };
 
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
@@ -150,10 +152,68 @@ function loadProjectConfig(projectDb: Database.Database, projectId: string) {
   };
 }
 
-function buildProjectWithConfig(project: AppProjectRow, projectDb: Database.Database): ProjectRow {
+function tableHasColumn(db: Database.Database, table: string, column: string): boolean {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return columns.some((item) => item.name === column);
+}
+
+function loadMonolithProjectConfig(projectId: string): {
+  project_prompt: string;
+  project_rules: string;
+  coding_standard: string;
+  coding_standard_other: string;
+  project_other: string;
+} {
+  const hasLegacyColumns =
+    tableHasColumn(appDb, "projects", "project_prompt") &&
+    tableHasColumn(appDb, "projects", "project_rules") &&
+    tableHasColumn(appDb, "projects", "coding_standard") &&
+    tableHasColumn(appDb, "projects", "coding_standard_other") &&
+    tableHasColumn(appDb, "projects", "project_other");
+  if (!hasLegacyColumns) {
+    return {
+      project_prompt: "",
+      project_rules: "",
+      coding_standard: "",
+      coding_standard_other: "",
+      project_other: ""
+    };
+  }
+
+  const row = appDb
+    .prepare(
+      `SELECT
+         project_prompt,
+         project_rules,
+         coding_standard,
+         coding_standard_other,
+         project_other
+       FROM projects
+       WHERE id = ?`
+    )
+    .get(projectId) as
+    | {
+        project_prompt: string;
+        project_rules: string;
+        coding_standard: string;
+        coding_standard_other: string;
+        project_other: string;
+      }
+    | undefined;
+
+  return {
+    project_prompt: row?.project_prompt ?? "",
+    project_rules: row?.project_rules ?? "",
+    coding_standard: row?.coding_standard ?? "",
+    coding_standard_other: row?.coding_standard_other ?? "",
+    project_other: row?.project_other ?? ""
+  };
+}
+
+function buildProjectWithConfig(project: AppProjectRow, projectDb: Database.Database, backend: SplitPersistenceBackend): ProjectRow {
   return {
     ...project,
-    ...loadProjectConfig(projectDb, project.id)
+    ...(backend === "project" ? loadProjectConfig(projectDb, project.id) : loadMonolithProjectConfig(project.id))
   };
 }
 
@@ -161,11 +221,15 @@ function contextHintFromProjectContext(context: RuntimeProjectContext): RuntimeT
   return {
     projectId: context.project.id,
     basePath: context.project.base_path,
-    projectDb: context.projectDb
+    projectDb: context.projectDb,
+    backend: context.backend
   };
 }
 
-function getTask(projectDb: Database.Database, taskId: string): TaskRow | undefined {
+function getTask(projectDb: Database.Database, taskId: string, projectId?: string): TaskRow | undefined {
+  if (projectId) {
+    return projectDb.prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?").get(taskId, projectId) as TaskRow | undefined;
+  }
   return projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
 }
 
@@ -183,8 +247,20 @@ function resolveTaskProjectContext(taskId: string, context?: RuntimeTaskContext)
       throw new Error("Project not found");
     }
     const basePath = context.basePath ?? project.base_path;
-    const projectDb = context.projectDb ?? getProjectDb({ projectId: project.id, basePath });
-    const task = getTask(projectDb, taskId);
+    const scoped =
+      context.projectDb
+        ? {
+            database: context.projectDb,
+            backend: context.backend ?? (context.projectDb === appDb ? "monolith" : ("project" as SplitPersistenceBackend))
+          }
+        : resolveProjectDatabase({
+            appDb,
+            projectId: project.id,
+            basePath,
+            intent: "write"
+          });
+    const projectDb = scoped.database;
+    const task = getTask(projectDb, taskId, project.id);
     if (!task) {
       throw new Error("Task not found");
     }
@@ -193,21 +269,22 @@ function resolveTaskProjectContext(taskId: string, context?: RuntimeTaskContext)
         ...project,
         base_path: basePath
       },
-      projectDb
+      projectDb,
+      backend: scoped.backend
     };
   }
 
   for (const project of listRuntimeProjects()) {
-    try {
-      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
-      const task = getTask(projectDb, taskId);
-      if (task) {
-        return { project, projectDb };
-      }
-    } catch (error) {
-      if (!isProjectDbError(error)) {
-        throw error;
-      }
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    const projectDb = scoped.database;
+    const task = getTask(projectDb, taskId, project.id);
+    if (task) {
+      return { project, projectDb, backend: scoped.backend };
     }
   }
 
@@ -217,14 +294,13 @@ function resolveTaskProjectContext(taskId: string, context?: RuntimeTaskContext)
 function listAvailableProjectContexts(): RuntimeProjectContext[] {
   const contexts: RuntimeProjectContext[] = [];
   for (const project of listRuntimeProjects()) {
-    try {
-      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
-      contexts.push({ project, projectDb });
-    } catch (error) {
-      if (!isProjectDbError(error)) {
-        throw error;
-      }
-    }
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    contexts.push({ project, projectDb: scoped.database, backend: scoped.backend });
   }
   return contexts;
 }
@@ -534,7 +610,7 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
     return;
   }
 
-  const project = buildProjectWithConfig(taskContext.project, taskContext.projectDb);
+  const project = buildProjectWithConfig(taskContext.project, taskContext.projectDb, taskContext.backend);
   const topology = resolveTaskGitTopology(taskContext.projectDb, task, project);
 
   const actorUserId = task.created_by_user_id;
@@ -708,7 +784,7 @@ function buildRuntimeEnv(): { env: Record<string, string>; cleanup?: () => void 
 export async function startTaskRuntime(taskId: string, actorUserId: string, context?: RuntimeTaskContext): Promise<void> {
   const taskContext = resolveTaskProjectContext(taskId, context);
   const projectDb = taskContext.projectDb;
-  const project = buildProjectWithConfig(taskContext.project, projectDb);
+  const project = buildProjectWithConfig(taskContext.project, projectDb, taskContext.backend);
   const task = getTask(projectDb, taskId);
   if (!task) {
     throw new Error("Task not found");

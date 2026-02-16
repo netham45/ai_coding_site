@@ -2,7 +2,7 @@ import type { Server as HttpServer } from "node:http";
 import { URL } from "node:url";
 import type Database from "better-sqlite3";
 import { WebSocketServer, type WebSocket } from "ws";
-import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import { capturePane, getPaneCursorPosition, hasSession, sendRawInput } from "../services/tmux.js";
 import { verifyTerminalToken } from "../services/terminalToken.js";
@@ -48,20 +48,21 @@ function taskScopeForUser(taskId: string, userId: string): TaskScope | undefined
     .all(userId) as Array<{ id: string; base_path: string }>;
 
   for (const project of projects) {
-    try {
-      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
-      const row = projectDb.prepare("SELECT id FROM tasks WHERE id = ?").get(taskId) as { id: string } | undefined;
-      if (row?.id) {
-        return {
-          projectId: project.id,
-          basePath: project.base_path,
-          projectDb
-        };
-      }
-    } catch (error) {
-      if (!isProjectDbError(error)) {
-        throw error;
-      }
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    const row = scoped.database
+      .prepare("SELECT id FROM tasks WHERE id = ? AND project_id = ?")
+      .get(taskId, project.id) as { id: string } | undefined;
+    if (row?.id) {
+      return {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb: scoped.database
+      };
     }
   }
 
