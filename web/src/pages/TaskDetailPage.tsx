@@ -76,6 +76,7 @@ export function TaskDetailPage() {
   const [syncingMain, setSyncingMain] = useState(false);
   const [mergingTask, setMergingTask] = useState(false);
   const [markingReady, setMarkingReady] = useState(false);
+  const [rerunningTask, setRerunningTask] = useState(false);
   const [cancellingTask, setCancellingTask] = useState(false);
   const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
 
@@ -442,6 +443,41 @@ export function TaskDetailPage() {
     }
   }
 
+  async function rerunTask() {
+    if (!taskId) return;
+    const confirmed = window.confirm(
+      "Re-run this task?\n\nThis will reset this task workspace repo to the latest base state and restart the task.\nAll unpushed task progress will be permanently lost."
+    );
+    if (!confirmed) return;
+
+    setRerunningTask(true);
+    try {
+      await api<{ task: Task }>(`/api/tasks/${taskId}/rerun`, { method: "POST" });
+      setIdeLaunchUrl(null);
+      try {
+        await api(`/api/tasks/${taskId}/start`, { method: "POST" });
+      } catch {
+        // best-effort restart
+      }
+      try {
+        const ideResponse = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
+        setIde(ideResponse.ide);
+        setIdeLaunchUrl(ideResponse.launchUrl);
+      } catch {
+        // best-effort restart
+      }
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      toast({ status: "success", title: "Task re-run started" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Re-run failed", description: error.message });
+    } finally {
+      setRerunningTask(false);
+    }
+  }
+
   if (!task) {
     return <Text>Loading task...</Text>;
   }
@@ -571,6 +607,9 @@ export function TaskDetailPage() {
                     </Button>
                     <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
                       Merge Task
+                    </Button>
+                    <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
+                      Re-run Task
                     </Button>
                     <Button
                       colorScheme="red"
