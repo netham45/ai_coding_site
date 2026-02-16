@@ -17,6 +17,7 @@ type Runtime = {
 };
 
 const runtimes = new Map<string, Runtime>();
+const disabledIdeExtensions = ["GitHub.copilot", "GitHub.copilot-chat"];
 
 async function commandExists(command: string): Promise<boolean> {
   try {
@@ -273,6 +274,7 @@ export async function startIdeSession(params: { taskId: string; workspacePath: s
       "--disable-workspace-trust",
       "--bind-addr",
       `127.0.0.1:${port}`,
+      ...disabledIdeExtensions.flatMap((extensionId) => ["--disable-extension", extensionId]),
       params.workspacePath
     ];
   } else if (await commandExists("openvscode-server")) {
@@ -284,6 +286,7 @@ export async function startIdeSession(params: { taskId: string; workspacePath: s
       "--port",
       String(port),
       "--without-connection-token",
+      ...disabledIdeExtensions.flatMap((extensionId) => ["--disable-extension", extensionId]),
       params.workspacePath
     ];
   } else {
