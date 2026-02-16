@@ -6,6 +6,10 @@ export type Project = {
   defaultBranch: string;
   basePath: string;
   projectPrompt: string;
+  projectRules: string;
+  codingStandard: string;
+  codingStandardOther: string;
+  projectOther: string;
   cloneStatus: "pending" | "cloning" | "ready" | "failed";
   cloneError: string | null;
   createdByUserId: string;

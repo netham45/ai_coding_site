@@ -16,6 +16,7 @@ import {
 import { ideSessionRunning, ideSessionTarget, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
+import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -308,7 +309,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const now = nowIso();
   const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
-  const effectivePrompt = `${project.project_prompt}\n\n${input.taskPrompt}`;
+  const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
 
   let baseCommitSha: string;
   try {

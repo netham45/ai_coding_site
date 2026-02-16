@@ -19,12 +19,20 @@ const createSchema = z.object({
   name: z.string().min(2).max(120),
   repoUrl: z.string().min(1),
   projectPrompt: z.string().max(8000).default(""),
+  projectRules: z.string().max(12000).default(""),
+  codingStandard: z.string().max(200).default(""),
+  codingStandardOther: z.string().max(4000).default(""),
+  projectOther: z.string().max(12000).default(""),
   defaultBranch: z.string().min(1).max(120).default("main")
 });
 
 const patchSchema = z.object({
   name: z.string().min(2).max(120).optional(),
-  projectPrompt: z.string().max(8000).optional()
+  projectPrompt: z.string().max(8000).optional(),
+  projectRules: z.string().max(12000).optional(),
+  codingStandard: z.string().max(200).optional(),
+  codingStandardOther: z.string().max(4000).optional(),
+  projectOther: z.string().max(12000).optional()
 });
 
 function serializeProject(project: ProjectRow) {
@@ -36,6 +44,10 @@ function serializeProject(project: ProjectRow) {
     defaultBranch: project.default_branch,
     basePath: project.base_path,
     projectPrompt: project.project_prompt,
+    projectRules: project.project_rules,
+    codingStandard: project.coding_standard,
+    codingStandardOther: project.coding_standard_other,
+    projectOther: project.project_other,
     cloneStatus: project.clone_status,
     cloneError: project.clone_error,
     createdByUserId: project.created_by_user_id,
@@ -185,8 +197,9 @@ projectsRouter.post("/", async (req, res) => {
   db.prepare(
     `INSERT INTO projects (
       id, name, slug, repo_url, default_branch, base_path,
-      project_prompt, clone_status, clone_error, created_by_user_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)`
+      project_prompt, project_rules, coding_standard, coding_standard_other, project_other,
+      clone_status, clone_error, created_by_user_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)`
   ).run(
     id,
     input.name,
@@ -195,6 +208,10 @@ projectsRouter.post("/", async (req, res) => {
     input.defaultBranch,
     basePath,
     input.projectPrompt,
+    input.projectRules,
+    input.codingStandard,
+    input.codingStandardOther,
+    input.projectOther,
     req.user.id,
     now,
     now
@@ -274,10 +291,22 @@ projectsRouter.patch("/:projectId", (req, res) => {
   const updates = parsed.data;
   const nextName = updates.name ?? existing.name;
   const nextPrompt = updates.projectPrompt ?? existing.project_prompt;
+  const nextRules = updates.projectRules ?? existing.project_rules;
+  const nextCodingStandard = updates.codingStandard ?? existing.coding_standard;
+  const nextCodingStandardOther = updates.codingStandardOther ?? existing.coding_standard_other;
+  const nextOther = updates.projectOther ?? existing.project_other;
 
-  db.prepare("UPDATE projects SET name = ?, project_prompt = ?, updated_at = ? WHERE id = ?").run(
+  db.prepare(
+    `UPDATE projects
+     SET name = ?, project_prompt = ?, project_rules = ?, coding_standard = ?, coding_standard_other = ?, project_other = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(
     nextName,
     nextPrompt,
+    nextRules,
+    nextCodingStandard,
+    nextCodingStandardOther,
+    nextOther,
     nowIso(),
     existing.id
   );

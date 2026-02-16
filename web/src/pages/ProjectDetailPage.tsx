@@ -8,6 +8,7 @@ import {
   Heading,
   Input,
   Link,
+  Select,
   Stack,
   Tab,
   TabList,
@@ -34,11 +35,30 @@ type CreateTaskForm = {
   aiCommand: string;
 };
 
+type ProjectInstructionsForm = {
+  projectPrompt: string;
+  projectRules: string;
+  codingStandard: string;
+  codingStandardOther: string;
+  projectOther: string;
+};
+
 const initialForm: CreateTaskForm = {
   title: "",
   taskPrompt: "",
   aiCommand: "codex --yolo {prompt}"
 };
+
+const CODING_STANDARD_OPTIONS = [
+  { value: "", label: "None selected" },
+  { value: "Airbnb JavaScript Style Guide", label: "Airbnb JavaScript Style Guide" },
+  { value: "Google JavaScript Style Guide", label: "Google JavaScript Style Guide" },
+  { value: "PEP 8", label: "PEP 8 (Python)" },
+  { value: "PSR-12", label: "PSR-12 (PHP)" },
+  { value: "Standard Go Formatting", label: "Standard Go Formatting (gofmt)" },
+  { value: "Rust Style Guide", label: "Rust Style Guide" },
+  { value: "Other", label: "Other" }
+];
 
 export function ProjectDetailPage() {
   const { projectId } = useParams();
@@ -48,8 +68,16 @@ export function ProjectDetailPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [form, setForm] = useState<CreateTaskForm>(initialForm);
+  const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
+    projectPrompt: "",
+    projectRules: "",
+    codingStandard: "",
+    codingStandardOther: "",
+    projectOther: ""
+  });
   const [loading, setLoading] = useState(false);
-  const [activePane, setActivePane] = useState<"tasks" | "ide">("tasks");
+  const [savingProjectInstructions, setSavingProjectInstructions] = useState(false);
+  const [activePane, setActivePane] = useState<"tasks" | "project" | "ide">("tasks");
   const [projectIdeLaunchUrl, setProjectIdeLaunchUrl] = useState<string | null>(null);
   const [startingProjectIde, setStartingProjectIde] = useState(false);
   const [projectIdeStartFailed, setProjectIdeStartFailed] = useState(false);
@@ -68,6 +96,13 @@ export function ProjectDetailPage() {
       api<TasksResponse>(`/api/projects/${projectId}/tasks`)
     ]);
     setProject(projectRes.project);
+    setInstructionsForm({
+      projectPrompt: projectRes.project.projectPrompt ?? "",
+      projectRules: projectRes.project.projectRules ?? "",
+      codingStandard: projectRes.project.codingStandard ?? "",
+      codingStandardOther: projectRes.project.codingStandardOther ?? "",
+      projectOther: projectRes.project.projectOther ?? ""
+    });
     setTasks(tasksRes.tasks);
   }
 
@@ -143,6 +178,38 @@ export function ProjectDetailPage() {
     }
   }
 
+  async function onSaveProjectInstructions(event: React.FormEvent) {
+    event.preventDefault();
+    if (!projectId) return;
+
+    setSavingProjectInstructions(true);
+    try {
+      const response = await api<{ project: Project }>(`/api/projects/${projectId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          projectPrompt: instructionsForm.projectPrompt,
+          projectRules: instructionsForm.projectRules,
+          codingStandard: instructionsForm.codingStandard,
+          codingStandardOther: instructionsForm.codingStandardOther,
+          projectOther: instructionsForm.projectOther
+        })
+      });
+      setProject(response.project);
+      setInstructionsForm({
+        projectPrompt: response.project.projectPrompt ?? "",
+        projectRules: response.project.projectRules ?? "",
+        codingStandard: response.project.codingStandard ?? "",
+        codingStandardOther: response.project.codingStandardOther ?? "",
+        projectOther: response.project.projectOther ?? ""
+      });
+      toast({ status: "success", title: "Project instructions updated" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Failed to update project instructions", description: error.message });
+    } finally {
+      setSavingProjectInstructions(false);
+    }
+  }
+
   if (!project) {
     return <Text>Loading project...</Text>;
   }
@@ -162,9 +229,14 @@ export function ProjectDetailPage() {
           <Text color="gray.600">{project.repoUrl}</Text>
         </Box>
 
-        <Tabs index={activePane === "tasks" ? 0 : 1} onChange={(index) => setActivePane(index === 0 ? "tasks" : "ide")} colorScheme="teal">
+        <Tabs
+          index={activePane === "tasks" ? 0 : activePane === "project" ? 1 : 2}
+          onChange={(index) => setActivePane(index === 0 ? "tasks" : index === 1 ? "project" : "ide")}
+          colorScheme="teal"
+        >
           <TabList>
             <Tab>Tasks</Tab>
+            <Tab>Project Prompt</Tab>
             <Tab>IDE</Tab>
           </TabList>
           <TabPanels>
@@ -193,6 +265,65 @@ export function ProjectDetailPage() {
                 </Grid>
                 <Button mt={4} colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
                   Create Task
+                </Button>
+              </form>
+            </TabPanel>
+            <TabPanel px={0} pt={4}>
+              <Heading size="md" mb={2}>
+                Project Prompt Builder
+              </Heading>
+              <Text color="gray.600" mb={4}>
+                These fields are combined with each new task prompt to generate the full runtime prompt.
+              </Text>
+              <form onSubmit={onSaveProjectInstructions}>
+                <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={4}>
+                  <FormControl gridColumn={{ md: "1 / span 2" }}>
+                    <FormLabel>Prompt</FormLabel>
+                    <Textarea
+                      rows={4}
+                      value={instructionsForm.projectPrompt}
+                      onChange={(e) => setInstructionsForm((x) => ({ ...x, projectPrompt: e.target.value }))}
+                    />
+                  </FormControl>
+                  <FormControl gridColumn={{ md: "1 / span 2" }}>
+                    <FormLabel>Rules</FormLabel>
+                    <Textarea
+                      rows={4}
+                      value={instructionsForm.projectRules}
+                      onChange={(e) => setInstructionsForm((x) => ({ ...x, projectRules: e.target.value }))}
+                    />
+                  </FormControl>
+                  <FormControl>
+                    <FormLabel>Coding Standard</FormLabel>
+                    <Select
+                      value={instructionsForm.codingStandard}
+                      onChange={(e) => setInstructionsForm((x) => ({ ...x, codingStandard: e.target.value }))}
+                    >
+                      {CODING_STANDARD_OPTIONS.map((option) => (
+                        <option key={option.value || "none"} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <FormControl isDisabled={instructionsForm.codingStandard !== "Other"}>
+                    <FormLabel>Coding Standard (Other)</FormLabel>
+                    <Input
+                      value={instructionsForm.codingStandardOther}
+                      onChange={(e) => setInstructionsForm((x) => ({ ...x, codingStandardOther: e.target.value }))}
+                    />
+                  </FormControl>
+                  <FormControl gridColumn={{ md: "1 / span 2" }}>
+                    <FormLabel>Other</FormLabel>
+                    <Textarea
+                      rows={4}
+                      value={instructionsForm.projectOther}
+                      onChange={(e) => setInstructionsForm((x) => ({ ...x, projectOther: e.target.value }))}
+                    />
+                  </FormControl>
+                </Grid>
+                <Button mt={4} colorScheme="teal" type="submit" isLoading={savingProjectInstructions}>
+                  Save Project Prompt
                 </Button>
               </form>
             </TabPanel>

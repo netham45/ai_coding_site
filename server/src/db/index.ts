@@ -25,6 +25,14 @@ function ensureColumn(table: string, column: string, alterSql: string): void {
 }
 
 ensureColumn("task_sessions", "last_output", "ALTER TABLE task_sessions ADD COLUMN last_output TEXT NOT NULL DEFAULT ''");
+ensureColumn("projects", "project_rules", "ALTER TABLE projects ADD COLUMN project_rules TEXT NOT NULL DEFAULT ''");
+ensureColumn("projects", "coding_standard", "ALTER TABLE projects ADD COLUMN coding_standard TEXT NOT NULL DEFAULT ''");
+ensureColumn(
+  "projects",
+  "coding_standard_other",
+  "ALTER TABLE projects ADD COLUMN coding_standard_other TEXT NOT NULL DEFAULT ''"
+);
+ensureColumn("projects", "project_other", "ALTER TABLE projects ADD COLUMN project_other TEXT NOT NULL DEFAULT ''");
 
 export function ensureLocalUser(): string {
   const row = db.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
