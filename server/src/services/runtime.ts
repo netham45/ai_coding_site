@@ -26,7 +26,6 @@ import {
   ensureTmuxAvailable,
   getPaneId,
   hasSession,
-  killSession,
   paneExitStatus,
   sendInput
 } from "./tmux.js";
@@ -548,10 +547,6 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
 
   const existingSessions = getActiveSessions(taskId);
   for (const existing of existingSessions) {
-    const alive = await hasSession(existing.tmux_socket_path, existing.tmux_session_name);
-    if (alive) {
-      await killSession(existing.tmux_socket_path, existing.tmux_session_name);
-    }
     db.prepare(
       "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_new_start') WHERE id = ?"
     ).run(nowIso(), nowIso(), existing.id);
@@ -695,7 +690,6 @@ export async function stopTaskRuntime(taskId: string, actorUserId: string): Prom
     // keep previous buffer
   }
 
-  await killSession(session.tmux_socket_path, session.tmux_session_name);
   db.prepare("UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(
     nowIso(),
     nowIso(),
