@@ -151,7 +151,7 @@ export function TaskDetailPage() {
       const runtimeActive = !!session && ["starting", "running", "waiting_input"].includes(session.status);
       const ideActive = !!ide && ["starting", "running"].includes(ide.status);
 
-      if (!runtimeActive && !task.isBlocked && !["merged", "cancelled", "failed"].includes(task.status)) {
+      if (!runtimeActive && !task.isBlocked && !["merge_ready", "merged", "cancelled", "failed"].includes(task.status)) {
         try {
           await api(`/api/tasks/${taskId}/start`, { method: "POST" });
           shouldReload = true;

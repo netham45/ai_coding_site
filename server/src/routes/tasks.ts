@@ -703,6 +703,16 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     return;
   }
 
+  const active = activeSessions(task.id);
+  if (active.length) {
+    try {
+      await stopTaskRuntime(task.id, req.user.id);
+    } catch (error: any) {
+      res.status(409).json({ error: String(error?.message ?? "Failed to stop active runtime before marking merge-ready") });
+      return;
+    }
+  }
+
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
     status = await getWorkspaceGitStatus(task.workspace_path);

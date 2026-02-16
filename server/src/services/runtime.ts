@@ -115,10 +115,8 @@ function transitionTaskIfNeeded(params: {
   if (!row || row.status === params.toStatus) {
     return;
   }
-  if (["merged", "cancelled", "merge_ready"].includes(row.status)) {
-    return;
-  }
-  if (params.toStatus === "waiting_input" && row.status === "queued") {
+  const fromRuntimeActiveState = row.status === "in_progress" || row.status === "waiting_input";
+  if (!fromRuntimeActiveState) {
     return;
   }
   db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(params.toStatus, nowIso(), params.taskId);
@@ -201,7 +199,17 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
     ) VALUES (?, ?, ?, ?, NULL, ?, ?, 'starting', ?, NULL, NULL, '', NULL, NULL)`
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
-  transitionTaskIfNeeded({ taskId: task.id, toStatus: "in_progress", reason: "runtime_started", actorUserId });
+  const latestTask = getTask(task.id);
+  if (latestTask && latestTask.status !== "in_progress") {
+    db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
+    insertTransition({
+      taskId: task.id,
+      fromStatus: latestTask.status,
+      toStatus: "in_progress",
+      reason: "runtime_started",
+      actorUserId
+    });
+  }
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
