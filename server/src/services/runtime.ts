@@ -115,7 +115,10 @@ function transitionTaskIfNeeded(params: {
   if (!row || row.status === params.toStatus) {
     return;
   }
-  if (params.toStatus === "waiting_input" && ["merged", "queued", "cancelled"].includes(row.status)) {
+  if (["merged", "cancelled", "merge_ready"].includes(row.status)) {
+    return;
+  }
+  if (params.toStatus === "waiting_input" && row.status === "queued") {
     return;
   }
   db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(params.toStatus, nowIso(), params.taskId);
