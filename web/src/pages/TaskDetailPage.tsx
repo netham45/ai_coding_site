@@ -166,6 +166,16 @@ export function TaskDetailPage() {
   }, [task?.projectId]);
 
   useEffect(() => {
+    const interval = setInterval(() => {
+      loadTask().catch((error: Error) => {
+        console.error("Failed to poll task", error);
+      });
+    }, 3000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entityId]);
+
+  useEffect(() => {
     if (!task) return;
     const nextTitle = projectName ? `${projectName} - ${task.title}` : task.title;
     document.title = nextTitle;
