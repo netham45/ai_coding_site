@@ -29,12 +29,67 @@ function configureSqlite(db: Database.Database): void {
   db.pragma("busy_timeout = 5000");
 }
 
-function ensureColumn(db: Database.Database, table: string, column: string, alterSql: string): void {
+function tableColumns(db: Database.Database, table: string): string[] {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  if (!cols.some((col) => col.name === column)) {
+  return cols.map((col) => col.name);
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, alterSql: string): void {
+  if (!tableColumns(db, table).includes(column)) {
     db.exec(alterSql);
   }
 }
+
+function migrateProjectsToGlobalMetadataOnly(db: Database.Database): void {
+  const columns = tableColumns(db, "projects");
+  const legacyColumns = ["project_prompt", "project_rules", "coding_standard", "coding_standard_other", "project_other"];
+  if (!legacyColumns.some((column) => columns.includes(column))) {
+    return;
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    db.exec(`
+      CREATE TABLE projects_new (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE NOT NULL,
+        repo_url TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        base_path TEXT NOT NULL,
+        clone_status TEXT NOT NULL CHECK (clone_status IN ('pending','cloning','ready','failed')),
+        clone_error TEXT,
+        created_by_user_id TEXT NOT NULL REFERENCES users(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    db.exec(`
+      INSERT INTO projects_new (
+        id, name, slug, repo_url, default_branch, base_path,
+        clone_status, clone_error, created_by_user_id, created_at, updated_at
+      )
+      SELECT
+        id, name, slug, repo_url, default_branch, base_path,
+        clone_status, clone_error, created_by_user_id, created_at, updated_at
+      FROM projects
+    `);
+    db.exec("DROP TABLE projects");
+    db.exec("ALTER TABLE projects_new RENAME TO projects");
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+
+  db.exec("CREATE INDEX IF NOT EXISTS idx_projects_created_by_user_id ON projects(created_by_user_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_projects_clone_status ON projects(clone_status)");
+}
+
+migrateProjectsToGlobalMetadataOnly(appDb);
 
 function ensureProjectDbSchema(db: Database.Database): void {
   db.exec(projectBaselineMigration);
