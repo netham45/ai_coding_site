@@ -13,7 +13,7 @@ import {
   mergeTaskWorkspaceIntoBase,
   pullMainIntoTaskWorkspace
 } from "../services/git.js";
-import { ideSessionRunning, ideSessionTarget, startIdeSession, stopIdeSession } from "../services/ide.js";
+import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -166,11 +166,36 @@ function createIdeToken(): string {
   return randomBytes(24).toString("hex");
 }
 
-function issueIdeLaunchUrl(taskId: string, ideId: string, folderPath?: string): string {
+function issueIdeLaunchUrl(params: { taskId: string; ideId: string; folderPath?: string; workspacePath?: string }): string {
   const rawToken = createIdeToken();
-  db.prepare("UPDATE ide_instances SET access_token_hash = ?, last_heartbeat_at = ? WHERE id = ?").run(hashToken(rawToken), nowIso(), ideId);
-  const folderQuery = folderPath ? `&folder=${encodeURIComponent(folderPath)}` : "";
-  return `/api/tasks/${taskId}/ide/view?token=${encodeURIComponent(rawToken)}${folderQuery}`;
+  db.prepare("UPDATE ide_instances SET access_token_hash = ?, last_heartbeat_at = ? WHERE id = ?").run(
+    hashToken(rawToken),
+    nowIso(),
+    params.ideId
+  );
+  const folderQuery = params.folderPath ? `&folder=${encodeURIComponent(params.folderPath)}` : "";
+  const workspaceQuery = params.workspacePath ? `&workspace=${encodeURIComponent(params.workspacePath)}` : "";
+  return `/api/tasks/${params.taskId}/ide/view?token=${encodeURIComponent(rawToken)}${workspaceQuery}${folderQuery}`;
+}
+
+async function buildIdeLaunchUrl(task: TaskRow, ideId: string): Promise<string> {
+  try {
+    const session = latestSession(task.id);
+    const attachableSession = session && ["starting", "running", "waiting_input"].includes(session.status) ? session : null;
+    const openPath = await prepareIdeWorkspace({
+      taskId: task.id,
+      workspacePath: task.workspace_path,
+      tmuxSocketPath: attachableSession?.tmux_socket_path,
+      tmuxSessionName: attachableSession?.tmux_session_name
+    });
+    if (openPath.endsWith(".code-workspace")) {
+      return issueIdeLaunchUrl({ taskId: task.id, ideId, workspacePath: openPath });
+    }
+    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: openPath });
+  } catch {
+    // Fall back to direct folder launch if workspace file generation fails.
+    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: task.workspace_path });
+  }
 }
 
 function rewriteProxyLocation(params: { location: string; taskId: string; targetPort: number }): string {
@@ -832,7 +857,7 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 
   const current = latestIde(task.id);
   if (current && current.status === "running" && ideSessionRunning(task.id)) {
-    const launchUrl = issueIdeLaunchUrl(task.id, current.id, task.workspace_path);
+    const launchUrl = await buildIdeLaunchUrl(task, current.id);
     res.json({ ide: serializeIde(current), launchUrl });
     return;
   }
@@ -865,7 +890,7 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
     ).run(ideId, task.id, launched.provider, launched.url, hashToken("pending"), now, now);
   })();
 
-  const launchUrl = issueIdeLaunchUrl(task.id, ideId, task.workspace_path);
+  const launchUrl = await buildIdeLaunchUrl(task, ideId);
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
@@ -881,7 +906,7 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
   res.json({ ide: serializeIde(ide), launchUrl });
 });
 
-tasksRouter.post("/tasks/:taskId/ide/token", (req, res) => {
+tasksRouter.post("/tasks/:taskId/ide/token", async (req, res) => {
   const task = taskForUser(req.params.taskId, req.user.id);
   if (!task) {
     res.status(404).json({ error: "Task not found" });
@@ -899,7 +924,7 @@ tasksRouter.post("/tasks/:taskId/ide/token", (req, res) => {
     return;
   }
 
-  const launchUrl = issueIdeLaunchUrl(task.id, ide.id, task.workspace_path);
+  const launchUrl = await buildIdeLaunchUrl(task, ide.id);
   res.json({ ide: serializeIde(ide), launchUrl });
 });
 
@@ -957,9 +982,14 @@ tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
     return;
   }
 
+  const workspace = typeof req.query.workspace === "string" ? req.query.workspace : "";
   const folder = typeof req.query.folder === "string" ? req.query.folder : "";
-  const folderQuery = folder ? `?folder=${encodeURIComponent(folder)}` : "";
-  res.redirect(302, `/api/tasks/${task.id}/ide/proxy/${folderQuery}`);
+  const locationQuery = workspace
+    ? `?workspace=${encodeURIComponent(workspace)}`
+    : folder
+      ? `?folder=${encodeURIComponent(folder)}`
+      : "";
+  res.redirect(302, `/api/tasks/${task.id}/ide/proxy/${locationQuery}`);
 });
 
 tasksRouter.all("/tasks/:taskId/ide/proxy*", (req, res) => {
