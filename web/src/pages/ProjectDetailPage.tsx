@@ -35,6 +35,7 @@ type CreateTaskForm = {
   title: string;
   taskPrompt: string;
   aiCommand: string;
+  dependencyTaskIds: string[];
 };
 
 type ProjectInstructionsForm = {
@@ -48,7 +49,8 @@ type ProjectInstructionsForm = {
 const initialForm: CreateTaskForm = {
   title: "",
   taskPrompt: "",
-  aiCommand: "codex --yolo {prompt}"
+  aiCommand: "codex --yolo {prompt}",
+  dependencyTaskIds: []
 };
 
 const CODING_STANDARD_OPTIONS = [
@@ -266,7 +268,8 @@ export function ProjectDetailPage() {
         body: JSON.stringify({
           title: form.title,
           taskPrompt: form.taskPrompt,
-          aiCommand: form.aiCommand
+          aiCommand: form.aiCommand,
+          dependencyTaskIds: form.dependencyTaskIds
         })
       });
       setForm(initialForm);
@@ -355,6 +358,27 @@ export function ProjectDetailPage() {
                   <FormControl isRequired>
                     <FormLabel>AI Command</FormLabel>
                     <Input value={form.aiCommand} onChange={(e) => setForm((x) => ({ ...x, aiCommand: e.target.value }))} />
+                  </FormControl>
+                  <FormControl>
+                    <FormLabel>Dependencies</FormLabel>
+                    <Select
+                      multiple
+                      value={form.dependencyTaskIds}
+                      onChange={(e) => {
+                        const selected = Array.from(e.target.selectedOptions).map((opt) => opt.value);
+                        setForm((x) => ({ ...x, dependencyTaskIds: selected }));
+                      }}
+                      h="140px"
+                    >
+                      {tasks.map((task) => (
+                        <option key={task.id} value={task.id}>
+                          {task.title} ({task.isBlocked ? "blocked" : task.status})
+                        </option>
+                      ))}
+                    </Select>
+                    <Text mt={1} fontSize="sm" color="gray.600">
+                      Select any number of tasks. This task stays blocked until all selected tasks are merged.
+                    </Text>
                   </FormControl>
                   <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
                     <FormLabel>Task Prompt</FormLabel>

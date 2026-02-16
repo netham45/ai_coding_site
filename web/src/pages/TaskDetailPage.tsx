@@ -56,6 +56,11 @@ function statusColor(status: Task["status"]) {
   return "purple";
 }
 
+function taskStatusLabel(task: Task): string {
+  if (task.isBlocked) return "blocked";
+  return task.status;
+}
+
 export function TaskDetailPage() {
   const { taskId } = useParams();
   const [searchParams] = useSearchParams();
@@ -136,6 +141,7 @@ export function TaskDetailPage() {
   useEffect(() => {
     if (!taskId || !task) return;
     if (autoStartedForTaskRef.current.has(taskId)) return;
+    if (task.isBlocked) return;
     autoStartedForTaskRef.current.add(taskId);
 
     (async () => {
@@ -143,7 +149,7 @@ export function TaskDetailPage() {
       const runtimeActive = !!session && ["starting", "running", "waiting_input"].includes(session.status);
       const ideActive = !!ide && ["starting", "running"].includes(ide.status);
 
-      if (!runtimeActive && !["merged", "cancelled", "failed"].includes(task.status)) {
+      if (!runtimeActive && !task.isBlocked && !["merged", "cancelled", "failed"].includes(task.status)) {
         try {
           await api(`/api/tasks/${taskId}/start`, { method: "POST" });
           shouldReload = true;
@@ -152,7 +158,7 @@ export function TaskDetailPage() {
         }
       }
 
-      if (!ideActive && !["merged", "cancelled", "failed"].includes(task.status)) {
+      if (!ideActive && !task.isBlocked && !["merged", "cancelled", "failed"].includes(task.status)) {
         try {
           const response = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
           setIde(response.ide);
@@ -168,7 +174,7 @@ export function TaskDetailPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, task?.id]);
+  }, [taskId, task?.id, task?.isBlocked]);
 
   useEffect(() => {
     if (!terminalContainerRef.current || terminalRef.current) {
@@ -345,6 +351,7 @@ export function TaskDetailPage() {
 
   useEffect(() => {
     if (!taskId) return;
+    if (task?.isBlocked) return;
     if (!ide || !["starting", "running"].includes(ide.status)) return;
     if (ideLaunchUrl) return;
 
@@ -356,7 +363,7 @@ export function TaskDetailPage() {
       .catch(() => {
         // best-effort recovery
       });
-  }, [taskId, ide?.id, ide?.status, ideLaunchUrl]);
+  }, [taskId, ide?.id, ide?.status, ideLaunchUrl, task?.isBlocked]);
 
   async function pullFromMain() {
     if (!taskId) return;
@@ -443,8 +450,13 @@ export function TaskDetailPage() {
   if (!task) {
     return <Text>Loading task...</Text>;
   }
+  const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
+  const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
 
   const renderIdePanel = (height: string) => {
+    if (task.isBlocked) {
+      return <Text color="orange.700">Task is blocked by unmerged dependencies. IDE start is disabled.</Text>;
+    }
     if (ideLaunchUrl) {
       return (
         <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" overflow="hidden">
@@ -456,9 +468,13 @@ export function TaskDetailPage() {
   };
 
   const renderTerminalPanel = (height: string) => (
+    task.isBlocked ? (
+      <Text color="orange.700">Task is blocked by unmerged dependencies. Runtime start is disabled.</Text>
+    ) : (
     <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" p={2} bg="#0f1720">
       <Box ref={terminalContainerRef} h={height} />
     </Box>
+    )
   );
 
   return (
@@ -474,7 +490,7 @@ export function TaskDetailPage() {
             {projectName ? `${projectName} - ${task.title}` : task.title}
           </Heading>
           <Stack direction="row" mt={2} align="center">
-            <Badge colorScheme={statusColor(task.status)}>{task.status}</Badge>
+            <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
             <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
               terminal: {terminalState}
             </Badge>
@@ -547,7 +563,7 @@ export function TaskDetailPage() {
               <Stack spacing={5}>
                 <Flex justify="flex-end">
                   <Stack direction={{ base: "column", md: "row" }} spacing={2}>
-                    <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain}>
+                    <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
                       Pull From Main Repo
                     </Button>
                     <Button
@@ -556,7 +572,7 @@ export function TaskDetailPage() {
                       size="sm"
                       onClick={markMergeReady}
                       isLoading={markingReady}
-                      isDisabled={!["in_progress", "waiting_input", "merge_conflict"].includes(task.status)}
+                      isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict"].includes(task.status)}
                     >
                       Mark Merge Ready
                     </Button>
@@ -575,6 +591,29 @@ export function TaskDetailPage() {
                     </Button>
                   </Stack>
                 </Flex>
+                <Box>
+                  <Heading size="sm" mb={2}>
+                    Dependencies
+                  </Heading>
+                  <Stack spacing={2}>
+                    <Text>depends on: {task.dependencyTaskIds.length}</Text>
+                    {dependencyTitles.map((title, index) => (
+                      <Text key={`${task.dependencyTaskIds[index]}-${index}`} fontSize="sm" color="gray.700">
+                        {title}
+                      </Text>
+                    ))}
+                    {!!task.blockedByTaskIds.length && (
+                      <Text color="orange.700">blocked by {task.blockedByTaskIds.length} unmerged task(s)</Text>
+                    )}
+                    {blockedByTitles.map((title, index) => (
+                      <Text key={`${task.blockedByTaskIds[index]}-${index}`} fontSize="sm" color="orange.700">
+                        {title}
+                      </Text>
+                    ))}
+                    {!task.dependencyTaskIds.length && <Text color="gray.600">No dependencies.</Text>}
+                  </Stack>
+                </Box>
+
                 <Box>
                   <Heading size="sm" mb={2}>
                     Effective Prompt

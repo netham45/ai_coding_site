@@ -65,6 +65,16 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  dependency_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, dependency_task_id),
+  CHECK (task_id != dependency_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_dependency_task_id ON task_dependencies(dependency_task_id);
+
 CREATE TABLE IF NOT EXISTS task_state_transitions (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
