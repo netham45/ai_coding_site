@@ -1,7 +1,8 @@
 import type { Server as HttpServer } from "node:http";
 import { URL } from "node:url";
+import type Database from "better-sqlite3";
 import { WebSocketServer, type WebSocket } from "ws";
-import { db } from "../db/index.js";
+import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import { capturePane, getPaneCursorPosition, hasSession, sendRawInput } from "../services/tmux.js";
 import { verifyTerminalToken } from "../services/terminalToken.js";
@@ -14,32 +15,58 @@ type WsPayload =
   | { type: "error"; message: string }
   | { type: "ack" };
 
-function latestSession(taskId: string): TaskSessionRow | undefined {
-  return db
+type TaskScope = {
+  projectId: string;
+  basePath: string;
+  projectDb: Database.Database;
+};
+
+function latestSession(scope: TaskScope, taskId: string): TaskSessionRow | undefined {
+  return scope.projectDb
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as TaskSessionRow | undefined;
 }
 
-function taskStatus(taskId: string): string | undefined {
-  const row = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
+function taskStatus(scope: TaskScope, taskId: string): string | undefined {
+  const row = scope.projectDb.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
   return row?.status;
 }
 
-function sessionStatus(sessionId: string): string | undefined {
-  const row = db.prepare("SELECT status FROM task_sessions WHERE id = ?").get(sessionId) as { status: string } | undefined;
+function sessionStatus(scope: TaskScope, sessionId: string): string | undefined {
+  const row = scope.projectDb.prepare("SELECT status FROM task_sessions WHERE id = ?").get(sessionId) as { status: string } | undefined;
   return row?.status;
 }
 
-function canAccessTask(taskId: string, userId: string): boolean {
-  const row = db
+function taskScopeForUser(taskId: string, userId: string): TaskScope | undefined {
+  const projects = appDb
     .prepare(
-      `SELECT t.id
-       FROM tasks t
-       JOIN project_members pm ON pm.project_id = t.project_id
-       WHERE t.id = ? AND pm.user_id = ?`
+      `SELECT p.id, p.base_path
+       FROM projects p
+       JOIN project_members pm ON pm.project_id = p.id
+       WHERE pm.user_id = ?`
     )
-    .get(taskId, userId) as { id: string } | undefined;
-  return Boolean(row?.id);
+    .all(userId) as Array<{ id: string; base_path: string }>;
+
+  for (const project of projects) {
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    const row = scoped.database
+      .prepare("SELECT id FROM tasks WHERE id = ? AND project_id = ?")
+      .get(taskId, project.id) as { id: string } | undefined;
+    if (row?.id) {
+      return {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb: scoped.database
+      };
+    }
+  }
+
+  return undefined;
 }
 
 function sendJson(ws: WebSocket, payload: WsPayload): void {
@@ -71,20 +98,25 @@ export function createTerminalGateway(server: HttpServer): void {
       return;
     }
 
-    if (claims.taskId !== taskId || !canAccessTask(taskId, claims.userId)) {
+    if (claims.taskId !== taskId) {
+      socket.destroy();
+      return;
+    }
+    const scope = taskScopeForUser(taskId, claims.userId);
+    if (!scope) {
       socket.destroy();
       return;
     }
 
     wss.handleUpgrade(req, socket, head, (ws) => {
-      (ws as any).__terminal = { taskId, userId: claims.userId };
+      (ws as any).__terminal = { taskId, userId: claims.userId, scope };
       wss.emit("connection", ws, req);
     });
   });
 
   wss.on("connection", (ws) => {
-    const meta = (ws as any).__terminal as { taskId: string; userId: string };
-    const session = latestSession(meta.taskId);
+    const meta = (ws as any).__terminal as { taskId: string; userId: string; scope: TaskScope };
+    const session = latestSession(meta.scope, meta.taskId);
 
     if (!session || !["starting", "running", "waiting_input"].includes(session.status)) {
       sendJson(ws, { type: "error", message: "No active runtime session" });
@@ -98,8 +130,8 @@ export function createTerminalGateway(server: HttpServer): void {
     let lastSessionStatus = "";
 
     const publishStatus = (force = false) => {
-      const currentTaskStatus = taskStatus(meta.taskId) ?? "unknown";
-      const currentSessionStatus = sessionStatus(session.id) ?? "unknown";
+      const currentTaskStatus = taskStatus(meta.scope, meta.taskId) ?? "unknown";
+      const currentSessionStatus = sessionStatus(meta.scope, session.id) ?? "unknown";
       if (!force && currentTaskStatus === lastTaskStatus && currentSessionStatus === lastSessionStatus) {
         return;
       }
@@ -111,10 +143,12 @@ export function createTerminalGateway(server: HttpServer): void {
     sendJson(ws, { type: "hello", taskId: meta.taskId, sessionId: session.id });
     publishStatus(true);
     recordEvent({
+      projectId: meta.scope.projectId,
       taskId: meta.taskId,
       sessionId: session.id,
       eventType: "terminal.ws.attached",
-      payload: { userId: meta.userId }
+      payload: { userId: meta.userId },
+      database: meta.scope.projectDb
     });
 
     const streamTick = async () => {
@@ -136,7 +170,7 @@ export function createTerminalGateway(server: HttpServer): void {
 
         lastFrame = frame;
         lastCursor = cursor;
-        db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
+        meta.scope.projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
           frame,
           new Date().toISOString(),
           session.id
@@ -162,7 +196,7 @@ export function createTerminalGateway(server: HttpServer): void {
         lastFrame = snapshot;
         lastCursor = cursor;
         sendJson(ws, { type: "output", data: snapshot, reset: true, cursorX: cursor.x, cursorY: cursor.y });
-        db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
+        meta.scope.projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
           snapshot,
           new Date().toISOString(),
           session.id
@@ -200,10 +234,12 @@ export function createTerminalGateway(server: HttpServer): void {
     ws.on("close", () => {
       clearInterval(timer);
       recordEvent({
+        projectId: meta.scope.projectId,
         taskId: meta.taskId,
         sessionId: session.id,
         eventType: "terminal.ws.detached",
-        payload: { userId: meta.userId }
+        payload: { userId: meta.userId },
+        database: meta.scope.projectDb
       });
     });
   });
