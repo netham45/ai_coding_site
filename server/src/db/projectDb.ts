@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "../utils/time.js";
+import { projectBaselineMigration } from "./migrations.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
@@ -11,6 +12,17 @@ export const PROJECT_DB_SCHEMA_VERSION = 1;
 export type ProjectDbMetadata = {
   project_id: string;
   schema_version: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectConfigRow = {
+  project_id: string;
+  project_prompt: string;
+  project_rules: string;
+  coding_standard: string;
+  coding_standard_other: string;
+  project_other: string;
   created_at: string;
   updated_at: string;
 };
@@ -100,6 +112,68 @@ function readValidatedProjectMetadata(db: Database.Database, expectedProjectId: 
   return existing;
 }
 
+function ensureProjectConfigRow(
+  db: Database.Database,
+  projectId: string,
+  defaults?: Partial<Omit<ProjectConfigRow, "project_id" | "created_at" | "updated_at">>
+): ProjectConfigRow {
+  const existing = db
+    .prepare(
+      `SELECT
+         project_id,
+         project_prompt,
+         project_rules,
+         coding_standard,
+         coding_standard_other,
+         project_other,
+         created_at,
+         updated_at
+       FROM project_config
+       WHERE project_id = ?`
+    )
+    .get(projectId) as ProjectConfigRow | undefined;
+
+  if (existing) {
+    return existing;
+  }
+
+  const now = nowIso();
+  const inserted: ProjectConfigRow = {
+    project_id: projectId,
+    project_prompt: defaults?.project_prompt ?? "",
+    project_rules: defaults?.project_rules ?? "",
+    coding_standard: defaults?.coding_standard ?? "",
+    coding_standard_other: defaults?.coding_standard_other ?? "",
+    project_other: defaults?.project_other ?? "",
+    created_at: now,
+    updated_at: now
+  };
+
+  db.prepare(
+    `INSERT INTO project_config (
+       project_id,
+       project_prompt,
+       project_rules,
+       coding_standard,
+       coding_standard_other,
+       project_other,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    inserted.project_id,
+    inserted.project_prompt,
+    inserted.project_rules,
+    inserted.coding_standard,
+    inserted.coding_standard_other,
+    inserted.project_other,
+    inserted.created_at,
+    inserted.updated_at
+  );
+
+  return inserted;
+}
+
 export function ensureProjectDb(params: { projectId: string; basePath: string }): ProjectDbHandle {
   const projectId = params.projectId;
   const basePath = path.resolve(params.basePath);
@@ -112,7 +186,9 @@ export function ensureProjectDb(params: { projectId: string; basePath: string })
 
   const cached = cacheByPath.get(dbPath);
   if (cached?.db.open) {
+    cached.db.exec(projectBaselineMigration);
     const metadata = readValidatedProjectMetadata(cached.db, projectId);
+    ensureProjectConfigRow(cached.db, projectId);
     projectPathById.set(projectId, dbPath);
     return {
       projectId,
@@ -131,7 +207,9 @@ export function ensureProjectDb(params: { projectId: string; basePath: string })
   const db = openSqliteDatabase(dbPath);
 
   try {
+    db.exec(projectBaselineMigration);
     const metadata = readValidatedProjectMetadata(db, projectId);
+    ensureProjectConfigRow(db, projectId);
     cacheByPath.set(dbPath, { projectId, basePath, dbPath, db });
     projectPathById.set(projectId, dbPath);
     return {
@@ -149,6 +227,55 @@ export function ensureProjectDb(params: { projectId: string; basePath: string })
 
 export function getProjectDb(params: { projectId: string; basePath: string }): Database.Database {
   return ensureProjectDb(params).db;
+}
+
+export function getProjectConfig(params: { projectId: string; basePath: string }): ProjectConfigRow {
+  const db = getProjectDb(params);
+  return ensureProjectConfigRow(db, params.projectId);
+}
+
+export function upsertProjectConfig(params: {
+  projectId: string;
+  basePath: string;
+  projectPrompt: string;
+  projectRules: string;
+  codingStandard: string;
+  codingStandardOther: string;
+  projectOther: string;
+}): ProjectConfigRow {
+  const db = getProjectDb(params);
+  const current = ensureProjectConfigRow(db, params.projectId);
+  const updatedAt = nowIso();
+
+  db.prepare(
+    `UPDATE project_config
+     SET project_prompt = ?,
+         project_rules = ?,
+         coding_standard = ?,
+         coding_standard_other = ?,
+         project_other = ?,
+         updated_at = ?
+     WHERE project_id = ?`
+  ).run(
+    params.projectPrompt,
+    params.projectRules,
+    params.codingStandard,
+    params.codingStandardOther,
+    params.projectOther,
+    updatedAt,
+    params.projectId
+  );
+
+  return {
+    project_id: params.projectId,
+    project_prompt: params.projectPrompt,
+    project_rules: params.projectRules,
+    coding_standard: params.codingStandard,
+    coding_standard_other: params.codingStandardOther,
+    project_other: params.projectOther,
+    created_at: current.created_at,
+    updated_at: updatedAt
+  };
 }
 
 export function closeProjectDb(params: { projectId?: string; dbPath?: string }): void {

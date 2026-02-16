@@ -6,5 +6,7 @@ export {
   closeAllProjectDbs,
   closeProjectDb,
   ensureProjectDb,
-  getProjectDb
+  getProjectConfig,
+  getProjectDb,
+  upsertProjectConfig
 } from "./projectDb.js";

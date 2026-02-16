@@ -8,11 +8,11 @@ type DependencySummary = {
 
 export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string, dependencySummaries: DependencySummary[] = []): string {
   const sections: string[] = [];
-  const prompt = project.project_prompt.trim();
-  const rules = project.project_rules.trim();
-  const codingStandard = project.coding_standard.trim();
-  const codingStandardOther = project.coding_standard_other.trim();
-  const other = project.project_other.trim();
+  const prompt = (project.project_prompt ?? "").trim();
+  const rules = (project.project_rules ?? "").trim();
+  const codingStandard = (project.coding_standard ?? "").trim();
+  const codingStandardOther = (project.coding_standard_other ?? "").trim();
+  const other = (project.project_other ?? "").trim();
   const task = taskPrompt.trim();
 
   if (prompt) {
