@@ -102,6 +102,22 @@ function tableExists(db: Database.Database, table: string): boolean {
   return Boolean(row?.ok);
 }
 
+function getUserVersion(db: Database.Database): number {
+  return Number(db.pragma("user_version", { simple: true }) ?? 0);
+}
+
+function runProjectMigrationsIfNeeded(db: Database.Database): void {
+  if (getUserVersion(db) >= PROJECT_DB_SCHEMA_VERSION) {
+    return;
+  }
+  db.exec(projectBaselineMigration);
+  db.pragma(`user_version = ${PROJECT_DB_SCHEMA_VERSION}`);
+}
+
+function ensureProjectMetadataTable(db: Database.Database): void {
+  db.exec(projectMetadataMigration);
+}
+
 function validateProjectMetadataRow(existing: ProjectDbMetadata, expectedProjectId?: string): ProjectDbMetadata {
   if (!existing.project_id || typeof existing.project_id !== "string") {
     throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata is invalid: project_id is required");
@@ -155,7 +171,6 @@ function readValidatedProjectMetadata(
   expectedProjectId: string,
   options?: { allowCreate: boolean }
 ): ProjectDbMetadata {
-  db.exec(projectMetadataMigration);
   const allowCreate = options?.allowCreate === true;
 
   const rowCount = db.prepare("SELECT COUNT(*) AS count FROM project_metadata").get() as { count: number };
@@ -269,7 +284,6 @@ function validateCachedHandle(params: {
   configDefaults?: Partial<Omit<ProjectConfigRow, "project_id" | "created_at" | "updated_at">>;
 }): ProjectDbHandle {
   try {
-    params.cached.db.exec(projectBaselineMigration);
     const metadata = readValidatedProjectMetadata(params.cached.db, params.projectId, { allowCreate: params.allowCreate });
     ensureProjectConfigRow(params.cached.db, params.projectId, {
       allowCreate: params.allowCreate,
@@ -379,7 +393,8 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
   }
 
   try {
-    db.exec(projectBaselineMigration);
+    runProjectMigrationsIfNeeded(db);
+    ensureProjectMetadataTable(db);
     const metadata = readValidatedProjectMetadata(db, projectId, { allowCreate });
     ensureProjectConfigRow(db, projectId, {
       allowCreate,

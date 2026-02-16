@@ -4,7 +4,6 @@ import { ChakraProvider } from "@chakra-ui/react";
 import { BrowserRouter } from "react-router-dom";
 import { App } from "./App";
 import { appTheme } from "./theme/theme";
-import "@xterm/xterm/css/xterm.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

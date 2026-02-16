@@ -63,13 +63,22 @@ type RuntimeProjectContext = {
 
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
 const WAITING_INPUT_IDLE_MS = 3000;
-const HEARTBEAT_INTERVAL_MS = 1000;
+const HEARTBEAT_INTERVAL_MS = 1500;
+const OUTPUT_PERSIST_INTERVAL_MS = 15000;
 const AUTO_MERGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTO_MERGE_POLL_INTERVAL_MS = 1250;
 const TASK_SUMMARY_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
 const TASK_SUMMARY_POLL_INTERVAL_MS = 1000;
 const TASK_SUMMARY_FILE_NAME = ".ai-task-summary.md";
 const autoMergeTaskIds = new Set<string>();
+
+type SessionActivityCache = {
+  lastOutput: string;
+  lastActivityMs: number;
+  lastPersistedAtMs: number;
+};
+
+const sessionActivityById = new Map<string, SessionActivityCache>();
 
 type TaskGitTopology = {
   pullRemoteRef: string;
@@ -367,6 +376,19 @@ function getActiveSessions(projectDb: Database.Database, taskId: string): Sessio
       "SELECT * FROM task_sessions WHERE task_id = ? AND status IN ('starting','running','waiting_input') ORDER BY started_at DESC"
     )
     .all(taskId) as SessionRow[];
+}
+
+function listSessionsForHeartbeat(projectDb: Database.Database): SessionRow[] {
+  return projectDb
+    .prepare(
+      `SELECT ts.*
+       FROM task_sessions ts
+       JOIN tasks t ON t.id = ts.task_id
+       WHERE ts.status IN ('starting','running','waiting_input')
+         AND t.status IN ('in_progress','waiting_input')
+       ORDER BY ts.started_at ASC`
+    )
+    .all() as SessionRow[];
 }
 
 function hasNewerActiveSession(projectDb: Database.Database, taskId: string, startedAt: string, excludeSessionId: string): boolean {
@@ -989,6 +1011,7 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
   const scopeHint = contextHintFromProjectContext(context);
   const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
   if (!alive) {
+    sessionActivityById.delete(session.id);
     if (hasNewerActiveSession(projectDb, session.task_id, session.started_at, session.id)) {
       projectDb
         .prepare(
@@ -1008,6 +1031,7 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
 
   const paneStatus = await paneExitStatus(session.tmux_socket_path, session.tmux_session_name);
   if (paneStatus.dead) {
+    sessionActivityById.delete(session.id);
     const stopStatus = "crashed";
     projectDb.prepare("UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ? WHERE id = ?").run(
       stopStatus,
@@ -1028,13 +1052,23 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
 
   const output = await capturePane(session.tmux_socket_path, session.tmux_session_name);
   const signal = parseLifecycleSignals(output);
-  const outputChanged = output !== session.last_output;
   const now = Date.now();
-  const lastActivityMs = session.last_heartbeat_at ? Date.parse(session.last_heartbeat_at) : Number.NaN;
-  const idleMs = Number.isFinite(lastActivityMs) ? now - lastActivityMs : Number.POSITIVE_INFINITY;
+  const persistedHeartbeatMs = session.last_heartbeat_at ? Date.parse(session.last_heartbeat_at) : Number.NaN;
+  const cached = sessionActivityById.get(session.id) ?? {
+    lastOutput: session.last_output,
+    lastActivityMs: Number.isFinite(persistedHeartbeatMs) ? persistedHeartbeatMs : now,
+    lastPersistedAtMs: Number.isFinite(persistedHeartbeatMs) ? persistedHeartbeatMs : 0
+  };
+  const outputChanged = output !== cached.lastOutput;
+  const idleMs = now - cached.lastActivityMs;
 
   if (outputChanged) {
-    projectDb.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+    cached.lastOutput = output;
+    cached.lastActivityMs = now;
+    if (now - cached.lastPersistedAtMs >= OUTPUT_PERSIST_INTERVAL_MS) {
+      projectDb.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+      cached.lastPersistedAtMs = now;
+    }
     if (session.status === "waiting_input") {
       projectDb.prepare("UPDATE task_sessions SET status = 'running' WHERE id = ?").run(session.id);
     }
@@ -1066,6 +1100,8 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
       maybeStartAutoMerge(session.task_id, scopeHint);
     }
   }
+
+  sessionActivityById.set(session.id, cached);
 }
 
 export async function recoverRuntimeSessions(): Promise<void> {
@@ -1073,9 +1109,7 @@ export async function recoverRuntimeSessions(): Promise<void> {
   kickPendingAutoMergeTasks();
 
   for (const context of listAvailableProjectContexts()) {
-    const rows = context.projectDb
-      .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
-      .all() as SessionRow[];
+    const rows = listSessionsForHeartbeat(context.projectDb);
 
     for (const row of rows) {
       const alive = await hasSession(row.tmux_socket_path, row.tmux_session_name);
@@ -1103,9 +1137,7 @@ export async function startRuntimeHeartbeat(): Promise<void> {
     kickPendingAutoMergeTasks();
 
     for (const context of listAvailableProjectContexts()) {
-      const activeSessions = context.projectDb
-        .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
-        .all() as SessionRow[];
+      const activeSessions = listSessionsForHeartbeat(context.projectDb);
 
       for (const session of activeSessions) {
         try {

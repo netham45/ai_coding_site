@@ -9,7 +9,7 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
-import { sendTaskRuntimeInput } from "../services/runtime.js";
+import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
   PlanRevisionItemDependencyRow,
   PlanRevisionItemRow,
@@ -531,7 +531,7 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
   ].join("\n");
 
   try {
-    await sendTaskRuntimeInput(plan.id, req.user.id, guidance, {
+    await sendTaskRuntimeInputWorker(plan.id, req.user.id, guidance, {
       projectId: project.id,
       basePath: project.base_path,
       projectDb

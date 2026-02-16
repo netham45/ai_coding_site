@@ -1,5 +1,5 @@
 import { db as appDb, resolveProjectDatabase } from "../db/index.js";
-import { startTaskRuntime } from "./runtime.js";
+import { startTaskRuntimeWorker } from "./runtimeWorker.js";
 
 const QUEUE_INTERVAL_MS = 1500;
 const MAX_TASKS_PER_PASS = 8;
@@ -59,22 +59,24 @@ async function processQueuedTasksPass(): Promise<void> {
   candidates.sort((a, b) => Date.parse(a.task.created_at) - Date.parse(b.task.created_at));
   const rows = candidates.slice(0, MAX_TASKS_PER_PASS);
 
-  for (const row of rows) {
-    if (startingTaskIds.has(row.task.id)) {
-      continue;
-    }
-    startingTaskIds.add(row.task.id);
-    try {
-      await startTaskRuntime(row.task.id, row.task.created_by_user_id, {
-        projectId: row.projectId,
-        basePath: row.basePath
-      });
-    } catch {
-      // Best-effort queue dispatch. Task remains queued for retry.
-    } finally {
-      startingTaskIds.delete(row.task.id);
-    }
-  }
+  await Promise.allSettled(
+    rows.map(async (row) => {
+      if (startingTaskIds.has(row.task.id)) {
+        return;
+      }
+      startingTaskIds.add(row.task.id);
+      try {
+        await startTaskRuntimeWorker(row.task.id, row.task.created_by_user_id, {
+          projectId: row.projectId,
+          basePath: row.basePath
+        });
+      } catch {
+        // Best-effort queue dispatch. Task remains queued for retry.
+      } finally {
+        startingTaskIds.delete(row.task.id);
+      }
+    })
+  );
 }
 
 let running = false;

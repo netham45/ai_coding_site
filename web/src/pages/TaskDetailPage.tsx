@@ -25,11 +25,9 @@ import {
 } from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import { api } from "../api/client";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskStatus, TaskTransition } from "../api/types";
+import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskTransition } from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -48,12 +46,6 @@ type ProjectResponse = {
   project: Project;
 };
 
-type TerminalTokenResponse = {
-  token: string;
-  expiresAt: string;
-  wsPath: string;
-};
-
 type IdeStartResponse = {
   ide: IdeInstance;
   launchUrl: string;
@@ -66,24 +58,11 @@ type PlanDetailResponse = {
   approvedTasks: Task[];
 };
 
-type TerminalMessage =
-  | { type: "hello"; taskId: string; sessionId: string }
-  | { type: "output"; data: string; reset?: boolean; cursorX?: number; cursorY?: number }
-  | { type: "status"; sessionStatus: string; taskStatus?: string }
-  | { type: "error"; message: string }
-  | { type: "ack" };
-
 type PlanItemDraft = {
   title: string;
   description: string;
   prompt: string;
 };
-
-const TASK_STATUSES: TaskStatus[] = ["queued", "in_progress", "waiting_input", "merge_ready", "merged", "cancelled", "failed", "merge_conflict"];
-
-function isTaskStatus(status: string): status is TaskStatus {
-  return TASK_STATUSES.includes(status as TaskStatus);
-}
 
 function statusColor(status: Task["status"]) {
   if (status === "queued") return "gray";
@@ -113,9 +92,8 @@ export function TaskDetailPage() {
   const [ide, setIde] = useState<IdeInstance | null>(null);
   const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
   const [ideLaunchUrl, setIdeLaunchUrl] = useState<string | null>(null);
-  const [activePane, setActivePane] = useState<"ide" | "terminal" | "info">("ide");
-  const [expandedPane, setExpandedPane] = useState<"ide" | "terminal" | null>(null);
-  const [terminalState, setTerminalState] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+  const [activePane, setActivePane] = useState<"ide" | "info">("ide");
+  const [expandedPane, setExpandedPane] = useState<"ide" | null>(null);
   const [syncingMain, setSyncingMain] = useState(false);
   const [mergingTask, setMergingTask] = useState(false);
   const [markingReady, setMarkingReady] = useState(false);
@@ -132,11 +110,6 @@ export function TaskDetailPage() {
   const [autoMergeItemKeys, setAutoMergeItemKeys] = useState<string[]>([]);
   const [planItemDrafts, setPlanItemDrafts] = useState<Record<string, PlanItemDraft>>({});
 
-  const terminalContainerRef = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
 
   async function loadTask() {
@@ -175,7 +148,7 @@ export function TaskDetailPage() {
   useEffect(() => {
     setIdeLaunchUrl(null);
     const tab = searchParams.get("tab");
-    setActivePane(tab === "terminal" ? "terminal" : tab === "info" ? "info" : "ide");
+    setActivePane(tab === "info" ? "info" : "ide");
     setExpandedPane(null);
     setIsTaskSidebarCollapsed(false);
     loadTask().catch((error: Error) => {
@@ -237,170 +210,6 @@ export function TaskDetailPage() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entityId, task?.id, task?.isBlocked]);
-
-  useEffect(() => {
-    if (!terminalContainerRef.current || terminalRef.current) {
-      return;
-    }
-
-    const term = new Terminal({
-      convertEol: true,
-      cursorBlink: true,
-      fontSize: 13,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      theme: {
-        background: "#0f1720",
-        foreground: "#e7edf3"
-      }
-    });
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-    term.open(terminalContainerRef.current);
-    fitAddon.fit();
-    if (session?.lastOutput) {
-      term.write(session.lastOutput);
-    }
-
-    term.onData((data) => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      ws.send(JSON.stringify({ type: "input", data }));
-    });
-
-    terminalRef.current = term;
-    fitAddonRef.current = fitAddon;
-
-    const onResize = () => fitAddon.fit();
-    window.addEventListener("resize", onResize);
-
-    return () => {
-      window.removeEventListener("resize", onResize);
-      if (reconnectTimerRef.current) {
-        window.clearTimeout(reconnectTimerRef.current);
-      }
-      wsRef.current?.close();
-      term.dispose();
-      terminalRef.current = null;
-      fitAddonRef.current = null;
-    };
-  }, [session?.lastOutput]);
-
-  useEffect(() => {
-    const term = terminalRef.current;
-    if (!term || !session?.lastOutput) {
-      return;
-    }
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      return;
-    }
-    term.clear();
-    term.write(session.lastOutput);
-  }, [session?.id, session?.lastOutput]);
-
-  async function connectTerminal() {
-    if (!entityId) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      return;
-    }
-
-    setTerminalState("connecting");
-    const term = terminalRef.current;
-
-    try {
-      const tokenData = await api<TerminalTokenResponse>(`/api/tasks/${entityId}/terminal-token`);
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${protocol}://${window.location.host}${tokenData.wsPath}?token=${encodeURIComponent(tokenData.token)}`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setTerminalState("connected");
-      };
-
-      ws.onmessage = (event) => {
-        const payload = JSON.parse(String(event.data)) as TerminalMessage;
-        if (payload.type === "output") {
-          if (payload.reset) {
-            term?.clear();
-          }
-          term?.write(payload.data, () => {
-            if (!term) return;
-            if (typeof payload.cursorX === "number" && typeof payload.cursorY === "number") {
-              const row = Math.max(1, payload.cursorY - 2);
-              const col = Math.max(1, payload.cursorX + 1);
-              term.write(`\u001b[${row};${col}H`);
-              term.scrollToBottom();
-            } else {
-              term.scrollToBottom();
-            }
-          });
-          return;
-        }
-        if (payload.type === "error") {
-          term?.writeln(`\r\n[error] ${payload.message}\r\n`);
-          return;
-        }
-        if (payload.type === "status") {
-          setSession((current) => {
-            if (!current || current.status === payload.sessionStatus) {
-              return current;
-            }
-            return { ...current, status: payload.sessionStatus as TaskSession["status"] };
-          });
-          const nextTaskStatus = payload.taskStatus;
-          if (nextTaskStatus && isTaskStatus(nextTaskStatus)) {
-            setTask((current) => {
-              if (!current || current.status === nextTaskStatus) {
-                return current;
-              }
-              return { ...current, status: nextTaskStatus };
-            });
-            setProjectTasks((current) =>
-              current.map((item) => (item.id === entityId && item.status !== nextTaskStatus ? { ...item, status: nextTaskStatus } : item))
-            );
-          }
-        }
-      };
-
-      ws.onclose = () => {
-        setTerminalState("disconnected");
-        wsRef.current = null;
-        if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
-          reconnectTimerRef.current = window.setTimeout(() => {
-            connectTerminal().catch(() => {
-              // no-op
-            });
-          }, 1500);
-        }
-      };
-
-      ws.onerror = () => {
-        setTerminalState("disconnected");
-      };
-    } catch (error: any) {
-      setTerminalState("disconnected");
-      toast({ status: "error", title: "Terminal connect failed", description: error.message });
-    }
-  }
-
-  useEffect(() => {
-    if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
-      connectTerminal().catch(() => {
-        // handled in connectTerminal
-      });
-    } else {
-      wsRef.current?.close();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.id, session?.status]);
-
-  useEffect(() => {
-    const fit = () => {
-      fitAddonRef.current?.fit();
-    };
-    window.setTimeout(fit, 40);
-  }, [activePane, expandedPane]);
 
   useEffect(() => {
     if (!expandedPane) return;
@@ -701,16 +510,6 @@ export function TaskDetailPage() {
     return <Text color="gray.700">Starting IDE session...</Text>;
   };
 
-  const renderTerminalPanel = (height: string) => (
-    task.isBlocked ? (
-      <Text color="orange.700">Task is blocked by unmerged dependencies. Runtime start is disabled.</Text>
-    ) : (
-    <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" p={2} bg="#0f1720">
-      <Box ref={terminalContainerRef} h={height} />
-    </Box>
-    )
-  );
-
   return (
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
       {!expandedPane && (
@@ -734,9 +533,6 @@ export function TaskDetailPage() {
             <Stack direction="row" align="center" flexWrap="wrap">
               <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
               <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
-              <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
-                terminal: {terminalState}
-              </Badge>
               <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
                 ide: {ide?.status ?? "stopped"}
               </Badge>
@@ -747,10 +543,9 @@ export function TaskDetailPage() {
           </Flex>
         </Box>
 
-        <Tabs index={activePane === "ide" ? 0 : activePane === "terminal" ? 1 : 2} onChange={(next) => setActivePane(next === 0 ? "ide" : next === 1 ? "terminal" : "info")} colorScheme="teal">
+        <Tabs index={activePane === "ide" ? 0 : 1} onChange={(next) => setActivePane(next === 0 ? "ide" : "info")} colorScheme="teal">
           <TabList>
             <Tab>IDE</Tab>
-            <Tab>Terminal</Tab>
             <Tab>Task Info</Tab>
           </TabList>
           <TabPanels>
@@ -781,29 +576,6 @@ export function TaskDetailPage() {
                   ? `${gitStatus.branch} | +${gitStatus.ahead}/-${gitStatus.behind} | staged ${gitStatus.staged} | unstaged ${gitStatus.unstaged} | untracked ${gitStatus.untracked}`
                   : "unavailable"}
               </Text>
-            </TabPanel>
-
-            <TabPanel px={0} pt={4}>
-              <Box
-                position={expandedPane === "terminal" ? "fixed" : "relative"}
-                inset={expandedPane === "terminal" ? "0" : "auto"}
-                zIndex={expandedPane === "terminal" ? 2000 : "auto"}
-                bg="white"
-              >
-                <Flex h="44px" px={3} borderBottom="1px solid" borderColor="blackAlpha.300" align="center" justify="space-between">
-                  <Text fontWeight="700">Terminal</Text>
-                  {expandedPane === "terminal" ? (
-                    <Button size="sm" onClick={() => setExpandedPane(null)}>
-                      Exit Full View
-                    </Button>
-                  ) : (
-                    <Button size="sm" variant="outline" onClick={() => setExpandedPane("terminal")}>
-                      Expand
-                    </Button>
-                  )}
-                </Flex>
-                <Box p={2}>{renderTerminalPanel(expandedPane === "terminal" ? "calc(100vh - 60px)" : "520px")}</Box>
-              </Box>
             </TabPanel>
 
             <TabPanel px={0} pt={4}>

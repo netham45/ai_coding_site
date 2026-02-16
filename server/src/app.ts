@@ -8,6 +8,7 @@ import { plansRouter } from "./routes/plans.js";
 import { projectsRouter } from "./routes/projects.js";
 import { settingsRouter } from "./routes/settings.js";
 import { tasksRouter } from "./routes/tasks.js";
+import { endpointWorkerHandler, wrapRouterHandlersInAsyncWorkers } from "./middleware/endpointWorker.js";
 import { workspaceRoot } from "./utils/paths.js";
 import { collectProjectDbDiagnosticsHealth } from "./db/projectDbDiagnostics.js";
 import { collectProjectMigrationHealth } from "./db/projectDataMigration.js";
@@ -19,7 +20,7 @@ export function createApp(): express.Express {
   app.use(express.json({ limit: "2mb" }));
   app.use(authMiddleware);
 
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", endpointWorkerHandler((_req, res) => {
     res.json({
       ok: true,
       diagnostics: {
@@ -27,24 +28,24 @@ export function createApp(): express.Express {
         migration: collectProjectMigrationHealth(appDb)
       }
     });
-  });
+  }));
 
-  app.use("/api/projects", projectsRouter);
-  app.use("/api/users/me/settings", settingsRouter);
-  app.use("/api", tasksRouter);
-  app.use("/api", plansRouter);
+  app.use("/api/projects", wrapRouterHandlersInAsyncWorkers(projectsRouter));
+  app.use("/api/users/me/settings", wrapRouterHandlersInAsyncWorkers(settingsRouter));
+  app.use("/api", wrapRouterHandlersInAsyncWorkers(tasksRouter));
+  app.use("/api", wrapRouterHandlersInAsyncWorkers(plansRouter));
 
   const webDist = path.join(workspaceRoot, "web", "dist");
   const webIndex = path.join(webDist, "index.html");
   if (fs.existsSync(webIndex)) {
     app.use(express.static(webDist));
-    app.get(/^\/(?!api).*/, (_req, res) => {
+    app.get(/^\/(?!api).*/, endpointWorkerHandler((_req, res) => {
       res.sendFile(webIndex);
-    });
+    }));
   } else {
-    app.get("/", (_req, res) => {
+    app.get("/", endpointWorkerHandler((_req, res) => {
       res.status(200).send("Frontend not built yet. Run `npm run build -w web` or `npm run dev -w web`.");
-    });
+    }));
   }
 
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

@@ -361,4 +361,49 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
 
     assert.ok(tableExists(appDb, "project_data_migrations"));
   });
+
+  test("cached project DB handle reuse does not rerun baseline migrations", () => {
+    const projectId = randomUUID();
+    const basePath = randomPath("cached-no-migrate");
+    const handle = ensureProjectDb({
+      projectId,
+      basePath,
+      initializeIfMissing: true
+    });
+
+    assert.equal(tableExists(handle.db, "tasks"), true);
+    handle.db.exec("DROP TABLE tasks");
+    assert.equal(tableExists(handle.db, "tasks"), false);
+
+    const cached = ensureProjectDb({
+      projectId,
+      basePath,
+      initializeIfMissing: false
+    });
+    assert.equal(tableExists(cached.db, "tasks"), false);
+  });
+
+  test("cached project DB handle reuse does not rerun metadata table migration", () => {
+    const projectId = randomUUID();
+    const basePath = randomPath("cached-no-metadata-migrate");
+    const handle = ensureProjectDb({
+      projectId,
+      basePath,
+      initializeIfMissing: true
+    });
+
+    assert.equal(tableExists(handle.db, "project_metadata"), true);
+    handle.db.exec("DROP TABLE project_metadata");
+    assert.equal(tableExists(handle.db, "project_metadata"), false);
+
+    assert.throws(
+      () =>
+        ensureProjectDb({
+          projectId,
+          basePath,
+          initializeIfMissing: false
+        }),
+      (error: unknown) => error instanceof ProjectDbError && error.code === "PROJECT_DB_CORRUPT"
+    );
+  });
 });

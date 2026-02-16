@@ -4,7 +4,6 @@ import { startIdeHeartbeat } from "./services/ide.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
-import { createTerminalGateway } from "./ws/terminalGateway.js";
 import { nowIso } from "./utils/time.js";
 import { createApp } from "./app.js";
 
@@ -15,7 +14,6 @@ const host = process.env.HOST ?? "0.0.0.0";
 ensureLocalUser();
 
 const server = http.createServer(app);
-createTerminalGateway(server);
 createIdeProxyGateway(server);
 
 server.listen(port, host, () => {

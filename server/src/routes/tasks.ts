@@ -18,8 +18,8 @@ import {
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
-import { sendTaskRuntimeInput, startTaskRuntime, triggerAutoMergeIfEligible } from "../services/runtime.js";
-import { issueTerminalToken } from "../services/terminalToken.js";
+import { triggerAutoMergeIfEligible } from "../services/runtime.js";
+import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
@@ -755,7 +755,7 @@ tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
   }
 
   try {
-    await startTaskRuntime(task.id, req.user.id, {
+    await startTaskRuntimeWorker(task.id, req.user.id, {
       projectId: project.id,
       basePath: project.base_path,
       projectDb
@@ -784,7 +784,7 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
   const { task, project, projectDb } = scopedTask;
 
   try {
-    await sendTaskRuntimeInput(task.id, req.user.id, parsed.data.text, {
+    await sendTaskRuntimeInputWorker(task.id, req.user.id, parsed.data.text, {
       projectId: project.id,
       basePath: project.base_path,
       projectDb
@@ -1221,22 +1221,6 @@ tasksRouter.get("/tasks/:taskId/merge-records", (req, res) => {
     .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
     .all(task.id) as MergeRecordRow[];
   res.json({ mergeRecords: mergeRecords.map(serializeMergeRecord) });
-});
-
-tasksRouter.get("/tasks/:taskId/terminal-token", (req, res) => {
-  const scopedTask = getTaskAccessOrRespond(
-    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
-    res
-  );
-  if (!scopedTask) return;
-  const { task } = scopedTask;
-
-  const { token, expiresAt } = issueTerminalToken(task.id, req.user.id);
-  res.json({
-    token,
-    expiresAt,
-    wsPath: `/ws/tasks/${task.id}/terminal`
-  });
 });
 
 tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
