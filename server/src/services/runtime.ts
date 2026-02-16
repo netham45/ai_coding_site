@@ -6,6 +6,7 @@ import type { ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
+import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha } from "./git.js";
 import { buildEffectivePrompt } from "./promptBuilder.js";
 import { buildCommand, parseLifecycleSignals } from "./adapters.js";
 import {
@@ -48,6 +49,19 @@ function getTask(taskId: string): TaskRow | undefined {
 
 function getProject(projectId: string): ProjectRow | undefined {
   return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as ProjectRow | undefined;
+}
+
+function taskIsBlocked(taskId: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT td.task_id
+       FROM task_dependencies td
+       JOIN tasks dep ON dep.id = td.dependency_task_id
+       WHERE td.task_id = ? AND dep.status != 'merged'
+       LIMIT 1`
+    )
+    .get(taskId) as { task_id: string } | undefined;
+  return Boolean(row?.task_id);
 }
 
 function getLatestSession(taskId: string): SessionRow | undefined {
@@ -126,11 +140,12 @@ function buildRuntimeEnv(): { env: Record<string, string>; cleanup?: () => void 
 }
 
 export async function startTaskRuntime(taskId: string, actorUserId: string): Promise<void> {
-  await ensureTmuxAvailable();
-
   const task = getTask(taskId);
   if (!task) {
     throw new Error("Task not found");
+  }
+  if (taskIsBlocked(task.id)) {
+    throw new Error("Task is blocked by unmerged dependencies");
   }
   if (["merged", "cancelled", "merge_ready", "merge_conflict"].includes(task.status)) {
     throw new Error(`Task cannot be started from status ${task.status}`);
@@ -139,6 +154,15 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   if (!project) {
     throw new Error("Project not found");
   }
+  const workspaceGitPath = path.join(task.workspace_path, ".git");
+  if (!fs.existsSync(workspaceGitPath)) {
+    const baseCommitSha = await getHeadCommitSha(project.base_path);
+    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: task.workspace_path });
+    await createTaskBranch(task.workspace_path, task.id);
+    db.prepare("UPDATE tasks SET base_commit_sha_at_create = ?, updated_at = ? WHERE id = ?").run(baseCommitSha, nowIso(), task.id);
+  }
+
+  await ensureTmuxAvailable();
 
   const existingSessions = getActiveSessions(taskId);
   for (const existing of existingSessions) {

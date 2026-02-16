@@ -48,6 +48,12 @@ export type TaskRow = {
   updated_at: string;
 };
 
+export type TaskDependencyRow = {
+  task_id: string;
+  dependency_task_id: string;
+  created_at: string;
+};
+
 export type TaskTransitionRow = {
   id: string;
   task_id: string;

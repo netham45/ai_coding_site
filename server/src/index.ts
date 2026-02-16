@@ -9,6 +9,7 @@ import { projectsRouter } from "./routes/projects.js";
 import { settingsRouter } from "./routes/settings.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { startIdeHeartbeat } from "./services/ide.js";
+import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { createTerminalGateway } from "./ws/terminalGateway.js";
@@ -63,6 +64,7 @@ server.listen(port, host, () => {
 startRuntimeHeartbeat().catch((error) => {
   console.warn(`Runtime heartbeat disabled: ${String((error as Error).message || error)}`);
 });
+startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {
   const now = nowIso();

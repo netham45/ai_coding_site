@@ -14,6 +14,7 @@ import {
   pullMainIntoTaskWorkspace
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
+import { kickTaskQueueProcessing } from "../services/queue.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
@@ -24,7 +25,8 @@ import { nowIso } from "../utils/time.js";
 const createTaskSchema = z.object({
   title: z.string().min(2).max(160),
   taskPrompt: z.string().min(1).max(12000),
-  aiCommand: z.string().min(1).max(500).optional()
+  aiCommand: z.string().min(1).max(500).optional(),
+  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional()
 });
 
 const patchTaskSchema = z.object({
@@ -76,6 +78,19 @@ function latestIde(taskId: string): IdeInstanceRow | undefined {
 }
 
 function serializeTask(task: TaskRow) {
+  const dependencyTaskIds = db
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const blockedByTaskIds = db
+    .prepare(
+      `SELECT td.dependency_task_id
+       FROM task_dependencies td
+       JOIN tasks dep ON dep.id = td.dependency_task_id
+       WHERE td.task_id = ? AND dep.status != 'merged'
+       ORDER BY dep.created_at ASC`
+    )
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+
   return {
     id: task.id,
     projectId: task.project_id,
@@ -90,10 +105,48 @@ function serializeTask(task: TaskRow) {
     cancelReason: task.cancel_reason,
     mergedAt: task.merged_at,
     mergedByUserId: task.merged_by_user_id,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
+    blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
+    isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
   };
+}
+
+function resolveTaskDependencies(params: { projectId: string; dependencyTaskIds: string[]; taskId?: string }): TaskRow[] {
+  const unique = [...new Set(params.dependencyTaskIds)];
+  if (unique.length !== params.dependencyTaskIds.length) {
+    throw new Error("Duplicate dependency ids are not allowed");
+  }
+  if (params.taskId && unique.includes(params.taskId)) {
+    throw new Error("A task cannot depend on itself");
+  }
+  if (unique.length === 0) {
+    return [];
+  }
+
+  const placeholders = unique.map(() => "?").join(", ");
+  const rows = db
+    .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
+    .all(params.projectId, ...unique) as TaskRow[];
+  if (rows.length !== unique.length) {
+    throw new Error("One or more dependencies were not found in this project");
+  }
+  return rows;
+}
+
+function taskIsBlocked(taskId: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT td.task_id
+       FROM task_dependencies td
+       JOIN tasks dep ON dep.id = td.dependency_task_id
+       WHERE td.task_id = ? AND dep.status != 'merged'
+       LIMIT 1`
+    )
+    .get(taskId) as { task_id: string } | undefined;
+  return Boolean(row?.task_id);
 }
 
 function serializeTransition(row: TaskTransitionRow) {
@@ -335,12 +388,26 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
+  const dependencyTaskIds = input.dependencyTaskIds ?? [];
+
+  let dependencies: TaskRow[];
+  try {
+    dependencies = resolveTaskDependencies({ projectId: project.id, dependencyTaskIds, taskId: id });
+  } catch (error: any) {
+    res.status(400).json({ error: String(error?.message ?? "Invalid dependencies") });
+    return;
+  }
+
+  const unresolvedDependencies = dependencies.filter((x) => x.status !== "merged");
+  const isBlocked = unresolvedDependencies.length > 0;
 
   let baseCommitSha: string;
   try {
     baseCommitSha = await getHeadCommitSha(project.base_path);
-    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath });
-    await createTaskBranch(workspacePath, id);
+    if (!isBlocked) {
+      await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath });
+      await createTaskBranch(workspacePath, id);
+    }
   } catch (error: any) {
     const message = String(error?.message ?? "Failed to initialize task workspace");
     res.status(500).json({ error: message });
@@ -371,7 +438,13 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     db.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(makeId(), id, "null", "queued", "task_created", req.user.id, now);
+    ).run(makeId(), id, "null", "queued", isBlocked ? "task_created_blocked" : "task_created", req.user.id, now);
+
+    for (const dependency of dependencies) {
+      db.prepare(
+        "INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)"
+      ).run(id, dependency.id, now);
+    }
   })();
 
   recordEvent({
@@ -382,11 +455,15 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       title: input.title,
       aiCommand,
       workspacePath,
-      baseCommitShaAtCreate: baseCommitSha
+      baseCommitShaAtCreate: baseCommitSha,
+      dependencyTaskIds: dependencies.map((x) => x.id),
+      blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
+      blocked: isBlocked
     }
   });
 
   const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
+  kickTaskQueueProcessing();
   res.status(201).json({ task: serializeTask(task) });
 });
 
@@ -480,6 +557,10 @@ tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  if (taskIsBlocked(task.id)) {
+    res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
+    return;
+  }
 
   try {
     await startTaskRuntime(task.id, req.user.id);
@@ -543,6 +624,10 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
 
   if (["merged", "cancelled", "failed"].includes(task.status)) {
     res.status(409).json({ error: "Cannot pull main into a terminal task state" });
+    return;
+  }
+  if (taskIsBlocked(task.id)) {
+    res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
   }
 
@@ -705,6 +790,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
   mergeLocks.add(project.id);
 
   try {
+    let queueKickNeeded = false;
     const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
     const targetBaseCommitSha = await getHeadCommitSha(project.base_path);
     const mergeRecordId = makeId();
@@ -774,6 +860,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
             targetBranch: project.default_branch
           }
         });
+        queueKickNeeded = true;
       }
     } catch (error: any) {
       const completedAt = nowIso();
@@ -790,6 +877,9 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
       .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
       .all(task.id) as MergeRecordRow[];
     res.json({ task: serializeTask(updatedTask), mergeRecords: mergeRecords.map(serializeMergeRecord) });
+    if (queueKickNeeded) {
+      kickTaskQueueProcessing();
+    }
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Merge failed") });
   } finally {
@@ -853,6 +943,10 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 
   if (["merged", "cancelled", "failed"].includes(task.status)) {
     res.status(409).json({ error: "IDE cannot be started for tasks in terminal states" });
+    return;
+  }
+  if (taskIsBlocked(task.id)) {
+    res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
   }
 

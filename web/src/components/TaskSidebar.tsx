@@ -11,6 +11,11 @@ function taskStatusColor(status: Task["status"]) {
   return "purple";
 }
 
+function taskStatusLabel(task: Task): string {
+  if (task.isBlocked) return "blocked";
+  return task.status;
+}
+
 export function TaskSidebar({
   tasks,
   selectedTaskId,
@@ -75,7 +80,7 @@ export function TaskSidebar({
               {task.title}
             </Link>
             <Box mt={1}>
-              <Badge colorScheme={taskStatusColor(task.status)}>{task.status}</Badge>
+              <Badge colorScheme={task.isBlocked ? "orange" : taskStatusColor(task.status)}>{taskStatusLabel(task)}</Badge>
             </Box>
           </Box>
         ))}

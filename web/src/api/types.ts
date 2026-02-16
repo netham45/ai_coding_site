@@ -41,6 +41,9 @@ export type Task = {
   cancelReason: string | null;
   mergedAt: string | null;
   mergedByUserId: string | null;
+  dependencyTaskIds: string[];
+  blockedByTaskIds: string[];
+  isBlocked: boolean;
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;
