@@ -272,6 +272,14 @@ export function ProjectDetailPage() {
     loadData().catch((error: Error) => {
       toast({ status: "error", title: "Failed to load project", description: error.message });
     });
+
+    const interval = setInterval(() => {
+      loadData().catch((error: Error) => {
+        console.error("Failed to poll project data", error);
+      });
+    }, 3000);
+
+    return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
