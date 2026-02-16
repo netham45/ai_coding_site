@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { api } from "../api/client";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, Project, Task, TaskSession, TaskTransition } from "../api/types";
+import type { GitStatusSummary, IdeInstance, MergeRecord, Project, Task, TaskSession, TaskStatus, TaskTransition } from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -38,9 +38,15 @@ type IdeStartResponse = {
 type TerminalMessage =
   | { type: "hello"; taskId: string; sessionId: string }
   | { type: "output"; data: string; reset?: boolean; cursorX?: number; cursorY?: number }
-  | { type: "status"; sessionStatus: string }
+  | { type: "status"; sessionStatus: string; taskStatus?: string }
   | { type: "error"; message: string }
   | { type: "ack" };
+
+const TASK_STATUSES: TaskStatus[] = ["queued", "in_progress", "waiting_input", "merge_ready", "merged", "cancelled", "failed", "merge_conflict"];
+
+function isTaskStatus(status: string): status is TaskStatus {
+  return TASK_STATUSES.includes(status as TaskStatus);
+}
 
 function statusColor(status: Task["status"]) {
   if (status === "queued") return "gray";
@@ -265,6 +271,27 @@ export function TaskDetailPage() {
         }
         if (payload.type === "error") {
           term?.writeln(`\r\n[error] ${payload.message}\r\n`);
+          return;
+        }
+        if (payload.type === "status") {
+          setSession((current) => {
+            if (!current || current.status === payload.sessionStatus) {
+              return current;
+            }
+            return { ...current, status: payload.sessionStatus as TaskSession["status"] };
+          });
+          const nextTaskStatus = payload.taskStatus;
+          if (nextTaskStatus && isTaskStatus(nextTaskStatus)) {
+            setTask((current) => {
+              if (!current || current.status === nextTaskStatus) {
+                return current;
+              }
+              return { ...current, status: nextTaskStatus };
+            });
+            setProjectTasks((current) =>
+              current.map((item) => (item.id === taskId && item.status !== nextTaskStatus ? { ...item, status: nextTaskStatus } : item))
+            );
+          }
         }
       };
 
