@@ -737,6 +737,16 @@ export function TaskDetailPage() {
                     </Stack>
                   )}
                 </Flex>
+
+                <Box>
+                  <Heading size="sm" mb={2}>
+                    Task Folder (Disk Path)
+                  </Heading>
+                  <Code display="block" whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
+                    {task.workspacePath}
+                  </Code>
+                </Box>
+
                 {task.mode === "plan" && (
                   <Box>
                     <Heading size="sm" mb={2}>
