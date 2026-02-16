@@ -101,6 +101,9 @@ function transitionTaskIfNeeded(params: {
   if (!row || row.status === params.toStatus) {
     return;
   }
+  if (params.toStatus === "waiting_input" && ["merged", "queued", "cancelled"].includes(row.status)) {
+    return;
+  }
   db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(params.toStatus, nowIso(), params.taskId);
   insertTransition({
     taskId: params.taskId,
@@ -330,6 +333,10 @@ async function monitorSession(session: SessionRow): Promise<void> {
 
   if (outputChanged) {
     db.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+    if (session.status === "waiting_input") {
+      db.prepare("UPDATE task_sessions SET status = 'running' WHERE id = ?").run(session.id);
+    }
+    transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "in_progress", reason: "runtime_output_activity" });
   }
 
   if (signal.sessionStatus === "waiting_input" && session.status !== "waiting_input") {
