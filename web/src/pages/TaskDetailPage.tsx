@@ -612,7 +612,7 @@ export function TaskDetailPage() {
                       size="sm"
                       onClick={markMergeReady}
                       isLoading={markingReady}
-                      isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict"].includes(task.status)}
+                      isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
                     >
                       Mark Merge Ready
                     </Button>

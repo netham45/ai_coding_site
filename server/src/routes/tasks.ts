@@ -359,7 +359,15 @@ function recordTaskTransition(params: {
 function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, actorUserId: string): TaskRow {
   const now = nowIso();
   db.transaction(() => {
-    db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+    if (nextStatus === "merged") {
+      db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+    } else {
+      db.prepare("UPDATE tasks SET status = ?, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
+        nextStatus,
+        now,
+        task.id
+      );
+    }
     recordTaskTransition({
       taskId: task.id,
       fromStatus: task.status,
@@ -698,7 +706,7 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     return;
   }
 
-  if (!["in_progress", "waiting_input", "merge_conflict"].includes(task.status)) {
+  if (!["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)) {
     res.status(409).json({ error: "Task cannot be marked merge-ready from current state" });
     return;
   }

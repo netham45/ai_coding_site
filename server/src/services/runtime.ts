@@ -183,6 +183,15 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
     });
   }
 
+  // Re-check task status after cleanup to avoid racing with cancel/merge actions.
+  const latestBeforeStart = getTask(task.id);
+  if (!latestBeforeStart) {
+    throw new Error("Task not found");
+  }
+  if (["merged", "cancelled", "merge_ready", "merge_conflict"].includes(latestBeforeStart.status)) {
+    throw new Error(`Task cannot be started from status ${latestBeforeStart.status}`);
+  }
+
   const effectivePrompt = buildEffectivePrompt(project, task.task_prompt);
   db.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
 
@@ -200,7 +209,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
   const latestTask = getTask(task.id);
-  if (latestTask && latestTask.status !== "in_progress") {
+  if (latestTask && ["queued", "failed", "waiting_input"].includes(latestTask.status)) {
     db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
     insertTransition({
       taskId: task.id,
