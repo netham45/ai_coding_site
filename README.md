@@ -1,167 +1,314 @@
-# AI Coding Web View - Phase 1 to Phase 6
+# AI Coding Site
 
-Implemented phases:
+AI Coding Site is a local-first web app for running AI coding tasks against Git repositories in isolated workspaces, with:
 
-- Phase 1: Project management + base repo clone + user settings + SSH keys
-- Phase 2: Task creation as isolated workspace clones + prompt composition + task metadata
-- Phase 3: Task runtime with tmux sessions + adapter scaffolding + start/input/stop controls
-- Phase 4: WebSocket terminal streaming with xterm.js
-- Phase 5: IDE instance model + tokenized IDE launch URL + terminal/IDE pane toggle + quick git status + live VS Code session launch
-- Phase 6: Merge/cancel workflow APIs + merge records + pull-main conflict helper + task info merge controls/audit
+- project management and repository cloning
+- execution tasks and plan tasks
+- tmux-backed runtime control (start/input/stop/rerun)
+- browser terminal streaming over WebSocket
+- browser IDE sessions via `code-server` or `openvscode-server`
+- merge/cancel workflow with merge audit records
 
-## Implemented backend
+## Table of Contents
 
-- SQLite pragmas enabled:
-  - `foreign_keys = ON`
-  - `journal_mode = WAL`
-  - `busy_timeout = 5000`
-- Tables:
-  - `users`
-  - `user_settings`
-  - `user_ssh_keys`
-  - `projects`
-  - `project_members`
-  - `tasks`
-  - `task_state_transitions`
-  - `task_sessions`
-  - `events`
-  - `ide_instances`
-  - `merge_records`
+- [Architecture](#architecture)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Running the app](#running-the-app)
+- [Usage flow](#usage-flow)
+- [API overview](#api-overview)
+- [Repository layout](#repository-layout)
+- [Troubleshooting](#troubleshooting)
+- [Development notes](#development-notes)
 
-### API endpoints
+## Architecture
+
+- `server/`: Express + TypeScript API, SQLite persistence, task runtime orchestration.
+- `web/`: React + Vite + Chakra UI frontend.
+- `data/app.sqlite`: runtime database created automatically.
+- `repos/`: cloned project bases and per-task workspaces.
+
+Runtime model:
+
+- Each task runs in its own tmux session.
+- Terminal output is captured and streamed to the frontend via `WS /ws/tasks/:taskId/terminal`.
+- IDE sessions run locally and are exposed through API proxy routes (`/api/tasks/:taskId/ide/proxy/...` and `/api/projects/:projectId/ide/proxy/...`).
+- A queue worker auto-starts unblocked queued tasks.
+
+## Features
+
+- Projects
+  - Create/list/update projects
+  - Clone repository base branch into `repos/<slug>/base`
+  - Search project files for `@file` prompt mentions
+  - Launch project-level IDE session
+- Tasks (execution mode)
+  - Create task workspaces from project base
+  - Track dependencies between tasks
+  - Start, send input, stop, rerun task runtimes
+  - Pull latest base branch into task branch
+  - Mark merge-ready, merge, cancel
+  - Store task summaries/results and merge records
+- Plans (plan mode)
+  - Create plan tasks that output structured YAML
+  - Extract and validate plan revisions
+  - Regenerate with feedback
+  - Approve plan revisions to create execution tasks
+- Terminal and IDE
+  - xterm.js terminal with reconnect behavior
+  - Tokenized terminal and IDE access URLs
+  - IDE provider auto-detection (`code-server` first, fallback `openvscode-server`)
+- Settings
+  - User-level default AI command template (for example `codex --yolo {prompt}`)
+
+## Requirements
+
+Required:
+
+- Node.js 18+
+- npm 9+
+- Git installed and available in `PATH`
+- tmux installed and available in `PATH`
+- Linux/macOS shell tools: `which`, `ps`, `ss`
+
+Recommended:
+
+- `code-server` or `openvscode-server` in `PATH` for in-browser IDE panes
+
+Notes:
+
+- This project is best run on Linux/macOS or WSL2.
+- On Windows without WSL, tmux and some shell utilities are typically unavailable.
+
+## Installation
+
+1. Clone the repository.
+2. Install workspace dependencies:
+
+```bash
+npm install
+```
+
+3. (Optional but recommended) Install an IDE provider:
+
+```bash
+# Option A
+code-server --version
+
+# Option B
+openvscode-server --version
+```
+
+4. Confirm required runtime tools:
+
+```bash
+node -v
+npm -v
+git --version
+tmux -V
+```
+
+### System package installation examples
+
+Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install -y git tmux iproute2 procps
+```
+
+macOS (Homebrew):
+
+```bash
+brew install git tmux
+```
+
+## Configuration
+
+Server environment variables:
+
+- `HOST`: bind host for API server. Default: `0.0.0.0`
+- `PORT`: API port. Default: `3001`
+- `TERMINAL_TOKEN_SECRET`: HMAC secret for terminal WS tokens. Default: `dev-terminal-secret`
+- `TERMINAL_TOKEN_TTL_SECONDS`: terminal token TTL in seconds. Default: `300`
+
+Example:
+
+```bash
+HOST=0.0.0.0
+PORT=3001
+TERMINAL_TOKEN_SECRET=replace-with-long-random-secret
+TERMINAL_TOKEN_TTL_SECONDS=300
+```
+
+Important behavior:
+
+- No `.env` loader is wired by default. Export env vars in your shell (or use your process manager).
+- Authentication is local-development style by default:
+  - if `x-user-id` header is missing, server falls back to a local seeded user.
+
+## Running the app
+
+### Development
+
+Start API server:
+
+```bash
+npm run dev -w server
+```
+
+Start frontend (new terminal):
+
+```bash
+npm run dev -w web
+```
+
+Or run just backend from workspace root:
+
+```bash
+npm run dev
+```
+
+URLs:
+
+- API: `http://localhost:3001`
+- Web: `http://localhost:5173`
+
+Vite dev server proxies:
+
+- `/api` -> `http://localhost:3001`
+- `/ws` -> `ws://localhost:3001`
+
+### Production build
+
+Build both packages:
+
+```bash
+npm run build
+```
+
+Start server build:
+
+```bash
+npm run start -w server
+```
+
+When `web/dist` exists, the server also serves the frontend for non-API routes.
+
+## Usage flow
+
+1. Open the app and create a project with repository URL and default branch.
+2. Wait until project clone status becomes `ready`.
+3. Create either:
+   - an execution task, or
+   - a plan task (then extract/approve plan items into execution tasks).
+4. Open a task:
+   - runtime and IDE attempt to auto-start
+   - use Terminal and IDE tabs to work with the agent session
+5. For finished work:
+   - pull base branch updates if needed
+   - mark task merge-ready
+   - merge and review merge records
+
+## API overview
+
+Health:
+
+- `GET /api/health`
 
 Projects:
 
-- `POST /api/projects`
 - `GET /api/projects`
+- `POST /api/projects`
 - `GET /api/projects/:projectId`
 - `PATCH /api/projects/:projectId`
+- `GET /api/projects/:projectId/files`
+- `POST /api/projects/:projectId/ide/start`
+- `POST /api/projects/:projectId/ide/stop`
+- `GET /api/projects/:projectId/ide/view?token=...`
+- `ANY /api/projects/:projectId/ide/proxy/*`
 
 Tasks:
 
-- `POST /api/projects/:projectId/tasks`
 - `GET /api/projects/:projectId/tasks`
+- `POST /api/projects/:projectId/tasks`
 - `GET /api/tasks/:taskId`
-- `PATCH /api/tasks/:taskId` (queued tasks only)
+- `PATCH /api/tasks/:taskId`
 - `POST /api/tasks/:taskId/start`
 - `POST /api/tasks/:taskId/input`
 - `POST /api/tasks/:taskId/stop`
+- `POST /api/tasks/:taskId/rerun`
+- `POST /api/tasks/:taskId/pull-main`
+- `POST /api/tasks/:taskId/mark-merge-ready`
+- `POST /api/tasks/:taskId/cancel`
+- `POST /api/tasks/:taskId/merge`
+- `GET /api/tasks/:taskId/merge-records`
 - `GET /api/tasks/:taskId/terminal-token`
 - `GET /api/tasks/:taskId/ide`
 - `POST /api/tasks/:taskId/ide/start`
 - `POST /api/tasks/:taskId/ide/token`
 - `POST /api/tasks/:taskId/ide/stop`
 - `GET /api/tasks/:taskId/ide/view?token=...`
-- `POST /api/tasks/:taskId/pull-main`
-- `POST /api/tasks/:taskId/mark-merge-ready`
-- `POST /api/tasks/:taskId/cancel`
-- `POST /api/tasks/:taskId/merge`
-- `GET /api/tasks/:taskId/merge-records`
+- `ANY /api/tasks/:taskId/ide/proxy/*`
 
-Terminal websocket:
+Plans:
 
-- `WS /ws/tasks/:taskId/terminal?token=...`
+- `POST /api/projects/:projectId/plans`
+- `GET /api/plans/:planId`
+- `POST /api/plans/:planId/extract`
+- `POST /api/plans/:planId/regenerate`
+- `POST /api/plans/:planId/approve`
 
 Settings:
 
 - `GET /api/users/me/settings`
 - `PATCH /api/users/me/settings`
 
-SSH keys:
+WebSocket:
 
-- `GET /api/users/me/ssh-keys`
-- `POST /api/users/me/ssh-keys`
-- `DELETE /api/users/me/ssh-keys/:sshKeyId`
+- `WS /ws/tasks/:taskId/terminal?token=...`
 
-## Phase 3 runtime behavior
+## Repository layout
 
-- Adapter interface includes:
-  - command build (`buildCommand`)
-  - tool classification (`codex`, `claude`, `custom`)
-  - lifecycle signal parsing from terminal output
-- Task start creates tmux-backed `task_sessions` rows with:
-  - stable session name: `task_<task_id>`
-  - dedicated socket path (short path under `/tmp/ai-coding-site-tmux`)
-- Heartbeat loop monitors active sessions and updates:
-  - `task_sessions.status`
-  - `task_sessions.last_heartbeat_at`
-  - task status transitions on crash/stop/signals
-- Startup recovery validates persisted active sessions and reconciles missing ones.
-
-## Phase 4 terminal behavior
-
-- Short-lived terminal token endpoint issues task-scoped ws credentials.
-- Websocket gateway attaches to active tmux task session and streams pane output.
-- Browser xterm terminal supports reconnect and fit behavior.
-
-## Implemented frontend
-
-- Chakra app shell + routes
-- Projects page:
-  - create project form
-  - project list with clone status/error badges
-- Project detail page:
-  - create task form (`title`, `taskPrompt`, `aiCommand`, `sshKeyId`)
-  - task list for project
-- Task detail page:
-  - task sidebar + tabbed content (`IDE`, `Terminal`, `Task Info`)
-  - auto-start runtime + IDE on task open
-  - fullscreen expand/collapse for IDE and terminal panes
-  - task info actions (pull-main, mark merge-ready, merge, cancel)
-  - task prompt/history and merge audit panel
-- Settings page:
-  - default AI command + default SSH key
-  - SSH key CRUD
-
-## Prerequisites
-
-- Node.js 18+
-- `git` available in PATH
-- `tmux` available in PATH (Phase 3 runtime)
-- `code-server` or `openvscode-server` available in PATH (Phase 5 IDE runtime)
-
-## Setup
-
-```bash
-npm install
+```text
+.
+├── server/
+│   ├── src/
+│   │   ├── routes/        # Projects, tasks, plans, settings APIs
+│   │   ├── services/      # Runtime, git, IDE, queue, prompt composition
+│   │   ├── ws/            # Terminal + IDE websocket gateways
+│   │   └── db/            # SQLite init/migrations
+├── web/
+│   └── src/
+│       ├── pages/         # Projects, project detail, task detail, settings
+│       ├── components/    # App shell + task sidebar
+│       └── api/           # frontend API client and types
+├── docs/                  # implementation phase notes and ADRs
+├── repos/                 # cloned project bases and task workspaces (runtime)
+└── data/                  # sqlite database (runtime)
 ```
 
-## Run
+## Troubleshooting
 
-API:
+- `tmux: command not found`
+  - Install tmux and restart the server.
+- `No IDE provider found. Install code-server or openvscode-server.`
+  - Install one provider or use terminal-only workflow.
+- Terminal does not connect
+  - Ensure API server is running and `TERMINAL_TOKEN_SECRET` is stable.
+  - Check browser can reach `/ws/...` through Vite proxy or direct server.
+- Project stays in clone `failed`
+  - Verify repository URL and git access credentials.
+- Task stays `queued`
+  - Check dependency tasks; queued tasks with unmet dependencies do not start.
+- Port conflicts
+  - Set a different `PORT` for server or free `3001`/`5173`.
 
-```bash
-npm run dev -w server
-```
+## Development notes
 
-Web:
-
-```bash
-npm run dev -w web
-```
-
-- API: `http://0.0.0.0:3001`
-- Web: `http://localhost:5173`
-
-## Build
-
-```bash
-npm run build
-```
-
-## Environment variables
-
-- `HOST`: API bind host (default `0.0.0.0`)
-- `PORT`: API port (default `3001`)
-- `SSH_ENCRYPTION_KEY`: key material used to encrypt SSH private keys at rest
-  - local fallback: `dev-only-change-me`
-  - set securely in non-dev environments
-- `TERMINAL_TOKEN_SECRET`: HMAC key for websocket terminal tokens
-- `TERMINAL_TOKEN_TTL_SECONDS`: terminal token lifetime in seconds (default `300`)
-
-## Current MVP constraints
-
-- Auth is simplified for local development (`x-user-id` optional).
-- Runtime is in-process (no separate worker yet).
-- Web terminal streaming is now implemented via xterm.js + websocket.
-- IDE is exposed through API-path proxy routes (HTTP + websocket) on the app port.
+- SQLite is initialized automatically on startup with WAL mode.
+- Runtime state is persisted in `task_sessions`, `task_state_transitions`, and `ide_instances`.
+- The AI command template must include `{prompt}` if you want prompt injection into command args.
+- Shell metacharacters in `aiCommand` are blocked by validation.
