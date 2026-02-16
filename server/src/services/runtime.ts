@@ -187,9 +187,6 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
   if (!task) {
     throw new Error("Task not found");
   }
-  if (task.result.trim().length > 0) {
-    return task.result.trim();
-  }
 
   const existing = readTaskSummaryFromWorkspace(task.workspace_path);
   if (existing) {
@@ -223,7 +220,7 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
     }
 
     const summary = readTaskSummaryFromWorkspace(latestTask.workspace_path);
-    if (summary && latestTask.status === "waiting_input") {
+    if (summary) {
       saveTaskResult(latestTask.id, summary);
       recordEvent({
         projectId: latestTask.project_id,
