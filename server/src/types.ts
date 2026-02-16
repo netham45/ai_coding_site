@@ -38,6 +38,7 @@ export type TaskRow = {
   task_prompt: string;
   effective_prompt: string;
   ai_command: string;
+  auto_merge: number;
   mode: TaskMode;
   parent_plan_task_id: string | null;
   source_plan_revision_id: string | null;

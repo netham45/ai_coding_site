@@ -36,6 +36,7 @@ export type Task = {
   taskPrompt: string;
   effectivePrompt: string;
   aiCommand: string;
+  autoMerge: boolean;
   mode: TaskMode;
   parentPlanTaskId: string | null;
   sourcePlanRevisionId: string | null;

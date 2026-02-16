@@ -2,6 +2,7 @@ import {
   Badge,
   Box,
   Button,
+  Checkbox,
   Code,
   Flex,
   FormControl,
@@ -36,6 +37,7 @@ type CreateTaskForm = {
   title: string;
   taskPrompt: string;
   aiCommand: string;
+  autoMerge: boolean;
   dependencyTaskIds: string[];
 };
 
@@ -57,6 +59,7 @@ const initialForm: CreateTaskForm = {
   title: "",
   taskPrompt: "",
   aiCommand: "codex --yolo {prompt}",
+  autoMerge: false,
   dependencyTaskIds: []
 };
 
@@ -309,6 +312,7 @@ export function ProjectDetailPage() {
           title: form.title,
           taskPrompt: form.taskPrompt,
           aiCommand: form.aiCommand,
+          autoMerge: form.autoMerge,
           dependencyTaskIds
         })
       });
@@ -478,6 +482,12 @@ export function ProjectDetailPage() {
                     <Text mt={1} fontSize="sm" color="gray.600">
                       Add dependencies one row at a time. This task stays blocked until all selected tasks are merged.
                     </Text>
+                  </FormControl>
+                  <FormControl>
+                    <FormLabel>Automation</FormLabel>
+                    <Checkbox isChecked={form.autoMerge} onChange={(e) => setForm((x) => ({ ...x, autoMerge: e.target.checked }))}>
+                      Auto-merge when waiting for input
+                    </Checkbox>
                   </FormControl>
                   <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
                     <FormLabel>Task Prompt</FormLabel>

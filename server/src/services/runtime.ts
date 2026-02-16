@@ -6,7 +6,16 @@ import type { ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
-import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "./git.js";
+import {
+  cloneLocalBaseToWorkspace,
+  createTaskBranch,
+  getHeadCommitSha,
+  getWorkspaceGitStatus,
+  mergeTaskWorkspaceIntoTarget,
+  pullRemoteRefIntoTaskWorkspace,
+  pushBranchToOrigin,
+  taskBranchName
+} from "./git.js";
 import { buildEffectivePrompt } from "./promptBuilder.js";
 import { buildCommand, parseLifecycleSignals } from "./adapters.js";
 import {
@@ -42,6 +51,9 @@ type SessionRow = {
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
 const WAITING_INPUT_IDLE_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 1000;
+const AUTO_MERGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
+const AUTO_MERGE_POLL_INTERVAL_MS = 1250;
+const autoMergeTaskIds = new Set<string>();
 
 function getTask(taskId: string): TaskRow | undefined {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
@@ -133,6 +145,258 @@ function transitionTaskIfNeeded(params: {
     toStatus: params.toStatus,
     reason: params.reason,
     actorUserId: params.actorUserId
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function updateTaskStatus(params: {
+  taskId: string;
+  toStatus: TaskStatus;
+  reason: string;
+  actorUserId?: string | null;
+  mergedAt?: string | null;
+  mergedByUserId?: string | null;
+  headCommitSha?: string | null;
+}): void {
+  const row = getTask(params.taskId);
+  if (!row || row.status === params.toStatus) {
+    return;
+  }
+
+  db.prepare(
+    `UPDATE tasks
+     SET status = ?,
+         merged_at = ?,
+         merged_by_user_id = ?,
+         head_commit_sha = COALESCE(?, head_commit_sha),
+         updated_at = ?
+     WHERE id = ?`
+  ).run(
+    params.toStatus,
+    params.mergedAt ?? null,
+    params.mergedByUserId ?? null,
+    params.headCommitSha ?? null,
+    nowIso(),
+    params.taskId
+  );
+
+  insertTransition({
+    taskId: params.taskId,
+    fromStatus: row.status,
+    toStatus: params.toStatus,
+    reason: params.reason,
+    actorUserId: params.actorUserId
+  });
+}
+
+async function awaitAutoMergeReady(taskId: string, actorUserId: string): Promise<TaskRow> {
+  const deadline = Date.now() + AUTO_MERGE_READY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const task = getTask(taskId);
+    if (!task) {
+      throw new Error("Task not found");
+    }
+    if (task.status === "merge_ready") {
+      return task;
+    }
+    if (["cancelled", "failed", "merge_conflict", "merged"].includes(task.status)) {
+      throw new Error(`Task entered terminal state ${task.status} before auto-merge could proceed`);
+    }
+
+    const gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+    const cleanWorkspace =
+      gitStatus.untracked === 0 &&
+      gitStatus.staged === 0 &&
+      gitStatus.unstaged === 0 &&
+      gitStatus.conflicted === 0;
+    if (cleanWorkspace && ["in_progress", "waiting_input"].includes(task.status)) {
+      try {
+        const sessions = getActiveSessions(task.id);
+        if (sessions.length) {
+          await stopTaskRuntime(task.id, actorUserId);
+        }
+      } catch {
+        // Best effort. If stop fails due stale session, continue.
+      }
+      updateTaskStatus({
+        taskId: task.id,
+        toStatus: "merge_ready",
+        reason: "auto_merge_marked_merge_ready",
+        actorUserId
+      });
+      const ready = getTask(task.id);
+      if (ready && ready.status === "merge_ready") {
+        return ready;
+      }
+    }
+
+    await sleep(AUTO_MERGE_POLL_INTERVAL_MS);
+  }
+
+  throw new Error("Timed out waiting for task to become merge_ready during auto-merge");
+}
+
+async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Promise<void> {
+  try {
+    const sessions = getActiveSessions(taskId);
+    for (const _session of sessions) {
+      await stopTaskRuntime(taskId, actorUserId);
+    }
+  } catch {
+    // Best effort to ensure runtime is idle.
+  }
+
+  const task = getTask(taskId);
+  if (!task) {
+    return;
+  }
+  if (!["merged", "cancelled"].includes(task.status)) {
+    updateTaskStatus({
+      taskId,
+      toStatus: "waiting_input",
+      reason: "auto_merge_failed_waiting_input",
+      actorUserId
+    });
+  }
+}
+
+async function runAutoMerge(taskId: string): Promise<void> {
+  const task = getTask(taskId);
+  if (!task || !task.auto_merge || task.status !== "waiting_input") {
+    return;
+  }
+
+  const project = getProject(task.project_id);
+  if (!project) {
+    throw new Error("Project not found");
+  }
+
+  const actorUserId = task.created_by_user_id;
+  const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
+  const targetBaseCommitSha = await getHeadCommitSha(project.base_path);
+  const mergeRecordId = makeId();
+  const mergeStartedAt = nowIso();
+
+  db.prepare(
+    `INSERT INTO merge_records (
+      id, task_id, project_id, source_commit_sha, target_base_commit_sha, merge_commit_sha, status,
+      conflict_summary, error_message, created_by_user_id, created_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, ?, ?, NULL)`
+  ).run(mergeRecordId, task.id, project.id, sourceCommitSha, targetBaseCommitSha, actorUserId, mergeStartedAt);
+
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "task.auto_merge.started",
+    payload: {}
+  });
+
+  try {
+    const pullResult = await pullRemoteRefIntoTaskWorkspace({
+      workspacePath: task.workspace_path,
+      remoteRef: project.default_branch
+    });
+    db.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, nowIso(), task.id);
+    if (pullResult.conflicted) {
+      throw new Error(
+        pullResult.conflictFiles.length
+          ? `Pull from ${project.default_branch} resulted in conflicts: ${pullResult.conflictFiles.join(", ")}`
+          : `Pull from ${project.default_branch} resulted in conflicts`
+      );
+    }
+
+    await sendTaskRuntimeInput(
+      task.id,
+      actorUserId,
+      [
+        "Auto-merge requested.",
+        "Please do all of the following now:",
+        "1) Pull in any latest changes if needed.",
+        "2) Resolve any issues.",
+        "3) Commit all required code changes to this task branch.",
+        "4) Exit the runtime with code 0 when done."
+      ].join("\n")
+    );
+
+    const mergeReadyTask = await awaitAutoMergeReady(task.id, actorUserId);
+    const mergeResult = await mergeTaskWorkspaceIntoTarget({
+      targetPath: project.base_path,
+      targetBranch: project.default_branch,
+      syncTargetBranchFromOrigin: true,
+      workspacePath: mergeReadyTask.workspace_path,
+      taskId: mergeReadyTask.id
+    });
+    if (mergeResult.conflicted) {
+      throw new Error(
+        mergeResult.conflictFiles.length
+          ? `Merge into ${project.default_branch} conflicted: ${mergeResult.conflictFiles.join(", ")}`
+          : `Merge into ${project.default_branch} conflicted`
+      );
+    }
+
+    await pushBranchToOrigin({ repoPath: project.base_path, branch: project.default_branch });
+
+    const completedAt = nowIso();
+    db.transaction(() => {
+      db.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+        mergeResult.mergeCommitSha,
+        completedAt,
+        mergeRecordId
+      );
+      db.prepare(
+        "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
+      ).run(completedAt, actorUserId, mergeResult.mergeCommitSha, completedAt, task.id);
+      insertTransition({
+        taskId: task.id,
+        fromStatus: "merge_ready",
+        toStatus: "merged",
+        reason: "auto_merge_success",
+        actorUserId
+      });
+    })();
+
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "task.auto_merge.merged",
+      payload: {
+        targetBranch: project.default_branch,
+        mergeCommitSha: mergeResult.mergeCommitSha
+      }
+    });
+  } catch (error: any) {
+    const completedAt = nowIso();
+    db.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
+      String(error?.message ?? "auto-merge failed"),
+      completedAt,
+      mergeRecordId
+    );
+    await ensureIdleWaitingInput(task.id, actorUserId);
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "task.auto_merge.failed",
+      payload: { error: String(error?.message ?? "auto-merge failed") }
+    });
+  }
+}
+
+function maybeStartAutoMerge(taskId: string): void {
+  if (autoMergeTaskIds.has(taskId)) {
+    return;
+  }
+  const task = getTask(taskId);
+  if (!task || !task.auto_merge || task.status !== "waiting_input") {
+    return;
+  }
+
+  autoMergeTaskIds.add(taskId);
+  void runAutoMerge(taskId).finally(() => {
+    autoMergeTaskIds.delete(taskId);
   });
 }
 
@@ -348,6 +612,7 @@ export async function stopTaskRuntime(taskId: string, actorUserId: string): Prom
   );
 
   transitionTaskIfNeeded({ taskId, toStatus: "waiting_input", reason: "session_stopped_by_user", actorUserId });
+  maybeStartAutoMerge(taskId);
 
   const task = getTask(taskId);
   if (task) {
@@ -423,6 +688,7 @@ async function monitorSession(session: SessionRow): Promise<void> {
   if (!outputChanged && session.status === "running" && idleMs >= WAITING_INPUT_IDLE_MS) {
     db.prepare("UPDATE task_sessions SET status = 'waiting_input' WHERE id = ?").run(session.id);
     transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "waiting_input", reason: "runtime_idle_no_output" });
+    maybeStartAutoMerge(session.task_id);
   }
 
   if (signal.taskStatus) {
@@ -431,6 +697,9 @@ async function monitorSession(session: SessionRow): Promise<void> {
       toStatus: signal.taskStatus,
       reason: signal.reason || "adapter_signal"
     });
+    if (signal.taskStatus === "waiting_input") {
+      maybeStartAutoMerge(session.task_id);
+    }
   }
 }
 

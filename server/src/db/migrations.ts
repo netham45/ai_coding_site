@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_prompt TEXT NOT NULL,
   effective_prompt TEXT NOT NULL,
   ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+  auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
   mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
   parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
   source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
