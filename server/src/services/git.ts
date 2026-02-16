@@ -135,6 +135,33 @@ export async function createTaskBranch(workspacePath: string, taskId: string): P
   }
 }
 
+export async function refreshBaseFromOrigin(params: { basePath: string; defaultBranch: string }): Promise<string> {
+  try {
+    await execFileAsync("git", ["-C", params.basePath, "fetch", "origin", params.defaultBranch], {
+      timeout: 45000,
+      env: nonInteractiveGitEnv()
+    });
+    await execFileAsync("git", ["-C", params.basePath, "checkout", params.defaultBranch], {
+      timeout: 15000,
+      env: nonInteractiveGitEnv()
+    });
+    await execFileAsync("git", ["-C", params.basePath, "reset", "--hard", `origin/${params.defaultBranch}`], {
+      timeout: 30000,
+      env: nonInteractiveGitEnv()
+    });
+    await execFileAsync("git", ["-C", params.basePath, "clean", "-fd"], {
+      timeout: 20000,
+      env: nonInteractiveGitEnv()
+    });
+  } catch (error: any) {
+    const stderr = error?.stderr ? String(error.stderr) : "";
+    const message = stderr.trim() || error?.message || "failed to refresh base repository";
+    throw new Error(message);
+  }
+
+  return getHeadCommitSha(params.basePath);
+}
+
 export type WorkspaceGitStatus = {
   branch: string;
   ahead: number;

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { createHash, randomBytes } from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { z } from "zod";
@@ -9,6 +10,7 @@ import {
   cloneLocalBaseToWorkspace,
   createTaskBranch,
   getHeadCommitSha,
+  refreshBaseFromOrigin,
   getWorkspaceGitStatus,
   mergeTaskWorkspaceIntoBase,
   pullMainIntoTaskWorkspace
@@ -16,6 +18,7 @@ import {
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
+import { hasSession, killSession } from "../services/tmux.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -69,6 +72,12 @@ function latestSession(taskId: string): TaskSessionRow | undefined {
   return db
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as TaskSessionRow | undefined;
+}
+
+function activeSessions(taskId: string): TaskSessionRow[] {
+  return db
+    .prepare("SELECT * FROM task_sessions WHERE task_id = ? AND status IN ('starting','running','waiting_input')")
+    .all(taskId) as TaskSessionRow[];
 }
 
 function latestIde(taskId: string): IdeInstanceRow | undefined {
@@ -764,6 +773,92 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
     }
   });
   res.json({ task: serializeTask(updated) });
+});
+
+tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
+  const task = taskForUser(req.params.taskId, req.user.id);
+  if (!task) {
+    res.status(404).json({ error: "Task not found" });
+    return;
+  }
+
+  const project = projectForUser(task.project_id, req.user.id);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  if (project.clone_status !== "ready") {
+    res.status(409).json({ error: "Project base repository is not ready" });
+    return;
+  }
+
+  const now = nowIso();
+  try {
+    const ide = latestIde(task.id);
+    if (ide && ["starting", "running"].includes(ide.status) && ideSessionRunning(task.id)) {
+      stopIdeSession(task.id);
+    }
+    if (ide && ["starting", "running"].includes(ide.status)) {
+      db.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
+    }
+
+    const sessions = activeSessions(task.id);
+    for (const session of sessions) {
+      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+      if (alive) {
+        await killSession(session.tmux_socket_path, session.tmux_session_name);
+      }
+      db.prepare(
+        "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'task_rerun_reset') WHERE id = ?"
+      ).run(nowIso(), nowIso(), session.id);
+    }
+
+    await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
+    const baseCommitSha = await refreshBaseFromOrigin({
+      basePath: project.base_path,
+      defaultBranch: project.default_branch
+    });
+    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: task.workspace_path });
+    await createTaskBranch(task.workspace_path, task.id);
+
+    const latestTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    const updatedAt = nowIso();
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE tasks
+         SET status = 'queued',
+             workspace_path = ?,
+             base_commit_sha_at_create = ?,
+             head_commit_sha = NULL,
+             cancel_reason = NULL,
+             merged_at = NULL,
+             merged_by_user_id = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(task.workspace_path, baseCommitSha, updatedAt, task.id);
+      recordTaskTransition({
+        taskId: task.id,
+        fromStatus: latestTask.status,
+        toStatus: "queued",
+        reason: "task_rerun_reset",
+        actorUserId: req.user.id
+      });
+    })();
+
+    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "task.rerun",
+      payload: {
+        previousStatus: latestTask.status,
+        baseCommitShaAtCreate: baseCommitSha
+      }
+    });
+    res.json({ task: serializeTask(updated) });
+  } catch (error: any) {
+    res.status(409).json({ error: String(error?.message ?? "Failed to re-run task") });
+  }
 });
 
 tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
