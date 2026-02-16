@@ -1036,12 +1036,8 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
     return;
   }
 
-  if (["merged", "cancelled", "failed"].includes(task.status)) {
-    res.status(409).json({ error: "IDE cannot be started for tasks in terminal states" });
-    return;
-  }
-  if (taskIsBlocked(task.id)) {
-    res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
+  if (!fs.existsSync(task.workspace_path)) {
+    res.status(409).json({ error: "Task workspace folder is missing" });
     return;
   }
 
