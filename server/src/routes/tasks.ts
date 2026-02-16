@@ -10,7 +10,6 @@ import {
   cloneLocalBaseToWorkspace,
   createTaskBranch,
   getHeadCommitSha,
-  refreshBaseFromOrigin,
   getWorkspaceGitStatus,
   mergeTaskWorkspaceIntoBase,
   pullMainIntoTaskWorkspace
@@ -45,6 +44,13 @@ const cancelTaskSchema = z.object({
 });
 
 const mergeLocks = new Set<string>();
+
+function isSafeTaskWorkspacePath(workspacePath: string, projectBasePath: string): boolean {
+  const resolvedWorkspacePath = path.resolve(workspacePath);
+  const projectTasksRoot = path.resolve(path.dirname(projectBasePath), "tasks");
+  const relative = path.relative(projectTasksRoot, resolvedWorkspacePath);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
   return db
@@ -831,11 +837,12 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       ).run(nowIso(), nowIso(), session.id);
     }
 
+    if (!isSafeTaskWorkspacePath(task.workspace_path, project.base_path)) {
+      throw new Error("Unsafe task workspace path; refusing to reset outside task workspace directory");
+    }
+
     await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
-    const baseCommitSha = await refreshBaseFromOrigin({
-      basePath: project.base_path,
-      defaultBranch: project.default_branch
-    });
+    const baseCommitSha = await getHeadCommitSha(project.base_path);
     await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: task.workspace_path });
     await createTaskBranch(task.workspace_path, task.id);
 

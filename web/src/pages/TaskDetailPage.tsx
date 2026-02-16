@@ -451,7 +451,7 @@ export function TaskDetailPage() {
   async function rerunTask() {
     if (!taskId) return;
     const confirmed = window.confirm(
-      "Re-run this task?\n\nThis will reset this task workspace repo to the latest base state and restart the task.\nAll unpushed task progress will be permanently lost."
+      "Re-run this task?\n\nThis will reset only this task workspace repo to the current local base snapshot and restart the task.\nAll unpushed task progress will be permanently lost."
     );
     if (!confirmed) return;
 
