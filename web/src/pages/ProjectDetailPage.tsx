@@ -53,6 +53,8 @@ const initialForm: CreateTaskForm = {
   dependencyTaskIds: []
 };
 
+const NON_SELECTABLE_DEPENDENCY_STATUSES = new Set(["merged", "cancelled", "failed"]);
+
 const CODING_STANDARD_OPTIONS = [
   { value: "", label: "None selected" },
   { value: "Airbnb JavaScript Style Guide", label: "Airbnb JavaScript Style Guide" },
@@ -97,6 +99,12 @@ export function ProjectDetailPage() {
   const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
   const [mentionQuery, setMentionQuery] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [dependencySelections, setDependencySelections] = useState<string[]>([""]);
+
+  const selectableDependencyTasks = useMemo(
+    () => tasks.filter((task) => !NON_SELECTABLE_DEPENDENCY_STATUSES.has(task.status)),
+    [tasks]
+  );
 
   const canCreate = useMemo(() => {
     return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0;
@@ -194,6 +202,15 @@ export function ProjectDetailPage() {
     };
   }, []);
 
+  useEffect(() => {
+    const selectableIds = new Set(selectableDependencyTasks.map((task) => task.id));
+    setDependencySelections((prev) => {
+      const next = prev.map((id) => (id && selectableIds.has(id) ? id : ""));
+      const hasChanged = next.length !== prev.length || next.some((id, index) => id !== prev[index]);
+      return hasChanged ? next : prev;
+    });
+  }, [selectableDependencyTasks]);
+
   async function loadData() {
     if (!projectId) return;
     const [projectRes, tasksRes] = await Promise.all([
@@ -263,6 +280,8 @@ export function ProjectDetailPage() {
     event.preventDefault();
     if (!projectId) return;
 
+    const dependencyTaskIds = [...new Set(dependencySelections.filter((id) => id))];
+
     setLoading(true);
     try {
       const created = await api<{ task: Task }>(`/api/projects/${projectId}/tasks`, {
@@ -271,10 +290,11 @@ export function ProjectDetailPage() {
           title: form.title,
           taskPrompt: form.taskPrompt,
           aiCommand: form.aiCommand,
-          dependencyTaskIds: form.dependencyTaskIds
+          dependencyTaskIds
         })
       });
       setForm(initialForm);
+      setDependencySelections([""]);
       await loadData();
       toast({ status: "success", title: "Task created" });
       navigate(`/tasks/${created.task.id}?tab=ide`);
@@ -363,23 +383,55 @@ export function ProjectDetailPage() {
                   </FormControl>
                   <FormControl>
                     <FormLabel>Dependencies</FormLabel>
-                    <Select
-                      multiple
-                      value={form.dependencyTaskIds}
-                      onChange={(e) => {
-                        const selected = Array.from(e.target.selectedOptions).map((opt) => opt.value);
-                        setForm((x) => ({ ...x, dependencyTaskIds: selected }));
-                      }}
-                      h="140px"
-                    >
-                      {tasks.map((task) => (
-                        <option key={task.id} value={task.id}>
-                          {task.title} ({task.isBlocked ? "blocked" : task.status})
-                        </option>
+                    <Stack spacing={2}>
+                      {dependencySelections.map((selectedId, index) => (
+                        <Flex key={`dependency-row-${index}`} gap={2}>
+                          <Select
+                            placeholder="Select dependency"
+                            value={selectedId}
+                            onChange={(e) => {
+                              const value = e.target.value;
+                              setDependencySelections((prev) => prev.map((id, rowIndex) => (rowIndex === index ? value : id)));
+                            }}
+                          >
+                            {selectableDependencyTasks.map((task) => {
+                              const selectedElsewhere = dependencySelections.includes(task.id) && selectedId !== task.id;
+                              return (
+                                <option key={task.id} value={task.id} disabled={selectedElsewhere}>
+                                  {task.title} ({task.isBlocked ? "blocked" : task.status})
+                                </option>
+                              );
+                            })}
+                          </Select>
+                          <Button
+                            type="button"
+                            size="sm"
+                            minW="40px"
+                            onClick={() => {
+                              setDependencySelections((prev) => [...prev, ""]);
+                            }}
+                          >
+                            +
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            minW="40px"
+                            onClick={() => {
+                              setDependencySelections((prev) => {
+                                if (prev.length === 1) return [""];
+                                return prev.filter((_, rowIndex) => rowIndex !== index);
+                              });
+                            }}
+                            isDisabled={dependencySelections.length === 1}
+                          >
+                            -
+                          </Button>
+                        </Flex>
                       ))}
-                    </Select>
+                    </Stack>
                     <Text mt={1} fontSize="sm" color="gray.600">
-                      Select any number of tasks. This task stays blocked until all selected tasks are merged.
+                      Add dependencies one row at a time. This task stays blocked until all selected tasks are merged.
                     </Text>
                   </FormControl>
                   <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
