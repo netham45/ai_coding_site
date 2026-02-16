@@ -85,6 +85,7 @@ export function ProjectDetailPage() {
   const [projectIdeStartFailed, setProjectIdeStartFailed] = useState(false);
   const [projectIdeRetryNonce, setProjectIdeRetryNonce] = useState(0);
   const [expandedIde, setExpandedIde] = useState(false);
+  const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
   const projectIdeAutoAttemptedRef = useRef(false);
   const taskPromptRef = useRef<HTMLTextAreaElement | null>(null);
   const suggestionRequestSeqRef = useRef(0);
@@ -212,6 +213,7 @@ export function ProjectDetailPage() {
     setProjectIdeLaunchUrl(null);
     setActivePane("tasks");
     setExpandedIde(false);
+    setIsTaskSidebarCollapsed(false);
     setProjectIdeStartFailed(false);
     setProjectIdeRetryNonce(0);
     projectIdeAutoAttemptedRef.current = false;
@@ -318,7 +320,7 @@ export function ProjectDetailPage() {
 
   return (
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
-      <TaskSidebar tasks={tasks} />
+      <TaskSidebar tasks={tasks} isCollapsed={isTaskSidebarCollapsed} onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)} />
 
       <Box flex="1" bg="white" borderRadius="lg" p={6} boxShadow="sm" border="1px solid" borderColor="blackAlpha.200">
         <Box mb={6}>

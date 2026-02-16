@@ -1,4 +1,5 @@
-import { Badge, Box, Heading, Link, Stack, Text } from "@chakra-ui/react";
+import { Badge, Box, Button, Flex, Heading, Link, Stack, Text } from "@chakra-ui/react";
+import { ChevronLeftIcon, ChevronRightIcon } from "@chakra-ui/icons";
 import { Link as RouterLink } from "react-router-dom";
 import type { Task } from "../api/types";
 
@@ -12,16 +13,54 @@ function taskStatusColor(status: Task["status"]) {
 
 export function TaskSidebar({
   tasks,
-  selectedTaskId
+  selectedTaskId,
+  isCollapsed = false,
+  onToggleCollapse
 }: {
   tasks: Task[];
   selectedTaskId?: string | null;
+  isCollapsed?: boolean;
+  onToggleCollapse?: () => void;
 }) {
+  if (isCollapsed) {
+    return (
+      <Box
+        w={{ base: "full", lg: "76px" }}
+        bg="white"
+        borderRadius="lg"
+        p={3}
+        boxShadow="sm"
+        border="1px solid"
+        borderColor="blackAlpha.200"
+      >
+        <Flex direction={{ base: "row", lg: "column" }} align="center" justify="center" gap={2}>
+          <Button
+            size="xs"
+            variant="ghost"
+            onClick={onToggleCollapse}
+            leftIcon={<ChevronRightIcon />}
+            aria-label="Show tasks sidebar"
+          >
+            Show
+          </Button>
+          <Text fontSize="xs" color="gray.600" display={{ base: "block", lg: "none" }}>
+            Tasks hidden
+          </Text>
+        </Flex>
+      </Box>
+    );
+  }
+
   return (
     <Box w={{ base: "full", lg: "320px" }} bg="white" borderRadius="lg" p={4} boxShadow="sm" border="1px solid" borderColor="blackAlpha.200">
-      <Heading size="sm" mb={3}>
-        Tasks
-      </Heading>
+      <Flex align="center" justify="space-between" mb={3}>
+        <Heading size="sm">Tasks</Heading>
+        {onToggleCollapse ? (
+          <Button size="xs" variant="ghost" onClick={onToggleCollapse} leftIcon={<ChevronLeftIcon />} aria-label="Collapse tasks sidebar">
+            Hide
+          </Button>
+        ) : null}
+      </Flex>
       <Stack spacing={2}>
         {tasks.map((task) => (
           <Box

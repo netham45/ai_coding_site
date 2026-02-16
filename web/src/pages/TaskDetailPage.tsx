@@ -77,6 +77,7 @@ export function TaskDetailPage() {
   const [mergingTask, setMergingTask] = useState(false);
   const [markingReady, setMarkingReady] = useState(false);
   const [cancellingTask, setCancellingTask] = useState(false);
+  const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
 
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -110,6 +111,7 @@ export function TaskDetailPage() {
     const tab = searchParams.get("tab");
     setActivePane(tab === "terminal" ? "terminal" : tab === "info" ? "info" : "ide");
     setExpandedPane(null);
+    setIsTaskSidebarCollapsed(false);
     loadTask().catch((error: Error) => {
       toast({ status: "error", title: "Failed to load task", description: error.message });
     });
@@ -463,7 +465,14 @@ export function TaskDetailPage() {
 
   return (
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
-      {!expandedPane && <TaskSidebar tasks={projectTasks} selectedTaskId={task.id} />}
+      {!expandedPane && (
+        <TaskSidebar
+          tasks={projectTasks}
+          selectedTaskId={task.id}
+          isCollapsed={isTaskSidebarCollapsed}
+          onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)}
+        />
+      )}
 
       <Box flex="1" bg="white" borderRadius={expandedPane ? "none" : "lg"} p={expandedPane ? 0 : 6} boxShadow={expandedPane ? "none" : "sm"} border={expandedPane ? "none" : "1px solid"} borderColor="blackAlpha.200">
         <Box mb={4}>
