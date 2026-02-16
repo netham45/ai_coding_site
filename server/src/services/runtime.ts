@@ -6,7 +6,7 @@ import type { ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
-import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha } from "./git.js";
+import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "./git.js";
 import { buildEffectivePrompt } from "./promptBuilder.js";
 import { buildCommand, parseLifecycleSignals } from "./adapters.js";
 import {
@@ -49,6 +49,13 @@ function getTask(taskId: string): TaskRow | undefined {
 
 function getProject(projectId: string): ProjectRow | undefined {
   return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as ProjectRow | undefined;
+}
+
+function getParentPlanTask(task: TaskRow): TaskRow | undefined {
+  if (!task.parent_plan_task_id) {
+    return undefined;
+  }
+  return db.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(task.parent_plan_task_id) as TaskRow | undefined;
 }
 
 function taskIsBlocked(taskId: string): boolean {
@@ -161,8 +168,23 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   }
   const workspaceGitPath = path.join(task.workspace_path, ".git");
   if (!fs.existsSync(workspaceGitPath)) {
-    const baseCommitSha = await getHeadCommitSha(project.base_path);
-    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: task.workspace_path });
+    let sourcePath = project.base_path;
+    let sourceBranch = project.default_branch;
+    if (task.parent_plan_task_id) {
+      const parentPlanTask = getParentPlanTask(task);
+      if (!parentPlanTask) {
+        throw new Error("Parent plan task not found");
+      }
+      sourcePath = parentPlanTask.workspace_path;
+      sourceBranch = taskBranchName(parentPlanTask.id);
+    }
+
+    const baseCommitSha = await getHeadCommitSha(sourcePath);
+    await cloneLocalBaseToWorkspace({
+      basePath: sourcePath,
+      baseBranch: sourceBranch,
+      workspacePath: task.workspace_path
+    });
     await createTaskBranch(task.workspace_path, task.id);
     db.prepare("UPDATE tasks SET base_commit_sha_at_create = ?, updated_at = ? WHERE id = ?").run(baseCommitSha, nowIso(), task.id);
   }

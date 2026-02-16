@@ -11,8 +11,9 @@ import {
   createTaskBranch,
   getHeadCommitSha,
   getWorkspaceGitStatus,
-  mergeTaskWorkspaceIntoBase,
-  pullMainIntoTaskWorkspace
+  mergeTaskWorkspaceIntoTarget,
+  pullRemoteRefIntoTaskWorkspace,
+  taskBranchName
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
@@ -72,6 +73,59 @@ function taskForUser(taskId: string, userId: string): TaskRow | undefined {
        WHERE t.id = ? AND pm.user_id = ?`
     )
     .get(taskId, userId) as TaskRow | undefined;
+}
+
+function parentPlanTaskForUser(task: TaskRow, userId: string): TaskRow | undefined {
+  if (!task.parent_plan_task_id) {
+    return undefined;
+  }
+  return db
+    .prepare(
+      `SELECT t.*
+       FROM tasks t
+       JOIN project_members pm ON pm.project_id = t.project_id
+       WHERE t.id = ? AND pm.user_id = ? AND t.mode = 'plan'`
+    )
+    .get(task.parent_plan_task_id, userId) as TaskRow | undefined;
+}
+
+type TaskGitTopology = {
+  sourceRepoPath: string;
+  sourceBranch: string;
+  pullRemoteRef: string;
+  mergeTargetPath: string;
+  mergeTargetBranch: string;
+  syncMergeTargetFromOrigin: boolean;
+  mergeLockKey: string;
+};
+
+function resolveTaskGitTopology(params: { task: TaskRow; project: ProjectRow; parentPlanTask?: TaskRow | undefined }): TaskGitTopology {
+  if (params.task.parent_plan_task_id) {
+    const parentPlan = params.parentPlanTask;
+    if (!parentPlan) {
+      throw new Error("Parent plan task not found");
+    }
+    const planBranch = taskBranchName(parentPlan.id);
+    return {
+      sourceRepoPath: parentPlan.workspace_path,
+      sourceBranch: planBranch,
+      pullRemoteRef: planBranch,
+      mergeTargetPath: parentPlan.workspace_path,
+      mergeTargetBranch: planBranch,
+      syncMergeTargetFromOrigin: false,
+      mergeLockKey: `repo:${path.resolve(parentPlan.workspace_path)}`
+    };
+  }
+
+  return {
+    sourceRepoPath: params.project.base_path,
+    sourceBranch: params.project.default_branch,
+    pullRemoteRef: params.project.default_branch,
+    mergeTargetPath: params.project.base_path,
+    mergeTargetBranch: params.project.default_branch,
+    syncMergeTargetFromOrigin: true,
+    mergeLockKey: `repo:${path.resolve(params.project.base_path)}`
+  };
 }
 
 function latestSession(taskId: string): TaskSessionRow | undefined {
@@ -432,7 +486,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   try {
     baseCommitSha = await getHeadCommitSha(project.base_path);
     if (!isBlocked) {
-      await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath });
+      await cloneLocalBaseToWorkspace({ basePath: project.base_path, baseBranch: project.default_branch, workspacePath });
       await createTaskBranch(workspacePath, id);
     }
   } catch (error: any) {
@@ -664,12 +718,20 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
     res.status(404).json({ error: "Project not found" });
     return;
   }
-
-  let pullResult: Awaited<ReturnType<typeof pullMainIntoTaskWorkspace>>;
+  const parentPlanTask = parentPlanTaskForUser(task, req.user.id);
+  let topology: TaskGitTopology;
   try {
-    pullResult = await pullMainIntoTaskWorkspace({
+    topology = resolveTaskGitTopology({ task, project, parentPlanTask });
+  } catch (error: any) {
+    res.status(409).json({ error: String(error?.message ?? "Failed to resolve task repository topology") });
+    return;
+  }
+
+  let pullResult: Awaited<ReturnType<typeof pullRemoteRefIntoTaskWorkspace>>;
+  try {
+    pullResult = await pullRemoteRefIntoTaskWorkspace({
       workspacePath: task.workspace_path,
-      defaultBranch: project.default_branch
+      remoteRef: topology.pullRemoteRef
     });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to pull from main") });
@@ -692,7 +754,7 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
     taskId: task.id,
     eventType: "task.pull_main",
     payload: {
-      baseBranch: project.default_branch,
+      targetRef: topology.pullRemoteRef,
       conflicted: pullResult.conflicted,
       conflictFiles: pullResult.conflictFiles,
       headCommitSha: pullResult.headCommitSha
@@ -702,7 +764,7 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
   res.json({
     task: serializeTask(latestTask),
     sync: {
-      baseBranch: project.default_branch,
+      targetRef: topology.pullRemoteRef,
       conflicted: pullResult.conflicted,
       conflictFiles: pullResult.conflictFiles,
       headCommitSha: pullResult.headCommitSha
@@ -714,10 +776,6 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
   const task = taskForUser(req.params.taskId, req.user.id);
   if (!task) {
     res.status(404).json({ error: "Task not found" });
-    return;
-  }
-  if (task.mode === "plan") {
-    res.status(409).json({ error: "Plan tasks cannot be marked merge-ready" });
     return;
   }
 
@@ -824,6 +882,14 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     res.status(409).json({ error: "Project base repository is not ready" });
     return;
   }
+  const parentPlanTask = parentPlanTaskForUser(task, req.user.id);
+  let topology: TaskGitTopology;
+  try {
+    topology = resolveTaskGitTopology({ task, project, parentPlanTask });
+  } catch (error: any) {
+    res.status(409).json({ error: String(error?.message ?? "Failed to resolve task repository topology") });
+    return;
+  }
 
   const now = nowIso();
   try {
@@ -851,8 +917,12 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     }
 
     await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
-    const baseCommitSha = await getHeadCommitSha(project.base_path);
-    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: task.workspace_path });
+    const baseCommitSha = await getHeadCommitSha(topology.sourceRepoPath);
+    await cloneLocalBaseToWorkspace({
+      basePath: topology.sourceRepoPath,
+      baseBranch: topology.sourceBranch,
+      workspacePath: task.workspace_path
+    });
     await createTaskBranch(task.workspace_path, task.id);
 
     const latestTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
@@ -901,10 +971,6 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
     res.status(404).json({ error: "Task not found" });
     return;
   }
-  if (task.mode === "plan") {
-    res.status(409).json({ error: "Plan tasks cannot be merged" });
-    return;
-  }
   if (task.status !== "merge_ready") {
     res.status(409).json({ error: "Task must be merge_ready before merge" });
     return;
@@ -915,17 +981,26 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
     res.status(404).json({ error: "Project not found" });
     return;
   }
-
-  if (mergeLocks.has(project.id)) {
-    res.status(409).json({ error: "Another merge is currently running for this project" });
+  const parentPlanTask = parentPlanTaskForUser(task, req.user.id);
+  let topology: TaskGitTopology;
+  try {
+    topology = resolveTaskGitTopology({ task, project, parentPlanTask });
+  } catch (error: any) {
+    res.status(409).json({ error: String(error?.message ?? "Failed to resolve task repository topology") });
     return;
   }
-  mergeLocks.add(project.id);
+  const lockKey = topology.mergeLockKey;
+
+  if (mergeLocks.has(lockKey)) {
+    res.status(409).json({ error: "Another merge is currently running for this merge target" });
+    return;
+  }
+  mergeLocks.add(lockKey);
 
   try {
     let queueKickNeeded = false;
     const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
-    const targetBaseCommitSha = await getHeadCommitSha(project.base_path);
+    const targetBaseCommitSha = await getHeadCommitSha(topology.mergeTargetPath);
     const mergeRecordId = makeId();
     const createdAt = nowIso();
     db.prepare(
@@ -936,10 +1011,11 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
     ).run(mergeRecordId, task.id, project.id, sourceCommitSha, targetBaseCommitSha, req.user.id, createdAt);
 
     try {
-      const mergeResult = await mergeTaskWorkspaceIntoBase({
-        basePath: project.base_path,
+      const mergeResult = await mergeTaskWorkspaceIntoTarget({
+        targetPath: topology.mergeTargetPath,
+        targetBranch: topology.mergeTargetBranch,
+        syncTargetBranchFromOrigin: topology.syncMergeTargetFromOrigin,
         workspacePath: task.workspace_path,
-        defaultBranch: project.default_branch,
         taskId: task.id
       });
       const completedAt = nowIso();
@@ -990,7 +1066,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
           payload: {
             mergeCommitSha: mergeResult.mergeCommitSha,
             sourceBranch: `task/${task.id}`,
-            targetBranch: project.default_branch
+            targetBranch: topology.mergeTargetBranch
           }
         });
         queueKickNeeded = true;
@@ -1016,7 +1092,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Merge failed") });
   } finally {
-    mergeLocks.delete(project.id);
+    mergeLocks.delete(lockKey);
   }
 });
 
