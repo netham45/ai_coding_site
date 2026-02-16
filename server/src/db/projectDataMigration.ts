@@ -1714,6 +1714,11 @@ export function runProjectDataMigrationBackfill(db: Database.Database): void {
     if (existingStatus === "cleaned") {
       continue;
     }
+    if (existingStatus === "verified" && !enableCleanup) {
+      // Verified projects may continue receiving writes in project DB during cutover.
+      // Re-running source-vs-target count verification would create false mismatches.
+      continue;
+    }
 
     const startedAt = nowIso();
     upsertMigrationStatus({
