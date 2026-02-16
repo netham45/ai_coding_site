@@ -1,8 +1,9 @@
+import type Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { db } from "../db/index.js";
-import type { ProjectRow, TaskRow, TaskStatus } from "../types.js";
+import { db as appDb, getProjectDb, isProjectDbError } from "../db/index.js";
+import type { AppProjectRow, ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
@@ -47,6 +48,17 @@ type SessionRow = {
   failure_reason: string | null;
 };
 
+export type RuntimeTaskContext = {
+  projectId: string;
+  basePath?: string;
+  projectDb?: Database.Database;
+};
+
+type RuntimeProjectContext = {
+  project: AppProjectRow;
+  projectDb: Database.Database;
+};
+
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
 const WAITING_INPUT_IDLE_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 1000;
@@ -64,24 +76,162 @@ type TaskGitTopology = {
   syncMergeTargetFromOrigin: boolean;
   shouldPushTargetBranchToOrigin: boolean;
 };
-function getTask(taskId: string): TaskRow | undefined {
-  return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+
+function listRuntimeProjects(): AppProjectRow[] {
+  return appDb
+    .prepare(
+      `SELECT
+         id,
+         name,
+         slug,
+         repo_url,
+         default_branch,
+         base_path,
+         clone_status,
+         clone_error,
+         created_by_user_id,
+         created_at,
+         updated_at
+       FROM projects
+       ORDER BY created_at ASC`
+    )
+    .all() as AppProjectRow[];
 }
 
-function getProject(projectId: string): ProjectRow | undefined {
-  return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as ProjectRow | undefined;
+function appProjectById(projectId: string): AppProjectRow | undefined {
+  return appDb
+    .prepare(
+      `SELECT
+         id,
+         name,
+         slug,
+         repo_url,
+         default_branch,
+         base_path,
+         clone_status,
+         clone_error,
+         created_by_user_id,
+         created_at,
+         updated_at
+       FROM projects
+       WHERE id = ?`
+    )
+    .get(projectId) as AppProjectRow | undefined;
 }
 
-function getParentPlanTask(task: TaskRow): TaskRow | undefined {
+function loadProjectConfig(projectDb: Database.Database, projectId: string) {
+  const row = projectDb
+    .prepare(
+      `SELECT
+         project_prompt,
+         project_rules,
+         coding_standard,
+         coding_standard_other,
+         project_other
+       FROM project_config
+       WHERE project_id = ?`
+    )
+    .get(projectId) as
+    | {
+        project_prompt: string;
+        project_rules: string;
+        coding_standard: string;
+        coding_standard_other: string;
+        project_other: string;
+      }
+    | undefined;
+
+  return {
+    project_prompt: row?.project_prompt ?? "",
+    project_rules: row?.project_rules ?? "",
+    coding_standard: row?.coding_standard ?? "",
+    coding_standard_other: row?.coding_standard_other ?? "",
+    project_other: row?.project_other ?? ""
+  };
+}
+
+function buildProjectWithConfig(project: AppProjectRow, projectDb: Database.Database): ProjectRow {
+  return {
+    ...project,
+    ...loadProjectConfig(projectDb, project.id)
+  };
+}
+
+function contextHintFromProjectContext(context: RuntimeProjectContext): RuntimeTaskContext {
+  return {
+    projectId: context.project.id,
+    basePath: context.project.base_path,
+    projectDb: context.projectDb
+  };
+}
+
+function getTask(projectDb: Database.Database, taskId: string): TaskRow | undefined {
+  return projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+}
+
+function getParentPlanTask(projectDb: Database.Database, task: TaskRow): TaskRow | undefined {
   if (!task.parent_plan_task_id) {
     return undefined;
   }
-  return db.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(task.parent_plan_task_id) as TaskRow | undefined;
+  return projectDb.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(task.parent_plan_task_id) as TaskRow | undefined;
 }
 
-function resolveTaskGitTopology(task: TaskRow, project: ProjectRow): TaskGitTopology {
+function resolveTaskProjectContext(taskId: string, context?: RuntimeTaskContext): RuntimeProjectContext {
+  if (context?.projectId) {
+    const project = appProjectById(context.projectId);
+    if (!project) {
+      throw new Error("Project not found");
+    }
+    const basePath = context.basePath ?? project.base_path;
+    const projectDb = context.projectDb ?? getProjectDb({ projectId: project.id, basePath });
+    const task = getTask(projectDb, taskId);
+    if (!task) {
+      throw new Error("Task not found");
+    }
+    return {
+      project: {
+        ...project,
+        base_path: basePath
+      },
+      projectDb
+    };
+  }
+
+  for (const project of listRuntimeProjects()) {
+    try {
+      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
+      const task = getTask(projectDb, taskId);
+      if (task) {
+        return { project, projectDb };
+      }
+    } catch (error) {
+      if (!isProjectDbError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error("Task not found");
+}
+
+function listAvailableProjectContexts(): RuntimeProjectContext[] {
+  const contexts: RuntimeProjectContext[] = [];
+  for (const project of listRuntimeProjects()) {
+    try {
+      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
+      contexts.push({ project, projectDb });
+    } catch (error) {
+      if (!isProjectDbError(error)) {
+        throw error;
+      }
+    }
+  }
+  return contexts;
+}
+
+function resolveTaskGitTopology(projectDb: Database.Database, task: TaskRow, project: ProjectRow): TaskGitTopology {
   if (task.parent_plan_task_id) {
-    const parentPlanTask = getParentPlanTask(task);
+    const parentPlanTask = getParentPlanTask(projectDb, task);
     if (!parentPlanTask) {
       throw new Error("Parent plan task not found");
     }
@@ -103,8 +253,9 @@ function resolveTaskGitTopology(task: TaskRow, project: ProjectRow): TaskGitTopo
     shouldPushTargetBranchToOrigin: true
   };
 }
-function taskIsBlocked(taskId: string): boolean {
-  const row = db
+
+function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
+  const row = projectDb
     .prepare(
       `SELECT td.task_id
        FROM task_dependencies td
@@ -116,8 +267,8 @@ function taskIsBlocked(taskId: string): boolean {
   return Boolean(row?.task_id);
 }
 
-function getDependencySummariesForTask(taskId: string): Array<{ id: string; title: string; result: string }> {
-  return db
+function getDependencySummariesForTask(projectDb: Database.Database, taskId: string): Array<{ id: string; title: string; result: string }> {
+  return projectDb
     .prepare(
       `SELECT dep.id, dep.title, dep.result
        FROM task_dependencies td
@@ -128,22 +279,22 @@ function getDependencySummariesForTask(taskId: string): Array<{ id: string; titl
     .all(taskId) as Array<{ id: string; title: string; result: string }>;
 }
 
-function getLatestSession(taskId: string): SessionRow | undefined {
-  return db
+function getLatestSession(projectDb: Database.Database, taskId: string): SessionRow | undefined {
+  return projectDb
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as SessionRow | undefined;
 }
 
-function getActiveSessions(taskId: string): SessionRow[] {
-  return db
+function getActiveSessions(projectDb: Database.Database, taskId: string): SessionRow[] {
+  return projectDb
     .prepare(
       "SELECT * FROM task_sessions WHERE task_id = ? AND status IN ('starting','running','waiting_input') ORDER BY started_at DESC"
     )
     .all(taskId) as SessionRow[];
 }
 
-function hasNewerActiveSession(taskId: string, startedAt: string, excludeSessionId: string): boolean {
-  const row = db
+function hasNewerActiveSession(projectDb: Database.Database, taskId: string, startedAt: string, excludeSessionId: string): boolean {
+  const row = projectDb
     .prepare(
       `SELECT id FROM task_sessions
        WHERE task_id = ?
@@ -156,26 +307,32 @@ function hasNewerActiveSession(taskId: string, startedAt: string, excludeSession
   return Boolean(row?.id);
 }
 
-function insertTransition(params: {
-  taskId: string;
-  fromStatus: string;
-  toStatus: string;
-  reason: string;
-  actorUserId?: string | null;
-}): void {
-  db.prepare(
+function insertTransition(
+  projectDb: Database.Database,
+  params: {
+    taskId: string;
+    fromStatus: string;
+    toStatus: string;
+    reason: string;
+    actorUserId?: string | null;
+  }
+): void {
+  projectDb.prepare(
     `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, params.reason, params.actorUserId ?? null, nowIso());
 }
 
-function transitionTaskIfNeeded(params: {
-  taskId: string;
-  toStatus: TaskStatus;
-  reason: string;
-  actorUserId?: string | null;
-}): void {
-  const row = getTask(params.taskId);
+function transitionTaskIfNeeded(
+  projectDb: Database.Database,
+  params: {
+    taskId: string;
+    toStatus: TaskStatus;
+    reason: string;
+    actorUserId?: string | null;
+  }
+): void {
+  const row = getTask(projectDb, params.taskId);
   if (!row || row.status === params.toStatus) {
     return;
   }
@@ -183,8 +340,8 @@ function transitionTaskIfNeeded(params: {
   if (!fromRuntimeActiveState) {
     return;
   }
-  db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(params.toStatus, nowIso(), params.taskId);
-  insertTransition({
+  projectDb.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(params.toStatus, nowIso(), params.taskId);
+  insertTransition(projectDb, {
     taskId: params.taskId,
     fromStatus: row.status,
     toStatus: params.toStatus,
@@ -209,12 +366,13 @@ function readTaskSummaryFromWorkspace(workspacePath: string): string {
   }
 }
 
-function saveTaskResult(taskId: string, result: string): void {
-  db.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(result, nowIso(), taskId);
+function saveTaskResult(projectDb: Database.Database, taskId: string, result: string): void {
+  projectDb.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(result, nowIso(), taskId);
 }
 
-async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): Promise<string> {
-  const task = getTask(taskId);
+async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string, context: RuntimeTaskContext): Promise<string> {
+  const taskContext = resolveTaskProjectContext(taskId, context);
+  const task = getTask(taskContext.projectDb, taskId);
   if (!task) {
     throw new Error("Task not found");
   }
@@ -238,12 +396,13 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
       "- Tests/validation performed",
       "- Remaining risks or follow-ups",
       "After writing the file, wait for further input."
-    ].join("\n")
+    ].join("\n"),
+    context
   );
 
   const deadline = Date.now() + TASK_SUMMARY_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const latestTask = getTask(task.id);
+    const latestTask = getTask(taskContext.projectDb, task.id);
     if (!latestTask) {
       throw new Error("Task not found");
     }
@@ -253,12 +412,13 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
 
     const summary = readTaskSummaryFromWorkspace(latestTask.workspace_path);
     if (summary) {
-      saveTaskResult(latestTask.id, summary);
+      saveTaskResult(taskContext.projectDb, latestTask.id, summary);
       recordEvent({
         projectId: latestTask.project_id,
         taskId: latestTask.id,
         eventType: "task.summary.captured",
-        payload: { file: TASK_SUMMARY_FILE_NAME }
+        payload: { file: TASK_SUMMARY_FILE_NAME },
+        database: taskContext.projectDb
       });
       return summary;
     }
@@ -269,21 +429,24 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
   throw new Error("Timed out waiting for runtime to write task summary");
 }
 
-function updateTaskStatus(params: {
-  taskId: string;
-  toStatus: TaskStatus;
-  reason: string;
-  actorUserId?: string | null;
-  mergedAt?: string | null;
-  mergedByUserId?: string | null;
-  headCommitSha?: string | null;
-}): void {
-  const row = getTask(params.taskId);
+function updateTaskStatus(
+  projectDb: Database.Database,
+  params: {
+    taskId: string;
+    toStatus: TaskStatus;
+    reason: string;
+    actorUserId?: string | null;
+    mergedAt?: string | null;
+    mergedByUserId?: string | null;
+    headCommitSha?: string | null;
+  }
+): void {
+  const row = getTask(projectDb, params.taskId);
   if (!row || row.status === params.toStatus) {
     return;
   }
 
-  db.prepare(
+  projectDb.prepare(
     `UPDATE tasks
      SET status = ?,
          merged_at = ?,
@@ -300,7 +463,7 @@ function updateTaskStatus(params: {
     params.taskId
   );
 
-  insertTransition({
+  insertTransition(projectDb, {
     taskId: params.taskId,
     fromStatus: row.status,
     toStatus: params.toStatus,
@@ -309,11 +472,11 @@ function updateTaskStatus(params: {
   });
 }
 
-async function awaitAutoMergeReady(taskId: string): Promise<TaskRow> {
+async function awaitAutoMergeReady(projectDb: Database.Database, taskId: string): Promise<TaskRow> {
   const deadline = Date.now() + AUTO_MERGE_READY_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    const task = getTask(taskId);
+    const task = getTask(projectDb, taskId);
     if (!task) {
       throw new Error("Task not found");
     }
@@ -331,12 +494,12 @@ async function awaitAutoMergeReady(taskId: string): Promise<TaskRow> {
       gitStatus.unstaged === 0 &&
       gitStatus.conflicted === 0;
     if (cleanWorkspace && ["in_progress", "waiting_input"].includes(task.status)) {
-      updateTaskStatus({
+      updateTaskStatus(projectDb, {
         taskId: task.id,
         toStatus: "merge_ready",
-        reason: "auto_merge_marked_merge_ready",
+        reason: "auto_merge_marked_merge_ready"
       });
-      const ready = getTask(task.id);
+      const ready = getTask(projectDb, task.id);
       if (ready && ready.status === "merge_ready") {
         return ready;
       }
@@ -348,13 +511,13 @@ async function awaitAutoMergeReady(taskId: string): Promise<TaskRow> {
   throw new Error("Timed out waiting for task to become merge_ready during auto-merge");
 }
 
-async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Promise<void> {
-  const task = getTask(taskId);
+async function ensureIdleWaitingInput(projectDb: Database.Database, taskId: string, actorUserId: string): Promise<void> {
+  const task = getTask(projectDb, taskId);
   if (!task) {
     return;
   }
   if (!["merge_ready", "merged", "cancelled"].includes(task.status)) {
-    updateTaskStatus({
+    updateTaskStatus(projectDb, {
       taskId,
       toStatus: "waiting_input",
       reason: "auto_merge_failed_waiting_input",
@@ -363,17 +526,16 @@ async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Prom
   }
 }
 
-async function runAutoMerge(taskId: string): Promise<void> {
-  const task = getTask(taskId);
+async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promise<void> {
+  const taskContext = resolveTaskProjectContext(taskId, context);
+  const scopeHint = contextHintFromProjectContext(taskContext);
+  const task = getTask(taskContext.projectDb, taskId);
   if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
     return;
   }
 
-  const project = getProject(task.project_id);
-  if (!project) {
-    throw new Error("Project not found");
-  }
-  const topology = resolveTaskGitTopology(task, project);
+  const project = buildProjectWithConfig(taskContext.project, taskContext.projectDb);
+  const topology = resolveTaskGitTopology(taskContext.projectDb, task, project);
 
   const actorUserId = task.created_by_user_id;
   const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
@@ -381,7 +543,7 @@ async function runAutoMerge(taskId: string): Promise<void> {
   const mergeRecordId = makeId();
   const mergeStartedAt = nowIso();
 
-  db.prepare(
+  taskContext.projectDb.prepare(
     `INSERT INTO merge_records (
       id, task_id, project_id, source_commit_sha, target_base_commit_sha, merge_commit_sha, status,
       conflict_summary, error_message, created_by_user_id, created_at, completed_at
@@ -392,17 +554,18 @@ async function runAutoMerge(taskId: string): Promise<void> {
     projectId: task.project_id,
     taskId: task.id,
     eventType: "task.auto_merge.started",
-    payload: {}
+    payload: {},
+    database: taskContext.projectDb
   });
 
   try {
-    await ensureTaskSummaryCaptured(task.id, actorUserId);
+    await ensureTaskSummaryCaptured(task.id, actorUserId, scopeHint);
 
     const pullResult = await pullRemoteRefIntoTaskWorkspace({
       workspacePath: task.workspace_path,
       remoteRef: topology.pullRemoteRef
     });
-    db.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, nowIso(), task.id);
+    taskContext.projectDb.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, nowIso(), task.id);
     if (pullResult.conflicted) {
       throw new Error(
         pullResult.conflictFiles.length
@@ -421,10 +584,11 @@ async function runAutoMerge(taskId: string): Promise<void> {
         "2) Resolve any issues.",
         "3) Commit all required code changes to this task branch.",
         "4) Do not exit the runtime. Leave it running and wait for further input when done."
-      ].join("\n")
+      ].join("\n"),
+      scopeHint
     );
 
-    const mergeReadyTask = await awaitAutoMergeReady(task.id);
+    const mergeReadyTask = await awaitAutoMergeReady(taskContext.projectDb, task.id);
     const mergeResult = await mergeTaskWorkspaceIntoTarget({
       targetPath: topology.mergeTargetPath,
       targetBranch: topology.mergeTargetBranch,
@@ -445,16 +609,16 @@ async function runAutoMerge(taskId: string): Promise<void> {
     }
 
     const completedAt = nowIso();
-    db.transaction(() => {
-      db.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+    taskContext.projectDb.transaction(() => {
+      taskContext.projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
         mergeResult.mergeCommitSha,
         completedAt,
         mergeRecordId
       );
-      db.prepare(
+      taskContext.projectDb.prepare(
         "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
       ).run(completedAt, actorUserId, mergeResult.mergeCommitSha, completedAt, task.id);
-      insertTransition({
+      insertTransition(taskContext.projectDb, {
         taskId: task.id,
         fromStatus: "merge_ready",
         toStatus: "merged",
@@ -470,50 +634,63 @@ async function runAutoMerge(taskId: string): Promise<void> {
       payload: {
         targetBranch: topology.mergeTargetBranch,
         mergeCommitSha: mergeResult.mergeCommitSha
-      }
+      },
+      database: taskContext.projectDb
     });
   } catch (error: any) {
     const completedAt = nowIso();
-    db.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
+    taskContext.projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
       String(error?.message ?? "auto-merge failed"),
       completedAt,
       mergeRecordId
     );
-    await ensureIdleWaitingInput(task.id, actorUserId);
+    await ensureIdleWaitingInput(taskContext.projectDb, task.id, actorUserId);
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
       eventType: "task.auto_merge.failed",
-      payload: { error: String(error?.message ?? "auto-merge failed") }
+      payload: { error: String(error?.message ?? "auto-merge failed") },
+      database: taskContext.projectDb
     });
   }
 }
 
-function maybeStartAutoMerge(taskId: string): void {
+function maybeStartAutoMerge(taskId: string, context?: RuntimeTaskContext): void {
   if (autoMergeTaskIds.has(taskId)) {
     return;
   }
-  const task = getTask(taskId);
+
+  let taskContext: RuntimeProjectContext;
+  let task: TaskRow | undefined;
+  try {
+    taskContext = resolveTaskProjectContext(taskId, context);
+    task = getTask(taskContext.projectDb, taskId);
+  } catch {
+    return;
+  }
+
   if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
     return;
   }
 
   autoMergeTaskIds.add(taskId);
-  void runAutoMerge(taskId).finally(() => {
+  void runAutoMerge(taskId, contextHintFromProjectContext(taskContext)).finally(() => {
     autoMergeTaskIds.delete(taskId);
   });
 }
 
-export function triggerAutoMergeIfEligible(taskId: string): void {
-  maybeStartAutoMerge(taskId);
+export function triggerAutoMergeIfEligible(taskId: string, context?: RuntimeTaskContext): void {
+  maybeStartAutoMerge(taskId, context);
 }
 
 function kickPendingAutoMergeTasks(): void {
-  const pendingAutoMergeTasks = db
-    .prepare("SELECT id FROM tasks WHERE auto_merge = 1 AND status IN ('waiting_input', 'merge_ready')")
-    .all() as Array<{ id: string }>;
-  for (const task of pendingAutoMergeTasks) {
-    maybeStartAutoMerge(task.id);
+  for (const context of listAvailableProjectContexts()) {
+    const pendingAutoMergeTasks = context.projectDb
+      .prepare("SELECT id FROM tasks WHERE auto_merge = 1 AND status IN ('waiting_input', 'merge_ready')")
+      .all() as Array<{ id: string }>;
+    for (const task of pendingAutoMergeTasks) {
+      maybeStartAutoMerge(task.id, contextHintFromProjectContext(context));
+    }
   }
 }
 
@@ -528,14 +705,19 @@ function buildRuntimeEnv(): { env: Record<string, string>; cleanup?: () => void 
   return { env };
 }
 
-export async function startTaskRuntime(taskId: string, actorUserId: string): Promise<void> {
-  const task = getTask(taskId);
+export async function startTaskRuntime(taskId: string, actorUserId: string, context?: RuntimeTaskContext): Promise<void> {
+  const taskContext = resolveTaskProjectContext(taskId, context);
+  const projectDb = taskContext.projectDb;
+  const project = buildProjectWithConfig(taskContext.project, projectDb);
+  const task = getTask(projectDb, taskId);
   if (!task) {
     throw new Error("Task not found");
   }
-  if (taskIsBlocked(task.id)) {
+
+  if (taskIsBlocked(projectDb, task.id)) {
     throw new Error("Task is blocked by unmerged dependencies");
   }
+
   const initialDisallowed =
     task.mode === "plan"
       ? ["merged", "cancelled"]
@@ -543,16 +725,13 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   if (initialDisallowed.includes(task.status)) {
     throw new Error(`Task cannot be started from status ${task.status}`);
   }
-  const project = getProject(task.project_id);
-  if (!project) {
-    throw new Error("Project not found");
-  }
+
   const workspaceGitPath = path.join(task.workspace_path, ".git");
   if (!fs.existsSync(workspaceGitPath)) {
     let sourcePath = project.base_path;
     let sourceBranch = project.default_branch;
     if (task.parent_plan_task_id) {
-      const parentPlanTask = getParentPlanTask(task);
+      const parentPlanTask = getParentPlanTask(projectDb, task);
       if (!parentPlanTask) {
         throw new Error("Parent plan task not found");
       }
@@ -567,19 +746,19 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
       workspacePath: task.workspace_path
     });
     await createTaskBranch(task.workspace_path, task.id);
-    db.prepare("UPDATE tasks SET base_commit_sha_at_create = ?, updated_at = ? WHERE id = ?").run(baseCommitSha, nowIso(), task.id);
+    projectDb.prepare("UPDATE tasks SET base_commit_sha_at_create = ?, updated_at = ? WHERE id = ?").run(baseCommitSha, nowIso(), task.id);
   }
 
   await ensureTmuxAvailable();
 
-  const existingSessions = getActiveSessions(taskId);
+  const existingSessions = getActiveSessions(projectDb, taskId);
   if (existingSessions.length) {
     // Runtime sessions are never force-stopped by server-side start requests.
     return;
   }
 
   // Re-check task status after cleanup to avoid racing with cancel/merge actions.
-  const latestBeforeStart = getTask(task.id);
+  const latestBeforeStart = getTask(projectDb, task.id);
   if (!latestBeforeStart) {
     throw new Error("Task not found");
   }
@@ -591,9 +770,9 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
     throw new Error(`Task cannot be started from status ${latestBeforeStart.status}`);
   }
 
-  const dependencySummaries = getDependencySummariesForTask(task.id);
+  const dependencySummaries = getDependencySummariesForTask(projectDb, task.id);
   const effectivePrompt = buildEffectivePrompt(project, task.task_prompt, dependencySummaries);
-  db.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
+  projectDb.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
 
   const built = buildCommand(task.ai_command, effectivePrompt);
   const sessionId = makeId();
@@ -601,17 +780,17 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   const socketPath = buildSocketPath(tmuxRoot, task.id);
   const now = nowIso();
 
-  db.prepare(
+  projectDb.prepare(
     `INSERT INTO task_sessions (
       id, task_id, tmux_session_name, tmux_socket_path, pane_id, detected_tool,
       backend_command, status, started_at, ended_at, last_heartbeat_at, last_output, exit_code, failure_reason
     ) VALUES (?, ?, ?, ?, NULL, ?, ?, 'starting', ?, NULL, NULL, '', NULL, NULL)`
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
-  const latestTask = getTask(task.id);
+  const latestTask = getTask(projectDb, task.id);
   if (latestTask && latestTask.status !== "in_progress") {
-    db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
-    insertTransition({
+    projectDb.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
+    insertTransition(projectDb, {
       taskId: task.id,
       fromStatus: latestTask.status,
       toStatus: "in_progress",
@@ -619,12 +798,14 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
       actorUserId
     });
   }
+
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
     sessionId,
     eventType: "session.starting",
-    payload: { sessionName, socketPath, tool: built.detectedTool }
+    payload: { sessionName, socketPath, tool: built.detectedTool },
+    database: projectDb
   });
 
   const runtimeEnv = buildRuntimeEnv();
@@ -638,7 +819,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
       env: runtimeEnv.env
     });
     const paneId = await getPaneId(socketPath, sessionName);
-    db.prepare("UPDATE task_sessions SET pane_id = ?, status = 'running', last_heartbeat_at = ? WHERE id = ?").run(
+    projectDb.prepare("UPDATE task_sessions SET pane_id = ?, status = 'running', last_heartbeat_at = ? WHERE id = ?").run(
       paneId,
       nowIso(),
       sessionId
@@ -649,18 +830,20 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
       taskId: task.id,
       sessionId,
       eventType: "session.running",
-      payload: { paneId }
+      payload: { paneId },
+      database: projectDb
     });
   } catch (error: any) {
     const reason = String(error?.message ?? "failed to start runtime");
-    db.prepare("UPDATE task_sessions SET status = 'failed', ended_at = ?, failure_reason = ? WHERE id = ?").run(nowIso(), reason, sessionId);
-    transitionTaskIfNeeded({ taskId: task.id, toStatus: "failed", reason: "runtime_start_failed", actorUserId });
+    projectDb.prepare("UPDATE task_sessions SET status = 'failed', ended_at = ?, failure_reason = ? WHERE id = ?").run(nowIso(), reason, sessionId);
+    transitionTaskIfNeeded(projectDb, { taskId: task.id, toStatus: "failed", reason: "runtime_start_failed", actorUserId });
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
       sessionId,
       eventType: "session.failed",
-      payload: { reason }
+      payload: { reason },
+      database: projectDb
     });
     throw new Error(reason);
   } finally {
@@ -668,12 +851,21 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   }
 }
 
-export async function sendTaskRuntimeInput(taskId: string, actorUserId: string, text: string): Promise<void> {
-  let session = getLatestSession(taskId);
+export async function sendTaskRuntimeInput(
+  taskId: string,
+  actorUserId: string,
+  text: string,
+  context?: RuntimeTaskContext
+): Promise<void> {
+  const taskContext = resolveTaskProjectContext(taskId, context);
+  const scopeHint = contextHintFromProjectContext(taskContext);
+  const projectDb = taskContext.projectDb;
+
+  let session = getLatestSession(projectDb, taskId);
   const hasRunnableSession = session && ["running", "waiting_input"].includes(session.status);
   if (!hasRunnableSession) {
-    await startTaskRuntime(taskId, actorUserId);
-    session = getLatestSession(taskId);
+    await startTaskRuntime(taskId, actorUserId, scopeHint);
+    session = getLatestSession(projectDb, taskId);
   }
   if (!session || !["running", "waiting_input"].includes(session.status)) {
     throw new Error("No running session available for task");
@@ -681,8 +873,8 @@ export async function sendTaskRuntimeInput(taskId: string, actorUserId: string, 
 
   let alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
   if (!alive) {
-    await startTaskRuntime(taskId, actorUserId);
-    session = getLatestSession(taskId);
+    await startTaskRuntime(taskId, actorUserId, scopeHint);
+    session = getLatestSession(projectDb, taskId);
     if (!session || !["running", "waiting_input"].includes(session.status)) {
       throw new Error("No running session available for task");
     }
@@ -693,18 +885,19 @@ export async function sendTaskRuntimeInput(taskId: string, actorUserId: string, 
   }
 
   await sendInput(session.tmux_socket_path, session.tmux_session_name, text);
-  db.prepare("UPDATE task_sessions SET status = 'running', last_heartbeat_at = ? WHERE id = ?").run(nowIso(), session.id);
+  projectDb.prepare("UPDATE task_sessions SET status = 'running', last_heartbeat_at = ? WHERE id = ?").run(nowIso(), session.id);
 
-  transitionTaskIfNeeded({ taskId, toStatus: "in_progress", reason: "user_input", actorUserId });
+  transitionTaskIfNeeded(projectDb, { taskId, toStatus: "in_progress", reason: "user_input", actorUserId });
 
-  const task = getTask(taskId);
+  const task = getTask(projectDb, taskId);
   if (task) {
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
       sessionId: session.id,
       eventType: "session.input",
-      payload: { chars: text.length }
+      payload: { chars: text.length },
+      database: projectDb
     });
   }
 }
@@ -715,28 +908,32 @@ export async function stopTaskRuntime(taskId: string, actorUserId: string): Prom
   throw new Error("Stopping runtime sessions is disabled");
 }
 
-async function monitorSession(session: SessionRow): Promise<void> {
+async function monitorSession(context: RuntimeProjectContext, session: SessionRow): Promise<void> {
+  const projectDb = context.projectDb;
+  const scopeHint = contextHintFromProjectContext(context);
   const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
   if (!alive) {
-    if (hasNewerActiveSession(session.task_id, session.started_at, session.id)) {
-      db.prepare(
-        "UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session') WHERE id = ?"
-      ).run(nowIso(), nowIso(), session.id);
+    if (hasNewerActiveSession(projectDb, session.task_id, session.started_at, session.id)) {
+      projectDb
+        .prepare(
+          "UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session') WHERE id = ?"
+        )
+        .run(nowIso(), nowIso(), session.id);
       return;
     }
-    db.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ? AND ended_at IS NULL").run(
+    projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ? AND ended_at IS NULL").run(
       nowIso(),
       nowIso(),
       session.id
     );
-    transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "failed", reason: "runtime_crashed" });
+    transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "failed", reason: "runtime_crashed" });
     return;
   }
 
   const paneStatus = await paneExitStatus(session.tmux_socket_path, session.tmux_session_name);
   if (paneStatus.dead) {
     const stopStatus = "crashed";
-    db.prepare("UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ? WHERE id = ?").run(
+    projectDb.prepare("UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ? WHERE id = ?").run(
       stopStatus,
       nowIso(),
       paneStatus.status,
@@ -745,10 +942,10 @@ async function monitorSession(session: SessionRow): Promise<void> {
     );
 
     if (paneStatus.status === 0) {
-      transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "merge_ready", reason: "runtime_exited_cleanly" });
-      maybeStartAutoMerge(session.task_id);
+      transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "merge_ready", reason: "runtime_exited_cleanly" });
+      maybeStartAutoMerge(session.task_id, scopeHint);
     } else {
-      transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "failed", reason: "runtime_exited_nonzero" });
+      transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "failed", reason: "runtime_exited_nonzero" });
     }
     return;
   }
@@ -761,36 +958,36 @@ async function monitorSession(session: SessionRow): Promise<void> {
   const idleMs = Number.isFinite(lastActivityMs) ? now - lastActivityMs : Number.POSITIVE_INFINITY;
 
   if (outputChanged) {
-    db.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+    projectDb.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
     if (session.status === "waiting_input") {
-      db.prepare("UPDATE task_sessions SET status = 'running' WHERE id = ?").run(session.id);
+      projectDb.prepare("UPDATE task_sessions SET status = 'running' WHERE id = ?").run(session.id);
     }
-    transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "in_progress", reason: "runtime_output_activity" });
+    transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "in_progress", reason: "runtime_output_activity" });
   }
 
   if (signal.sessionStatus === "waiting_input" && session.status !== "waiting_input") {
-    db.prepare("UPDATE task_sessions SET status = 'waiting_input', last_heartbeat_at = COALESCE(last_heartbeat_at, ?) WHERE id = ?").run(
+    projectDb.prepare("UPDATE task_sessions SET status = 'waiting_input', last_heartbeat_at = COALESCE(last_heartbeat_at, ?) WHERE id = ?").run(
       nowIso(),
       session.id
     );
   }
 
   if (!outputChanged && session.status === "running" && idleMs >= WAITING_INPUT_IDLE_MS) {
-    db.prepare("UPDATE task_sessions SET status = 'waiting_input' WHERE id = ?").run(session.id);
-    transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "waiting_input", reason: "runtime_idle_no_output" });
-    maybeStartAutoMerge(session.task_id);
+    projectDb.prepare("UPDATE task_sessions SET status = 'waiting_input' WHERE id = ?").run(session.id);
+    transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "waiting_input", reason: "runtime_idle_no_output" });
+    maybeStartAutoMerge(session.task_id, scopeHint);
   }
 
   if (signal.taskStatus) {
-    transitionTaskIfNeeded({
+    transitionTaskIfNeeded(projectDb, {
       taskId: session.task_id,
       toStatus: signal.taskStatus,
       reason: signal.reason || "adapter_signal"
     });
     if (signal.taskStatus === "waiting_input") {
-      maybeStartAutoMerge(session.task_id);
+      maybeStartAutoMerge(session.task_id, scopeHint);
     } else if (signal.taskStatus === "merge_ready") {
-      maybeStartAutoMerge(session.task_id);
+      maybeStartAutoMerge(session.task_id, scopeHint);
     }
   }
 }
@@ -798,19 +995,22 @@ async function monitorSession(session: SessionRow): Promise<void> {
 export async function recoverRuntimeSessions(): Promise<void> {
   await ensureTmuxAvailable();
   kickPendingAutoMergeTasks();
-  const rows = db
-    .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
-    .all() as SessionRow[];
 
-  for (const row of rows) {
-    const alive = await hasSession(row.tmux_socket_path, row.tmux_session_name);
-    if (!alive) {
-      db.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(
-        nowIso(),
-        nowIso(),
-        row.id
-      );
-      transitionTaskIfNeeded({ taskId: row.task_id, toStatus: "failed", reason: "recovery_missing_tmux" });
+  for (const context of listAvailableProjectContexts()) {
+    const rows = context.projectDb
+      .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
+      .all() as SessionRow[];
+
+    for (const row of rows) {
+      const alive = await hasSession(row.tmux_socket_path, row.tmux_session_name);
+      if (!alive) {
+        context.projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(
+          nowIso(),
+          nowIso(),
+          row.id
+        );
+        transitionTaskIfNeeded(context.projectDb, { taskId: row.task_id, toStatus: "failed", reason: "recovery_missing_tmux" });
+      }
     }
   }
 }
@@ -825,27 +1025,32 @@ export async function startRuntimeHeartbeat(): Promise<void> {
 
   heartbeatTimer = setInterval(async () => {
     kickPendingAutoMergeTasks();
-    const activeSessions = db
-      .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
-      .all() as SessionRow[];
 
-    for (const session of activeSessions) {
-      try {
-        await monitorSession(session);
-      } catch (error: any) {
-        if (hasNewerActiveSession(session.task_id, session.started_at, session.id)) {
-          db.prepare(
-            "UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session'), last_heartbeat_at = ? WHERE id = ?"
-          ).run(nowIso(), nowIso(), nowIso(), session.id);
-          continue;
+    for (const context of listAvailableProjectContexts()) {
+      const activeSessions = context.projectDb
+        .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
+        .all() as SessionRow[];
+
+      for (const session of activeSessions) {
+        try {
+          await monitorSession(context, session);
+        } catch (error: any) {
+          if (hasNewerActiveSession(context.projectDb, session.task_id, session.started_at, session.id)) {
+            context.projectDb
+              .prepare(
+                "UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session'), last_heartbeat_at = ? WHERE id = ?"
+              )
+              .run(nowIso(), nowIso(), nowIso(), session.id);
+            continue;
+          }
+          context.projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = ?, last_heartbeat_at = ? WHERE id = ?").run(
+            nowIso(),
+            String(error?.message ?? "heartbeat failure"),
+            nowIso(),
+            session.id
+          );
+          transitionTaskIfNeeded(context.projectDb, { taskId: session.task_id, toStatus: "failed", reason: "heartbeat_failure" });
         }
-        db.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = ?, last_heartbeat_at = ? WHERE id = ?").run(
-          nowIso(),
-          String(error?.message ?? "heartbeat failure"),
-          nowIso(),
-          session.id
-        );
-        transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "failed", reason: "heartbeat_failure" });
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
