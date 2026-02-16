@@ -57,6 +57,14 @@ const TASK_SUMMARY_POLL_INTERVAL_MS = 1000;
 const TASK_SUMMARY_FILE_NAME = ".ai-task-summary.md";
 const autoMergeTaskIds = new Set<string>();
 
+type TaskGitTopology = {
+  pullRemoteRef: string;
+  mergeTargetPath: string;
+  mergeTargetBranch: string;
+  syncMergeTargetFromOrigin: boolean;
+  shouldPushTargetBranchToOrigin: boolean;
+};
+
 function getTask(taskId: string): TaskRow | undefined {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
 }
@@ -70,6 +78,31 @@ function getParentPlanTask(task: TaskRow): TaskRow | undefined {
     return undefined;
   }
   return db.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(task.parent_plan_task_id) as TaskRow | undefined;
+}
+
+function resolveTaskGitTopology(task: TaskRow, project: ProjectRow): TaskGitTopology {
+  if (task.parent_plan_task_id) {
+    const parentPlanTask = getParentPlanTask(task);
+    if (!parentPlanTask) {
+      throw new Error("Parent plan task not found");
+    }
+    const planBranch = taskBranchName(parentPlanTask.id);
+    return {
+      pullRemoteRef: planBranch,
+      mergeTargetPath: parentPlanTask.workspace_path,
+      mergeTargetBranch: planBranch,
+      syncMergeTargetFromOrigin: false,
+      shouldPushTargetBranchToOrigin: false
+    };
+  }
+
+  return {
+    pullRemoteRef: project.default_branch,
+    mergeTargetPath: project.base_path,
+    mergeTargetBranch: project.default_branch,
+    syncMergeTargetFromOrigin: true,
+    shouldPushTargetBranchToOrigin: true
+  };
 }
 
 function taskIsBlocked(taskId: string): boolean {
@@ -342,10 +375,11 @@ async function runAutoMerge(taskId: string): Promise<void> {
   if (!project) {
     throw new Error("Project not found");
   }
+  const topology = resolveTaskGitTopology(task, project);
 
   const actorUserId = task.created_by_user_id;
   const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
-  const targetBaseCommitSha = await getHeadCommitSha(project.base_path);
+  const targetBaseCommitSha = await getHeadCommitSha(topology.mergeTargetPath);
   const mergeRecordId = makeId();
   const mergeStartedAt = nowIso();
 
@@ -368,14 +402,14 @@ async function runAutoMerge(taskId: string): Promise<void> {
 
     const pullResult = await pullRemoteRefIntoTaskWorkspace({
       workspacePath: task.workspace_path,
-      remoteRef: project.default_branch
+      remoteRef: topology.pullRemoteRef
     });
     db.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, nowIso(), task.id);
     if (pullResult.conflicted) {
       throw new Error(
         pullResult.conflictFiles.length
-          ? `Pull from ${project.default_branch} resulted in conflicts: ${pullResult.conflictFiles.join(", ")}`
-          : `Pull from ${project.default_branch} resulted in conflicts`
+          ? `Pull from ${topology.pullRemoteRef} resulted in conflicts: ${pullResult.conflictFiles.join(", ")}`
+          : `Pull from ${topology.pullRemoteRef} resulted in conflicts`
       );
     }
 
@@ -394,21 +428,23 @@ async function runAutoMerge(taskId: string): Promise<void> {
 
     const mergeReadyTask = await awaitAutoMergeReady(task.id);
     const mergeResult = await mergeTaskWorkspaceIntoTarget({
-      targetPath: project.base_path,
-      targetBranch: project.default_branch,
-      syncTargetBranchFromOrigin: true,
+      targetPath: topology.mergeTargetPath,
+      targetBranch: topology.mergeTargetBranch,
+      syncTargetBranchFromOrigin: topology.syncMergeTargetFromOrigin,
       workspacePath: mergeReadyTask.workspace_path,
       taskId: mergeReadyTask.id
     });
     if (mergeResult.conflicted) {
       throw new Error(
         mergeResult.conflictFiles.length
-          ? `Merge into ${project.default_branch} conflicted: ${mergeResult.conflictFiles.join(", ")}`
-          : `Merge into ${project.default_branch} conflicted`
+          ? `Merge into ${topology.mergeTargetBranch} conflicted: ${mergeResult.conflictFiles.join(", ")}`
+          : `Merge into ${topology.mergeTargetBranch} conflicted`
       );
     }
 
-    await pushBranchToOrigin({ repoPath: project.base_path, branch: project.default_branch });
+    if (topology.shouldPushTargetBranchToOrigin) {
+      await pushBranchToOrigin({ repoPath: topology.mergeTargetPath, branch: topology.mergeTargetBranch });
+    }
 
     const completedAt = nowIso();
     db.transaction(() => {
@@ -434,7 +470,7 @@ async function runAutoMerge(taskId: string): Promise<void> {
       taskId: task.id,
       eventType: "task.auto_merge.merged",
       payload: {
-        targetBranch: project.default_branch,
+        targetBranch: topology.mergeTargetBranch,
         mergeCommitSha: mergeResult.mergeCommitSha
       }
     });
