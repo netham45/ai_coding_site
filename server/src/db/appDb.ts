@@ -5,6 +5,7 @@ import { makeId } from "../utils/id.js";
 import { dataRoot } from "../utils/paths.js";
 import { nowIso } from "../utils/time.js";
 import { appBaselineMigration } from "./migrations.js";
+import { runProjectDataMigrationBackfill } from "./projectDataMigration.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
 const DEFAULT_AI_COMMAND = "codex --yolo {prompt}";
@@ -32,6 +33,7 @@ function initializeAppDb(): Database.Database {
   const db = openSqliteDatabase(getAppDbPath());
   db.exec(appBaselineMigration);
   applyLegacyMigrations(db);
+  runProjectDataMigrationBackfill(db);
   return db;
 }
 
