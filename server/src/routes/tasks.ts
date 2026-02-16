@@ -4,7 +4,9 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { z } from "zod";
-import { db } from "../db/index.js";
+import type { Database as DatabaseType } from "better-sqlite3";
+import { appDb } from "../db/index.js";
+import { projectContextForUser, taskContextForUser } from "../db/ownership.js";
 import { recordEvent } from "../services/events.js";
 import {
   cloneLocalBaseToWorkspace,
@@ -54,39 +56,22 @@ function isSafeTaskWorkspacePath(workspacePath: string, projectBasePath: string)
 }
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
-  return db
-    .prepare(
-      `SELECT p.*
-       FROM projects p
-       JOIN project_members pm ON pm.project_id = p.id
-       WHERE p.id = ? AND pm.user_id = ?`
-    )
-    .get(projectId, userId) as ProjectRow | undefined;
+  return projectContextForUser(projectId, userId)?.project;
 }
 
 function taskForUser(taskId: string, userId: string): TaskRow | undefined {
-  return db
-    .prepare(
-      `SELECT t.*
-       FROM tasks t
-       JOIN project_members pm ON pm.project_id = t.project_id
-       WHERE t.id = ? AND pm.user_id = ?`
-    )
-    .get(taskId, userId) as TaskRow | undefined;
+  return taskContextForUser(taskId, userId)?.task;
 }
 
 function parentPlanTaskForUser(task: TaskRow, userId: string): TaskRow | undefined {
   if (!task.parent_plan_task_id) {
     return undefined;
   }
-  return db
-    .prepare(
-      `SELECT t.*
-       FROM tasks t
-       JOIN project_members pm ON pm.project_id = t.project_id
-       WHERE t.id = ? AND pm.user_id = ? AND t.mode = 'plan'`
-    )
-    .get(task.parent_plan_task_id, userId) as TaskRow | undefined;
+  const parent = taskContextForUser(task.parent_plan_task_id, userId)?.task;
+  if (!parent || parent.project_id !== task.project_id || parent.mode !== "plan") {
+    return undefined;
+  }
+  return parent;
 }
 
 type TaskGitTopology = {
@@ -128,29 +113,29 @@ function resolveTaskGitTopology(params: { task: TaskRow; project: ProjectRow; pa
   };
 }
 
-function latestSession(taskId: string): TaskSessionRow | undefined {
-  return db
+function latestSession(projectDb: DatabaseType, taskId: string): TaskSessionRow | undefined {
+  return projectDb
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as TaskSessionRow | undefined;
 }
 
-function activeSessions(taskId: string): TaskSessionRow[] {
-  return db
+function activeSessions(projectDb: DatabaseType, taskId: string): TaskSessionRow[] {
+  return projectDb
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? AND status IN ('starting','running','waiting_input')")
     .all(taskId) as TaskSessionRow[];
 }
 
-function latestIde(taskId: string): IdeInstanceRow | undefined {
-  return db
+function latestIde(projectDb: DatabaseType, taskId: string): IdeInstanceRow | undefined {
+  return projectDb
     .prepare("SELECT * FROM ide_instances WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1")
     .get(taskId) as IdeInstanceRow | undefined;
 }
 
-function serializeTask(task: TaskRow) {
-  const dependencyTaskIds = db
+function serializeTask(projectDb: DatabaseType, task: TaskRow) {
+  const dependencyTaskIds = projectDb
     .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as Array<{ dependency_task_id: string }>;
-  const blockedByTaskIds = db
+  const blockedByTaskIds = projectDb
     .prepare(
       `SELECT td.dependency_task_id
        FROM task_dependencies td
@@ -189,7 +174,7 @@ function serializeTask(task: TaskRow) {
   };
 }
 
-function resolveTaskDependencies(params: { projectId: string; dependencyTaskIds: string[]; taskId?: string }): TaskRow[] {
+function resolveTaskDependencies(projectDb: DatabaseType, params: { projectId: string; dependencyTaskIds: string[]; taskId?: string }): TaskRow[] {
   const unique = [...new Set(params.dependencyTaskIds)];
   if (unique.length !== params.dependencyTaskIds.length) {
     throw new Error("Duplicate dependency ids are not allowed");
@@ -202,7 +187,7 @@ function resolveTaskDependencies(params: { projectId: string; dependencyTaskIds:
   }
 
   const placeholders = unique.map(() => "?").join(", ");
-  const rows = db
+  const rows = projectDb
     .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
     .all(params.projectId, ...unique) as TaskRow[];
   if (rows.length !== unique.length) {
@@ -211,8 +196,8 @@ function resolveTaskDependencies(params: { projectId: string; dependencyTaskIds:
   return rows;
 }
 
-function taskIsBlocked(taskId: string): boolean {
-  const row = db
+function taskIsBlocked(projectDb: DatabaseType, taskId: string): boolean {
+  const row = projectDb
     .prepare(
       `SELECT td.task_id
        FROM task_dependencies td
@@ -295,9 +280,12 @@ function createIdeToken(): string {
   return randomBytes(24).toString("hex");
 }
 
-function issueIdeLaunchUrl(params: { taskId: string; ideId: string; folderPath?: string; workspacePath?: string }): string {
+function issueIdeLaunchUrl(
+  projectDb: DatabaseType,
+  params: { taskId: string; ideId: string; folderPath?: string; workspacePath?: string }
+): string {
   const rawToken = createIdeToken();
-  db.prepare("UPDATE ide_instances SET access_token_hash = ?, last_heartbeat_at = ? WHERE id = ?").run(
+  projectDb.prepare("UPDATE ide_instances SET access_token_hash = ?, last_heartbeat_at = ? WHERE id = ?").run(
     hashToken(rawToken),
     nowIso(),
     params.ideId
@@ -307,9 +295,9 @@ function issueIdeLaunchUrl(params: { taskId: string; ideId: string; folderPath?:
   return `/api/tasks/${params.taskId}/ide/view?token=${encodeURIComponent(rawToken)}${workspaceQuery}${folderQuery}`;
 }
 
-async function buildIdeLaunchUrl(task: TaskRow, ideId: string): Promise<string> {
+async function buildIdeLaunchUrl(projectDb: DatabaseType, task: TaskRow, ideId: string): Promise<string> {
   try {
-    const session = latestSession(task.id);
+    const session = latestSession(projectDb, task.id);
     const attachableSession = session && ["starting", "running", "waiting_input"].includes(session.status) ? session : null;
     const openPath = await prepareIdeWorkspace({
       taskId: task.id,
@@ -318,12 +306,12 @@ async function buildIdeLaunchUrl(task: TaskRow, ideId: string): Promise<string> 
       tmuxSessionName: attachableSession?.tmux_session_name
     });
     if (openPath.endsWith(".code-workspace")) {
-      return issueIdeLaunchUrl({ taskId: task.id, ideId, workspacePath: openPath });
+      return issueIdeLaunchUrl(projectDb, { taskId: task.id, ideId, workspacePath: openPath });
     }
-    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: openPath });
+    return issueIdeLaunchUrl(projectDb, { taskId: task.id, ideId, folderPath: openPath });
   } catch {
     // Fall back to direct folder launch if workspace file generation fails.
-    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: task.workspace_path });
+    return issueIdeLaunchUrl(projectDb, { taskId: task.id, ideId, folderPath: task.workspace_path });
   }
 }
 
@@ -403,38 +391,48 @@ function resolveAiCommand(inputAiCommand: string | undefined, userId: string): s
   if (inputAiCommand) {
     return inputAiCommand;
   }
-  const settings = db
+  const settings = appDb
     .prepare("SELECT default_ai_command FROM user_settings WHERE user_id = ?")
     .get(userId) as { default_ai_command: string } | undefined;
   return settings?.default_ai_command || "codex --yolo {prompt}";
 }
 
 function recordTaskTransition(params: {
+  projectDb: DatabaseType;
   taskId: string;
   fromStatus: string;
   toStatus: string;
   reason: string;
   actorUserId: string;
 }): void {
-  db.prepare(
+  params.projectDb.prepare(
     `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, params.reason, params.actorUserId, nowIso());
 }
 
-function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, actorUserId: string): TaskRow {
+function setTaskStatus(
+  projectDb: DatabaseType,
+  task: TaskRow,
+  nextStatus: TaskStatus,
+  reason: string,
+  actorUserId: string
+): TaskRow {
   const now = nowIso();
-  db.transaction(() => {
+  projectDb.transaction(() => {
     if (nextStatus === "merged") {
-      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+      projectDb.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
     } else {
-      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
+      projectDb
+        .prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?")
+        .run(
         nextStatus,
         now,
         task.id
       );
     }
     recordTaskTransition({
+      projectDb,
       taskId: task.id,
       fromStatus: task.status,
       toStatus: nextStatus,
@@ -458,11 +456,12 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     return;
   }
 
-  const project = projectForUser(req.params.projectId, req.user.id);
-  if (!project) {
+  const projectContext = projectContextForUser(req.params.projectId, req.user.id);
+  if (!projectContext) {
     res.status(404).json({ error: "Project not found" });
     return;
   }
+  const { project, db: projectDb } = projectContext;
 
   if (project.clone_status !== "ready") {
     res.status(409).json({ error: "Project base repository is not ready" });
@@ -480,7 +479,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
 
   let dependencies: TaskRow[];
   try {
-    dependencies = resolveTaskDependencies({ projectId: project.id, dependencyTaskIds, taskId: id });
+    dependencies = resolveTaskDependencies(projectDb, { projectId: project.id, dependencyTaskIds, taskId: id });
   } catch (error: any) {
     res.status(400).json({ error: String(error?.message ?? "Invalid dependencies") });
     return;
@@ -502,8 +501,8 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     return;
   }
 
-  db.transaction(() => {
-    db.prepare(
+  projectDb.transaction(() => {
+    projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
         auto_merge,
@@ -526,13 +525,13 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       now
     );
 
-    db.prepare(
+    projectDb.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(makeId(), id, "null", "queued", isBlocked ? "task_created_blocked" : "task_created", req.user.id, now);
 
     for (const dependency of dependencies) {
-      db.prepare(
+      projectDb.prepare(
         "INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)"
       ).run(id, dependency.id, now);
     }
@@ -554,36 +553,38 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     }
   });
 
-  const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
+  const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
   kickTaskQueueProcessing();
-  res.status(201).json({ task: serializeTask(task) });
+  res.status(201).json({ task: serializeTask(projectDb, task) });
 });
 
 tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
-  const project = projectForUser(req.params.projectId, req.user.id);
-  if (!project) {
+  const projectContext = projectContextForUser(req.params.projectId, req.user.id);
+  if (!projectContext) {
     res.status(404).json({ error: "Project not found" });
     return;
   }
+  const { project, db: projectDb } = projectContext;
 
-  const tasks = db
+  const tasks = projectDb
     .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
     .all(project.id) as TaskRow[];
 
-  res.json({ tasks: tasks.map(serializeTask) });
+  res.json({ tasks: tasks.map((task) => serializeTask(projectDb, task)) });
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
-  const transitions = db
+  const transitions = projectDb
     .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as TaskTransitionRow[];
-  const mergeRecords = db
+  const mergeRecords = projectDb
     .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
     .all(task.id) as MergeRecordRow[];
 
@@ -595,10 +596,10 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   }
 
   res.json({
-    task: serializeTask(task),
+    task: serializeTask(projectDb, task),
     transitions: transitions.map(serializeTransition),
-    session: serializeSession(latestSession(task.id)),
-    ide: serializeIde(latestIde(task.id)),
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord)
   });
@@ -611,11 +612,12 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
     return;
   }
 
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   if (task.status !== "queued") {
     res.status(409).json({ error: "Task configuration can only be edited while queued" });
@@ -624,7 +626,7 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
 
   const input = parsed.data;
   const nextAiCommand = input.aiCommand ?? task.ai_command;
-  db.prepare("UPDATE tasks SET ai_command = ?, updated_at = ? WHERE id = ?").run(
+  projectDb.prepare("UPDATE tasks SET ai_command = ?, updated_at = ? WHERE id = ?").run(
     nextAiCommand,
     nowIso(),
     task.id
@@ -639,17 +641,18 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
     }
   });
 
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-  res.json({ task: serializeTask(updated) });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ task: serializeTask(projectDb, updated) });
 });
 
 tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
-  if (taskIsBlocked(task.id)) {
+  const { task, db: projectDb } = taskContext;
+  if (taskIsBlocked(projectDb, task.id)) {
     res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
   }
@@ -661,8 +664,8 @@ tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
     return;
   }
 
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-  res.json({ task: serializeTask(updated), session: serializeSession(latestSession(task.id)) });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ task: serializeTask(projectDb, updated), session: serializeSession(latestSession(projectDb, task.id)) });
 });
 
 tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
@@ -672,11 +675,12 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
     return;
   }
 
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   try {
     await sendTaskRuntimeInput(task.id, req.user.id, parsed.data.text);
@@ -685,8 +689,8 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
     return;
   }
 
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-  res.json({ task: serializeTask(updated), session: serializeSession(latestSession(task.id)) });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ task: serializeTask(projectDb, updated), session: serializeSession(latestSession(projectDb, task.id)) });
 });
 
 tasksRouter.post("/tasks/:taskId/stop", async (req, res) => {
@@ -702,17 +706,18 @@ tasksRouter.post("/tasks/:taskId/stop", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   if (["merged", "cancelled", "failed"].includes(task.status)) {
     res.status(409).json({ error: "Cannot pull main into a terminal task state" });
     return;
   }
-  if (taskIsBlocked(task.id)) {
+  if (taskIsBlocked(projectDb, task.id)) {
     res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
   }
@@ -743,14 +748,14 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
   }
 
   const now = nowIso();
-  db.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, now, task.id);
+  projectDb.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, now, task.id);
 
-  let latestTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  let latestTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
   if (pullResult.conflicted && latestTask.status !== "merge_conflict") {
-    latestTask = setTaskStatus(latestTask, "merge_conflict", "pull_main_conflict", req.user.id);
+    latestTask = setTaskStatus(projectDb, latestTask, "merge_conflict", "pull_main_conflict", req.user.id);
   }
   if (!pullResult.conflicted && latestTask.status === "merge_conflict") {
-    latestTask = setTaskStatus(latestTask, "in_progress", "pull_main_resolved", req.user.id);
+    latestTask = setTaskStatus(projectDb, latestTask, "in_progress", "pull_main_resolved", req.user.id);
   }
 
   recordEvent({
@@ -766,7 +771,7 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
   });
 
   res.json({
-    task: serializeTask(latestTask),
+    task: serializeTask(projectDb, latestTask),
     sync: {
       targetRef: topology.pullRemoteRef,
       conflicted: pullResult.conflicted,
@@ -777,11 +782,12 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
     status = await getWorkspaceGitStatus(task.workspace_path);
@@ -803,28 +809,29 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     return;
   }
 
-  const updated = setTaskStatus(task, "merge_ready", "user_marked_merge_ready", req.user.id);
+  const updated = setTaskStatus(projectDb, task, "merge_ready", "user_marked_merge_ready", req.user.id);
   recordEvent({
     projectId: updated.project_id,
     taskId: updated.id,
     eventType: "task.mark_merge_ready",
     payload: {}
   });
-  res.json({ task: serializeTask(updated) });
+  res.json({ task: serializeTask(projectDb, updated) });
 });
 
 tasksRouter.post("/tasks/:taskId/in-progress", (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
   if (task.status === "waiting_input") {
-    res.json({ task: serializeTask(task) });
+    res.json({ task: serializeTask(projectDb, task) });
     return;
   }
 
-  const updated = setTaskStatus(task, "waiting_input", "user_marked_in_progress", req.user.id);
+  const updated = setTaskStatus(projectDb, task, "waiting_input", "user_marked_in_progress", req.user.id);
   recordEvent({
     projectId: updated.project_id,
     taskId: updated.id,
@@ -834,7 +841,7 @@ tasksRouter.post("/tasks/:taskId/in-progress", (req, res) => {
       toStatus: "waiting_input"
     }
   });
-  res.json({ task: serializeTask(updated) });
+  res.json({ task: serializeTask(projectDb, updated) });
 });
 
 tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
@@ -844,16 +851,18 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
     return;
   }
 
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   const now = nowIso();
-  db.transaction(() => {
-    db.prepare("UPDATE tasks SET status = 'cancelled', cancel_reason = ?, updated_at = ? WHERE id = ?").run(parsed.data.reason, now, task.id);
+  projectDb.transaction(() => {
+    projectDb.prepare("UPDATE tasks SET status = 'cancelled', cancel_reason = ?, updated_at = ? WHERE id = ?").run(parsed.data.reason, now, task.id);
     recordTaskTransition({
+      projectDb,
       taskId: task.id,
       fromStatus: task.status,
       toStatus: "cancelled",
@@ -861,7 +870,7 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
       actorUserId: req.user.id
     });
   })();
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
@@ -870,15 +879,16 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
       reason: parsed.data.reason
     }
   });
-  res.json({ task: serializeTask(updated) });
+  res.json({ task: serializeTask(projectDb, updated) });
 });
 
 tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
   const project = projectForUser(task.project_id, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
@@ -899,15 +909,15 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
 
   const now = nowIso();
   try {
-    const ide = latestIde(task.id);
+    const ide = latestIde(projectDb, task.id);
     if (ide && ["starting", "running"].includes(ide.status) && ideSessionRunning(task.id)) {
       stopIdeSession(task.id);
     }
     if (ide && ["starting", "running"].includes(ide.status)) {
-      db.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
+      projectDb.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
     }
 
-    const sessions = activeSessions(task.id);
+    const sessions = activeSessions(projectDb, task.id);
     if (sessions.length) {
       res.status(409).json({ error: "Cannot rerun while runtime session is active" });
       return;
@@ -926,10 +936,10 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     });
     await createTaskBranch(task.workspace_path, task.id);
 
-    const latestTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    const latestTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
     const updatedAt = nowIso();
-    db.transaction(() => {
-      db.prepare(
+    projectDb.transaction(() => {
+      projectDb.prepare(
         `UPDATE tasks
          SET status = 'queued',
              result = '',
@@ -943,6 +953,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
          WHERE id = ?`
       ).run(task.workspace_path, baseCommitSha, updatedAt, task.id);
       recordTaskTransition({
+        projectDb,
         taskId: task.id,
         fromStatus: latestTask.status,
         toStatus: "queued",
@@ -951,7 +962,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       });
     })();
 
-    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
@@ -961,18 +972,19 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
         baseCommitShaAtCreate: baseCommitSha
       }
     });
-    res.json({ task: serializeTask(updated) });
+    res.json({ task: serializeTask(projectDb, updated) });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to re-run task") });
   }
 });
 
 tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
   if (task.status !== "merge_ready") {
     res.status(409).json({ error: "Task must be merge_ready before merge" });
     return;
@@ -1005,7 +1017,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
     const targetBaseCommitSha = await getHeadCommitSha(topology.mergeTargetPath);
     const mergeRecordId = makeId();
     const createdAt = nowIso();
-    db.prepare(
+    projectDb.prepare(
       `INSERT INTO merge_records (
         id, task_id, project_id, source_commit_sha, target_base_commit_sha, merge_commit_sha, status,
         conflict_summary, error_message, created_by_user_id, created_at, completed_at
@@ -1024,12 +1036,13 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
 
       if (mergeResult.conflicted) {
         const conflictSummary = mergeResult.conflictFiles.join("\n");
-        db.transaction(() => {
-          db.prepare(
+        projectDb.transaction(() => {
+          projectDb.prepare(
             "UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?"
           ).run(conflictSummary || "conflicts detected", completedAt, mergeRecordId);
-          db.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, task.id);
+          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, task.id);
           recordTaskTransition({
+            projectDb,
             taskId: task.id,
             fromStatus: "merge_ready",
             toStatus: "merge_conflict",
@@ -1046,14 +1059,15 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
           }
         });
       } else {
-        db.transaction(() => {
-          db.prepare(
+        projectDb.transaction(() => {
+          projectDb.prepare(
             "UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?"
           ).run(mergeResult.mergeCommitSha, completedAt, mergeRecordId);
-          db.prepare(
+          projectDb.prepare(
             "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
           ).run(completedAt, req.user.id, mergeResult.mergeCommitSha, completedAt, task.id);
           recordTaskTransition({
+            projectDb,
             taskId: task.id,
             fromStatus: "merge_ready",
             toStatus: "merged",
@@ -1075,7 +1089,7 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
       }
     } catch (error: any) {
       const completedAt = nowIso();
-      db.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
+      projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
         String(error?.message ?? "merge failed"),
         completedAt,
         mergeRecordId
@@ -1083,11 +1097,11 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
       throw error;
     }
 
-    const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-    const mergeRecords = db
+    const updatedTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    const mergeRecords = projectDb
       .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
       .all(task.id) as MergeRecordRow[];
-    res.json({ task: serializeTask(updatedTask), mergeRecords: mergeRecords.map(serializeMergeRecord) });
+    res.json({ task: serializeTask(projectDb, updatedTask), mergeRecords: mergeRecords.map(serializeMergeRecord) });
     if (queueKickNeeded) {
       kickTaskQueueProcessing();
     }
@@ -1099,12 +1113,13 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/merge-records", (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
-  const mergeRecords = db
+  const { task, db: projectDb } = taskContext;
+  const mergeRecords = projectDb
     .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
     .all(task.id) as MergeRecordRow[];
   res.json({ mergeRecords: mergeRecords.map(serializeMergeRecord) });
@@ -1126,11 +1141,12 @@ tasksRouter.get("/tasks/:taskId/terminal-token", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
   try {
@@ -1140,26 +1156,27 @@ tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
   }
 
   res.json({
-    ide: serializeIde(latestIde(task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus
   });
 });
 
 tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   if (!fs.existsSync(task.workspace_path)) {
     res.status(409).json({ error: "Task workspace folder is missing" });
     return;
   }
 
-  const current = latestIde(task.id);
+  const current = latestIde(projectDb, task.id);
   if (current && current.status === "running" && ideSessionRunning(task.id)) {
-    const launchUrl = await buildIdeLaunchUrl(task, current.id);
+    const launchUrl = await buildIdeLaunchUrl(projectDb, task, current.id);
     res.json({ ide: serializeIde(current), launchUrl });
     return;
   }
@@ -1177,22 +1194,22 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 
   const now = nowIso();
   const ideId = makeId();
-  db.transaction(() => {
+  projectDb.transaction(() => {
     if (current && current.status !== "stopped" && current.status !== "failed") {
-      db.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(
+      projectDb.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(
         now,
         now,
         current.id
       );
     }
-    db.prepare(
+    projectDb.prepare(
       `INSERT INTO ide_instances (
         id, task_id, provider, url, access_token_hash, status, started_at, ended_at, last_heartbeat_at
       ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, ?)`
     ).run(ideId, task.id, launched.provider, launched.url, hashToken("pending"), now, now);
   })();
 
-  const launchUrl = await buildIdeLaunchUrl(task, ideId);
+  const launchUrl = await buildIdeLaunchUrl(projectDb, task, ideId);
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
@@ -1204,40 +1221,44 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
     }
   });
 
-  const ide = db.prepare("SELECT * FROM ide_instances WHERE id = ?").get(ideId) as IdeInstanceRow | undefined;
+  const ide = projectDb.prepare("SELECT * FROM ide_instances WHERE id = ?").get(ideId) as IdeInstanceRow | undefined;
   res.json({ ide: serializeIde(ide), launchUrl });
 });
 
 tasksRouter.post("/tasks/:taskId/ide/token", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
-  const ide = latestIde(task.id);
+  const ide = latestIde(projectDb, task.id);
   if (!ide || !["starting", "running"].includes(ide.status)) {
     res.status(409).json({ error: "No active IDE instance for task" });
     return;
   }
   if (!ideSessionRunning(task.id)) {
-    db.prepare("UPDATE ide_instances SET status = 'failed', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(nowIso(), nowIso(), ide.id);
+    projectDb
+      .prepare("UPDATE ide_instances SET status = 'failed', ended_at = ?, last_heartbeat_at = ? WHERE id = ?")
+      .run(nowIso(), nowIso(), ide.id);
     res.status(409).json({ error: "IDE runtime is not available" });
     return;
   }
 
-  const launchUrl = await buildIdeLaunchUrl(task, ide.id);
+  const launchUrl = await buildIdeLaunchUrl(projectDb, task, ide.id);
   res.json({ ide: serializeIde(ide), launchUrl });
 });
 
 tasksRouter.post("/tasks/:taskId/ide/stop", (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
-  const ide = latestIde(task.id);
+  const ide = latestIde(projectDb, task.id);
   if (!ide || !["starting", "running"].includes(ide.status)) {
     stopIdeSession(task.id);
     res.json({ ide: null, stopped: false });
@@ -1246,7 +1267,7 @@ tasksRouter.post("/tasks/:taskId/ide/stop", (req, res) => {
 
   stopIdeSession(task.id);
   const now = nowIso();
-  db.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
+  projectDb.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
@@ -1256,16 +1277,17 @@ tasksRouter.post("/tasks/:taskId/ide/stop", (req, res) => {
     }
   });
 
-  const updated = db.prepare("SELECT * FROM ide_instances WHERE id = ?").get(ide.id) as IdeInstanceRow | undefined;
+  const updated = projectDb.prepare("SELECT * FROM ide_instances WHERE id = ?").get(ide.id) as IdeInstanceRow | undefined;
   res.json({ ide: serializeIde(updated) });
 });
 
 tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).send("Task not found");
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
   const token = typeof req.query.token === "string" ? req.query.token : "";
   if (!token) {
@@ -1273,7 +1295,7 @@ tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
     return;
   }
 
-  const ide = latestIde(task.id);
+  const ide = latestIde(projectDb, task.id);
   if (!ide || ide.status !== "running" || !ideSessionRunning(task.id)) {
     res.status(409).send("IDE is not running");
     return;
@@ -1295,13 +1317,14 @@ tasksRouter.get("/tasks/:taskId/ide/view", async (req, res) => {
 });
 
 tasksRouter.all("/tasks/:taskId/ide/proxy*", (req, res) => {
-  const task = taskForUser(req.params.taskId, req.user.id);
-  if (!task) {
+  const taskContext = taskContextForUser(req.params.taskId, req.user.id);
+  if (!taskContext) {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  const { task, db: projectDb } = taskContext;
 
-  const ide = latestIde(task.id);
+  const ide = latestIde(projectDb, task.id);
   if (!ide || ide.status !== "running" || !ideSessionRunning(task.id)) {
     res.status(409).json({ error: "IDE is not running" });
     return;

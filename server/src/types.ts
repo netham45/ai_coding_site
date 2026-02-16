@@ -12,23 +12,37 @@ export type TaskStatus =
 
 export type TaskMode = "execution" | "plan";
 
-export type ProjectRow = {
+export type AppProjectRow = {
   id: string;
   name: string;
   slug: string;
   repo_url: string;
   default_branch: string;
   base_path: string;
-  project_prompt: string;
-  project_rules: string;
-  coding_standard: string;
-  coding_standard_other: string;
-  project_other: string;
   clone_status: CloneStatus;
   clone_error: string | null;
   created_by_user_id: string;
   created_at: string;
   updated_at: string;
+};
+
+export type ProjectConfigRow = {
+  project_id: string;
+  project_prompt: string;
+  project_rules: string;
+  coding_standard: string;
+  coding_standard_other: string;
+  project_other: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectRow = AppProjectRow & {
+  project_prompt: string;
+  project_rules: string;
+  coding_standard: string;
+  coding_standard_other: string;
+  project_other: string;
 };
 
 export type TaskRow = {
