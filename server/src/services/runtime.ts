@@ -39,6 +39,8 @@ type SessionRow = {
 };
 
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
+const WAITING_INPUT_IDLE_MS = 3000;
+const HEARTBEAT_INTERVAL_MS = 1000;
 
 function getTask(taskId: string): TaskRow | undefined {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
@@ -321,10 +323,25 @@ async function monitorSession(session: SessionRow): Promise<void> {
 
   const output = await capturePane(session.tmux_socket_path, session.tmux_session_name);
   const signal = parseLifecycleSignals(output);
-  db.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+  const outputChanged = output !== session.last_output;
+  const now = Date.now();
+  const lastActivityMs = session.last_heartbeat_at ? Date.parse(session.last_heartbeat_at) : Number.NaN;
+  const idleMs = Number.isFinite(lastActivityMs) ? now - lastActivityMs : Number.POSITIVE_INFINITY;
+
+  if (outputChanged) {
+    db.prepare("UPDATE task_sessions SET last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(nowIso(), output, session.id);
+  }
 
   if (signal.sessionStatus === "waiting_input" && session.status !== "waiting_input") {
+    db.prepare("UPDATE task_sessions SET status = 'waiting_input', last_heartbeat_at = COALESCE(last_heartbeat_at, ?) WHERE id = ?").run(
+      nowIso(),
+      session.id
+    );
+  }
+
+  if (!outputChanged && session.status === "running" && idleMs >= WAITING_INPUT_IDLE_MS) {
     db.prepare("UPDATE task_sessions SET status = 'waiting_input' WHERE id = ?").run(session.id);
+    transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "waiting_input", reason: "runtime_idle_no_output" });
   }
 
   if (signal.taskStatus) {
@@ -387,5 +404,5 @@ export async function startRuntimeHeartbeat(): Promise<void> {
         transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "failed", reason: "heartbeat_failure" });
       }
     }
-  }, 5000);
+  }, HEARTBEAT_INTERVAL_MS);
 }
