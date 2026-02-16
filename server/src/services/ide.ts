@@ -203,14 +203,81 @@ function resolveGlobalGitConfigPath(): string | null {
     return direct;
   }
 
-  if (typeof process.env.HOME === "string" && process.env.HOME.length > 0) {
-    const candidate = path.join(process.env.HOME, ".gitconfig");
+  const homeCandidates = [process.env.SNAP_REAL_HOME, process.env.HOME].filter(
+    (value): value is string => typeof value === "string" && value.length > 0
+  );
+
+  for (const home of homeCandidates) {
+    const candidate = path.join(home, ".gitconfig");
     if (fs.existsSync(candidate)) {
       return candidate;
     }
   }
 
   return null;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function compactId(value: string): string {
+  const cleaned = value.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (cleaned.length > 0) {
+    return cleaned.slice(0, 48);
+  }
+  return "task";
+}
+
+export async function prepareIdeWorkspace(params: {
+  taskId: string;
+  workspacePath: string;
+  tmuxSocketPath?: string | null;
+  tmuxSessionName?: string | null;
+}): Promise<string> {
+  const hasTmuxTarget = Boolean(params.tmuxSocketPath && params.tmuxSessionName);
+  if (!hasTmuxTarget) {
+    return params.workspacePath;
+  }
+
+  const workspaceFilePath = path.join(params.workspacePath, `.ai-coding-site-${compactId(params.taskId)}.code-workspace`);
+  const tmuxSocketPath = params.tmuxSocketPath as string;
+  const tmuxSessionName = params.tmuxSessionName as string;
+  const attachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+
+  const workspaceSpec = {
+    folders: [{ path: params.workspacePath }],
+    settings: {
+      "task.allowAutomaticTasks": "on"
+    },
+    tasks: {
+      version: "2.0.0",
+      tasks: [
+        {
+          label: "Attach Task Runtime",
+          type: "shell",
+          command: attachCommand,
+          options: {
+            env: {
+              TMUX: ""
+            }
+          },
+          runOptions: {
+            runOn: "folderOpen"
+          },
+          presentation: {
+            reveal: "always",
+            panel: "dedicated",
+            focus: true
+          },
+          problemMatcher: []
+        }
+      ]
+    }
+  };
+
+  await fs.promises.writeFile(workspaceFilePath, `${JSON.stringify(workspaceSpec, null, 2)}\n`, "utf8");
+  return workspaceFilePath;
 }
 
 export async function startIdeSession(params: { taskId: string; workspacePath: string }): Promise<{ provider: Provider; url: string }> {
