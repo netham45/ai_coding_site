@@ -24,6 +24,10 @@ function ensureColumn(table: string, column: string, alterSql: string): void {
   }
 }
 
+function ensureIndex(indexSql: string): void {
+  db.exec(indexSql);
+}
+
 ensureColumn("task_sessions", "last_output", "ALTER TABLE task_sessions ADD COLUMN last_output TEXT NOT NULL DEFAULT ''");
 ensureColumn("projects", "project_rules", "ALTER TABLE projects ADD COLUMN project_rules TEXT NOT NULL DEFAULT ''");
 ensureColumn("projects", "coding_standard", "ALTER TABLE projects ADD COLUMN coding_standard TEXT NOT NULL DEFAULT ''");
@@ -37,6 +41,9 @@ ensureColumn("tasks", "mode", "ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL D
 ensureColumn("tasks", "parent_plan_task_id", "ALTER TABLE tasks ADD COLUMN parent_plan_task_id TEXT");
 ensureColumn("tasks", "source_plan_revision_id", "ALTER TABLE tasks ADD COLUMN source_plan_revision_id TEXT");
 ensureColumn("tasks", "source_plan_item_key", "ALTER TABLE tasks ADD COLUMN source_plan_item_key TEXT");
+
+ensureIndex("CREATE INDEX IF NOT EXISTS idx_tasks_parent_plan_task_id ON tasks(parent_plan_task_id)");
+ensureIndex("CREATE INDEX IF NOT EXISTS idx_tasks_mode ON tasks(mode)");
 
 export function ensureLocalUser(): string {
   const row = db.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
