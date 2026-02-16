@@ -1,6 +1,12 @@
 import type { ProjectRow } from "../types.js";
 
-export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string): string {
+type DependencySummary = {
+  id: string;
+  title: string;
+  result: string;
+};
+
+export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string, dependencySummaries: DependencySummary[] = []): string {
   const sections: string[] = [];
   const prompt = project.project_prompt.trim();
   const rules = project.project_rules.trim();
@@ -24,6 +30,15 @@ export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string): s
   }
   if (other) {
     sections.push(`Other:\n${other}`);
+  }
+  if (dependencySummaries.length > 0) {
+    const formatted = dependencySummaries
+      .filter((summary) => summary.result.trim().length > 0)
+      .map((summary) => `- ${summary.title} (${summary.id}):\n${summary.result.trim()}`)
+      .join("\n\n");
+    if (formatted) {
+      sections.push(`Dependency Summaries:\n${formatted}`);
+    }
   }
   if (task) {
     sections.push(`Task Prompt:\n${task}`);

@@ -166,6 +166,7 @@ function serializeTask(task: TaskRow) {
     projectId: task.project_id,
     title: task.title,
     taskPrompt: task.task_prompt,
+    result: task.result,
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
     autoMerge: Boolean(task.auto_merge),
@@ -489,12 +490,12 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   db.transaction(() => {
     db.prepare(
       `INSERT INTO tasks (
-        id, project_id, title, task_prompt, effective_prompt, ai_command,
+        id, project_id, title, task_prompt, result, effective_prompt, ai_command,
         auto_merge,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -925,6 +926,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       db.prepare(
         `UPDATE tasks
          SET status = 'queued',
+             result = '',
              workspace_path = ?,
              base_commit_sha_at_create = ?,
              head_commit_sha = NULL,

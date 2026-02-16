@@ -34,6 +34,7 @@ export type Task = {
   projectId: string;
   title: string;
   taskPrompt: string;
+  result: string;
   effectivePrompt: string;
   aiCommand: string;
   autoMerge: boolean;
