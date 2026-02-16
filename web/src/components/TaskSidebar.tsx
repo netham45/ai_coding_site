@@ -32,7 +32,7 @@ export function TaskSidebar({
             p={3}
             bg={selectedTaskId === task.id ? "teal.50" : "white"}
           >
-            <Link as={RouterLink} to={`/tasks/${task.id}`} color="teal.700" fontWeight="700">
+            <Link as={RouterLink} to={`/tasks/${task.id}?tab=ide`} color="teal.700" fontWeight="700">
               {task.title}
             </Link>
             <Box mt={1}>
