@@ -187,14 +187,12 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
   if (!task) {
     throw new Error("Task not found");
   }
-  if (task.result.trim().length > 0) {
-    return task.result.trim();
-  }
 
-  const existing = readTaskSummaryFromWorkspace(task.workspace_path);
-  if (existing) {
-    saveTaskResult(task.id, existing);
-    return existing;
+  const summaryPath = path.join(task.workspace_path, TASK_SUMMARY_FILE_NAME);
+  try {
+    fs.rmSync(summaryPath, { force: true });
+  } catch {
+    // best effort; stale file should not block summary regeneration
   }
 
   await sendTaskRuntimeInput(
@@ -223,7 +221,7 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
     }
 
     const summary = readTaskSummaryFromWorkspace(latestTask.workspace_path);
-    if (summary && latestTask.status === "waiting_input") {
+    if (summary) {
       saveTaskResult(latestTask.id, summary);
       recordEvent({
         projectId: latestTask.project_id,
