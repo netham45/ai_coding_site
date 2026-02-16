@@ -2,10 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { db } from "../db/index.js";
-import type { TaskRow, TaskStatus } from "../types.js";
+import type { ProjectRow, TaskRow, TaskStatus } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
+import { buildEffectivePrompt } from "./promptBuilder.js";
 import { buildCommand, parseLifecycleSignals } from "./adapters.js";
 import {
   buildSessionName,
@@ -41,6 +42,10 @@ const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
 
 function getTask(taskId: string): TaskRow | undefined {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+}
+
+function getProject(projectId: string): ProjectRow | undefined {
+  return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as ProjectRow | undefined;
 }
 
 function getLatestSession(taskId: string): SessionRow | undefined {
@@ -125,6 +130,10 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   if (["merged", "cancelled", "merge_ready", "merge_conflict"].includes(task.status)) {
     throw new Error(`Task cannot be started from status ${task.status}`);
   }
+  const project = getProject(task.project_id);
+  if (!project) {
+    throw new Error("Project not found");
+  }
 
   const existingSessions = getActiveSessions(taskId);
   for (const existing of existingSessions) {
@@ -144,7 +153,10 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
     });
   }
 
-  const built = buildCommand(task.ai_command, task.effective_prompt);
+  const effectivePrompt = buildEffectivePrompt(project, task.task_prompt);
+  db.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
+
+  const built = buildCommand(task.ai_command, effectivePrompt);
   const sessionId = makeId();
   const sessionName = buildSessionName(task.id, sessionId);
   const socketPath = buildSocketPath(tmuxRoot, task.id);

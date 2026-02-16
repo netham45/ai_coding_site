@@ -18,6 +18,10 @@ export type ProjectRow = {
   default_branch: string;
   base_path: string;
   project_prompt: string;
+  project_rules: string;
+  coding_standard: string;
+  coding_standard_other: string;
+  project_other: string;
   clone_status: CloneStatus;
   clone_error: string | null;
   created_by_user_id: string;
