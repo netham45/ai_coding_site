@@ -322,7 +322,7 @@ async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Prom
   if (!task) {
     return;
   }
-  if (!["merged", "cancelled"].includes(task.status)) {
+  if (!["merge_ready", "merged", "cancelled"].includes(task.status)) {
     updateTaskStatus({
       taskId,
       toStatus: "waiting_input",
@@ -562,7 +562,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
   const latestTask = getTask(task.id);
-  if (latestTask && ["queued", "failed", "waiting_input"].includes(latestTask.status)) {
+  if (latestTask && latestTask.status === "waiting_input") {
     db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
     insertTransition({
       taskId: task.id,

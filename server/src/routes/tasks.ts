@@ -426,9 +426,9 @@ function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, ac
   const now = nowIso();
   db.transaction(() => {
     if (nextStatus === "merged") {
-      db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
     } else {
-      db.prepare("UPDATE tasks SET status = ?, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
+      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
         nextStatus,
         now,
         task.id
@@ -778,7 +778,6 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     res.status(404).json({ error: "Task not found" });
     return;
   }
-
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
     status = await getWorkspaceGitStatus(task.workspace_path);
@@ -810,6 +809,30 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
   res.json({ task: serializeTask(updated) });
 });
 
+tasksRouter.post("/tasks/:taskId/in-progress", (req, res) => {
+  const task = taskForUser(req.params.taskId, req.user.id);
+  if (!task) {
+    res.status(404).json({ error: "Task not found" });
+    return;
+  }
+  if (task.status === "waiting_input") {
+    res.json({ task: serializeTask(task) });
+    return;
+  }
+
+  const updated = setTaskStatus(task, "waiting_input", "user_marked_in_progress", req.user.id);
+  recordEvent({
+    projectId: updated.project_id,
+    taskId: updated.id,
+    eventType: "task.mark_in_progress",
+    payload: {
+      fromStatus: task.status,
+      toStatus: "waiting_input"
+    }
+  });
+  res.json({ task: serializeTask(updated) });
+});
+
 tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
   const parsed = cancelTaskSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
@@ -820,11 +843,6 @@ tasksRouter.post("/tasks/:taskId/cancel", (req, res) => {
   const task = taskForUser(req.params.taskId, req.user.id);
   if (!task) {
     res.status(404).json({ error: "Task not found" });
-    return;
-  }
-
-  if (!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)) {
-    res.status(409).json({ error: "Task cannot be cancelled from current state" });
     return;
   }
 
@@ -857,7 +875,6 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     res.status(404).json({ error: "Task not found" });
     return;
   }
-
   const project = projectForUser(task.project_id, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
