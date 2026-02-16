@@ -27,7 +27,8 @@ AI Coding Site is a local-first web app for running AI coding tasks against Git 
 
 - `server/`: Express + TypeScript API, SQLite persistence, task runtime orchestration.
 - `web/`: React + Vite + Chakra UI frontend.
-- `data/app.sqlite`: runtime database created automatically.
+- `data/app.sqlite`: global runtime database (`users`, `user_settings`, `projects`, `project_members`).
+- `repos/<slug>/base/.ai-coding/project.sqlite`: per-project database for tasks/plans/sessions/events/IDE/merge state and project prompt/config.
 - `repos/`: cloned project bases and per-task workspaces.
 
 Runtime model:
@@ -308,7 +309,10 @@ WebSocket:
 
 ## Development notes
 
-- SQLite is initialized automatically on startup with WAL mode.
-- Runtime state is persisted in `task_sessions`, `task_state_transitions`, and `ide_instances`.
+- SQLite is initialized automatically on startup with WAL mode for app DB and each project DB.
+- Ownership invariants:
+  - Single source of truth per table (global tables in app DB, project-local tables in project DB).
+  - No cross-file foreign keys between app DB and project DB.
+  - Cross-DB linkage is by IDs only; integrity is enforced in application logic.
 - The AI command template must include `{prompt}` if you want prompt injection into command args.
 - Shell metacharacters in `aiCommand` are blocked by validation.

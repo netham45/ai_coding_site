@@ -1,4 +1,6 @@
-export const baselineMigration = `
+export const PROJECT_DB_SCHEMA_VERSION = 1;
+
+export const appBaselineMigration = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
@@ -21,11 +23,6 @@ CREATE TABLE IF NOT EXISTS projects (
   repo_url TEXT NOT NULL,
   default_branch TEXT NOT NULL,
   base_path TEXT NOT NULL,
-  project_prompt TEXT NOT NULL DEFAULT '',
-  project_rules TEXT NOT NULL DEFAULT '',
-  coding_standard TEXT NOT NULL DEFAULT '',
-  coding_standard_other TEXT NOT NULL DEFAULT '',
-  project_other TEXT NOT NULL DEFAULT '',
   clone_status TEXT NOT NULL CHECK (clone_status IN ('pending','cloning','ready','failed')),
   clone_error TEXT,
   created_by_user_id TEXT NOT NULL REFERENCES users(id),
@@ -42,10 +39,31 @@ CREATE TABLE IF NOT EXISTS project_members (
   created_at TEXT NOT NULL,
   PRIMARY KEY (project_id, user_id)
 );
+`;
+
+export const projectBaselineMigration = `
+CREATE TABLE IF NOT EXISTS project_metadata (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  project_id TEXT NOT NULL UNIQUE,
+  schema_version INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  project_id TEXT NOT NULL,
+  project_prompt TEXT NOT NULL DEFAULT '',
+  project_rules TEXT NOT NULL DEFAULT '',
+  coding_standard TEXT NOT NULL DEFAULT '',
+  coding_standard_other TEXT NOT NULL DEFAULT '',
+  project_other TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
   title TEXT NOT NULL,
   task_prompt TEXT NOT NULL,
   result TEXT NOT NULL DEFAULT '',
@@ -62,14 +80,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   head_commit_sha TEXT,
   cancel_reason TEXT,
   merged_at TEXT,
-  merged_by_user_id TEXT REFERENCES users(id),
-  created_by_user_id TEXT NOT NULL REFERENCES users(id),
+  merged_by_user_id TEXT,
+  created_by_user_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_plan_task_id ON tasks(parent_plan_task_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_mode ON tasks(mode);
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -87,7 +107,7 @@ CREATE TABLE IF NOT EXISTS task_state_transitions (
   from_status TEXT NOT NULL,
   to_status TEXT NOT NULL,
   reason TEXT NOT NULL,
-  actor_user_id TEXT REFERENCES users(id),
+  actor_user_id TEXT,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_state_transitions_task_id ON task_state_transitions(task_id);
@@ -114,9 +134,9 @@ CREATE INDEX IF NOT EXISTS idx_task_sessions_status ON task_sessions(status);
 
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
-  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
-  session_id TEXT REFERENCES task_sessions(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  task_id TEXT,
+  session_id TEXT,
   event_type TEXT NOT NULL,
   payload TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
@@ -130,14 +150,14 @@ CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type);
 CREATE TABLE IF NOT EXISTS merge_records (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
   source_commit_sha TEXT NOT NULL,
   target_base_commit_sha TEXT NOT NULL,
   merge_commit_sha TEXT,
   status TEXT NOT NULL CHECK (status IN ('pending','merged','conflict','failed')),
   conflict_summary TEXT,
   error_message TEXT,
-  created_by_user_id TEXT NOT NULL REFERENCES users(id),
+  created_by_user_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   completed_at TEXT
 );
@@ -152,7 +172,7 @@ CREATE TABLE IF NOT EXISTS plan_revisions (
   feedback TEXT,
   raw_output TEXT NOT NULL DEFAULT '',
   parse_error TEXT,
-  created_by_user_id TEXT NOT NULL REFERENCES users(id),
+  created_by_user_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
   approved_at TEXT
 );

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { db } from "../db/index.js";
+import { appDb } from "../db/index.js";
 import type { UserSettingsRow } from "../types.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "../services/events.js";
@@ -12,7 +12,7 @@ const patchSchema = z.object({
 export const settingsRouter = Router();
 
 settingsRouter.get("/", (req, res) => {
-  const row = db.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
+  const row = appDb.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
   res.json({
     settings: {
       userId: row.user_id,
@@ -30,7 +30,7 @@ settingsRouter.patch("/", (req, res) => {
     return;
   }
 
-  const current = db.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
+  const current = appDb.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
   if (!current) {
     res.status(404).json({ error: "Settings not found" });
     return;
@@ -38,14 +38,14 @@ settingsRouter.patch("/", (req, res) => {
 
   const input = parsed.data;
   const nextAi = input.defaultAiCommand ?? current.default_ai_command;
-  db.prepare("UPDATE user_settings SET default_ai_command = ?, updated_at = ? WHERE user_id = ?").run(nextAi, nowIso(), req.user.id);
+  appDb.prepare("UPDATE user_settings SET default_ai_command = ?, updated_at = ? WHERE user_id = ?").run(nextAi, nowIso(), req.user.id);
 
   recordEvent({
     eventType: "user_settings.updated",
     payload: { userId: req.user.id, defaultAiCommand: nextAi }
   });
 
-  const updated = db.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
+  const updated = appDb.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(req.user.id) as UserSettingsRow;
   res.json({
     settings: {
       userId: updated.user_id,
