@@ -61,6 +61,52 @@ export async function cloneLocalBaseToWorkspace(params: { basePath: string; work
   }
 }
 
+export async function listRepoFiles(params: { repoPath: string; query?: string; limit?: number }): Promise<string[]> {
+  const normalizedLimit = Math.min(Math.max(params.limit ?? 20, 1), 100);
+  const normalizedQuery = (params.query ?? "").trim().toLowerCase();
+
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", params.repoPath, "ls-files", "--cached", "--others", "--exclude-standard"],
+      {
+        timeout: 20000,
+        env: nonInteractiveGitEnv()
+      }
+    );
+
+    const files = String(stdout)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!normalizedQuery) {
+      return files.sort((a, b) => a.localeCompare(b)).slice(0, normalizedLimit);
+    }
+
+    return files
+      .filter((file) => file.toLowerCase().includes(normalizedQuery))
+      .sort((a, b) => {
+        const aLower = a.toLowerCase();
+        const bLower = b.toLowerCase();
+        const aBase = path.basename(aLower);
+        const bBase = path.basename(bLower);
+
+        const aScore = aLower.startsWith(normalizedQuery) ? 0 : aBase.startsWith(normalizedQuery) ? 1 : 2;
+        const bScore = bLower.startsWith(normalizedQuery) ? 0 : bBase.startsWith(normalizedQuery) ? 1 : 2;
+
+        if (aScore !== bScore) return aScore - bScore;
+        if (a.length !== b.length) return a.length - b.length;
+        return a.localeCompare(b);
+      })
+      .slice(0, normalizedLimit);
+  } catch (error: any) {
+    const stderr = error?.stderr ? String(error.stderr) : "";
+    const message = stderr.trim() || error?.message || "failed to list repository files";
+    throw new Error(message);
+  }
+}
+
 export async function getHeadCommitSha(repoPath: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", "HEAD"], {

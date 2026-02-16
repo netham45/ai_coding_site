@@ -10,7 +10,7 @@ import { makeId } from "../utils/id.js";
 import { nextSlug, slugify } from "../utils/slug.js";
 import { nowIso } from "../utils/time.js";
 import { isValidRepoUrl } from "../utils/validation.js";
-import { cloneRepo } from "../services/git.js";
+import { cloneRepo, listRepoFiles } from "../services/git.js";
 import { recordEvent } from "../services/events.js";
 import { reposRoot } from "../utils/paths.js";
 import { ideSessionRunning, ideSessionTarget, startIdeSession, stopIdeSession } from "../services/ide.js";
@@ -273,6 +273,34 @@ projectsRouter.get("/:projectId", (req, res) => {
     return;
   }
   res.json({ project: serializeProject(project) });
+});
+
+projectsRouter.get("/:projectId/files", async (req, res) => {
+  const project = projectForUser(req.params.projectId, req.user.id);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+
+  if (project.clone_status !== "ready") {
+    res.json({ files: [] });
+    return;
+  }
+
+  const query = typeof req.query.query === "string" ? req.query.query : "";
+  const rawLimit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : Number.NaN;
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 20;
+
+  try {
+    const files = await listRepoFiles({
+      repoPath: project.base_path,
+      query,
+      limit
+    });
+    res.json({ files });
+  } catch (error: any) {
+    res.status(500).json({ error: String(error?.message ?? "Failed to list files") });
+  }
 });
 
 projectsRouter.patch("/:projectId", (req, res) => {
