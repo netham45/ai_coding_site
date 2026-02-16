@@ -4,7 +4,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { z } from "zod";
-import { db } from "../db/index.js";
+import { db, ensureProjectDb } from "../db/index.js";
 import type { ProjectRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nextSlug, slugify } from "../utils/slug.js";
@@ -240,6 +240,10 @@ projectsRouter.post("/", async (req, res) => {
       repoUrl: input.repoUrl,
       destination: basePath,
       branch: input.defaultBranch
+    });
+    ensureProjectDb({
+      projectId: id,
+      basePath
     });
 
     db.prepare("UPDATE projects SET clone_status = 'ready', clone_error = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id);
