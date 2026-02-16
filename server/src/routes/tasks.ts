@@ -17,7 +17,7 @@ import {
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
-import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
+import { sendTaskRuntimeInput, startTaskRuntime } from "../services/runtime.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -692,15 +692,9 @@ tasksRouter.post("/tasks/:taskId/stop", async (req, res) => {
     return;
   }
 
-  try {
-    await stopTaskRuntime(task.id, req.user.id);
-  } catch (error: any) {
-    res.status(409).json({ error: String(error?.message ?? "Failed to stop session") });
-    return;
-  }
-
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-  res.json({ task: serializeTask(updated), session: serializeSession(latestSession(task.id)) });
+  void task;
+  void req;
+  res.status(409).json({ error: "Stopping runtime sessions is disabled" });
 });
 
 tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
@@ -783,16 +777,6 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
   if (!task) {
     res.status(404).json({ error: "Task not found" });
     return;
-  }
-
-  const active = activeSessions(task.id);
-  if (active.length) {
-    try {
-      await stopTaskRuntime(task.id, req.user.id);
-    } catch (error: any) {
-      res.status(409).json({ error: String(error?.message ?? "Failed to stop active runtime before marking merge-ready") });
-      return;
-    }
   }
 
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
@@ -903,10 +887,9 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     }
 
     const sessions = activeSessions(task.id);
-    for (const session of sessions) {
-      db.prepare(
-        "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'task_rerun_reset') WHERE id = ?"
-      ).run(nowIso(), nowIso(), session.id);
+    if (sessions.length) {
+      res.status(409).json({ error: "Cannot rerun while runtime session is active" });
+      return;
     }
 
     if (!isSafeTaskWorkspacePath(task.workspace_path, project.base_path)) {

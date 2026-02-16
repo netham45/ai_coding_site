@@ -670,6 +670,7 @@ export function TaskDetailPage() {
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const isPlanOwnedExecutionTask = task.mode === "execution" && !!task.parentPlanTaskId;
+  const completionSummary = task.result.trim();
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -859,6 +860,17 @@ export function TaskDetailPage() {
                     {task.workspacePath}
                   </Code>
                 </Box>
+
+                {!!completionSummary && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Completion Summary
+                    </Heading>
+                    <Code display="block" whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
+                      {completionSummary}
+                    </Code>
+                  </Box>
+                )}
 
                 {task.mode === "plan" && (
                   <Box>
