@@ -188,10 +188,11 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): P
     throw new Error("Task not found");
   }
 
-  const existing = readTaskSummaryFromWorkspace(task.workspace_path);
-  if (existing) {
-    saveTaskResult(task.id, existing);
-    return existing;
+  const summaryPath = path.join(task.workspace_path, TASK_SUMMARY_FILE_NAME);
+  try {
+    fs.rmSync(summaryPath, { force: true });
+  } catch {
+    // best effort; stale file should not block summary regeneration
   }
 
   await sendTaskRuntimeInput(
