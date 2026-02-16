@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   task_prompt TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT '',
   effective_prompt TEXT NOT NULL,
   ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
   auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),

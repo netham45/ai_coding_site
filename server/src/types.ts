@@ -36,6 +36,7 @@ export type TaskRow = {
   project_id: string;
   title: string;
   task_prompt: string;
+  result: string;
   effective_prompt: string;
   ai_command: string;
   auto_merge: number;

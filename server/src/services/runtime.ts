@@ -53,6 +53,9 @@ const WAITING_INPUT_IDLE_MS = 3000;
 const HEARTBEAT_INTERVAL_MS = 1000;
 const AUTO_MERGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTO_MERGE_POLL_INTERVAL_MS = 1250;
+const TASK_SUMMARY_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
+const TASK_SUMMARY_POLL_INTERVAL_MS = 1000;
+const TASK_SUMMARY_FILE_NAME = ".ai-task-summary.md";
 const autoMergeTaskIds = new Set<string>();
 
 function getTask(taskId: string): TaskRow | undefined {
@@ -81,6 +84,18 @@ function taskIsBlocked(taskId: string): boolean {
     )
     .get(taskId) as { task_id: string } | undefined;
   return Boolean(row?.task_id);
+}
+
+function getDependencySummariesForTask(taskId: string): Array<{ id: string; title: string; result: string }> {
+  return db
+    .prepare(
+      `SELECT dep.id, dep.title, dep.result
+       FROM task_dependencies td
+       JOIN tasks dep ON dep.id = td.dependency_task_id
+       WHERE td.task_id = ?
+       ORDER BY td.created_at ASC`
+    )
+    .all(taskId) as Array<{ id: string; title: string; result: string }>;
 }
 
 function getLatestSession(taskId: string): SessionRow | undefined {
@@ -150,6 +165,80 @@ function transitionTaskIfNeeded(params: {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readTaskSummaryFromWorkspace(workspacePath: string): string {
+  const filePath = path.join(workspacePath, TASK_SUMMARY_FILE_NAME);
+  if (!fs.existsSync(filePath)) {
+    return "";
+  }
+  try {
+    return fs.readFileSync(filePath, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveTaskResult(taskId: string, result: string): void {
+  db.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(result, nowIso(), taskId);
+}
+
+async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string): Promise<string> {
+  const task = getTask(taskId);
+  if (!task) {
+    throw new Error("Task not found");
+  }
+  if (task.result.trim().length > 0) {
+    return task.result.trim();
+  }
+
+  const existing = readTaskSummaryFromWorkspace(task.workspace_path);
+  if (existing) {
+    saveTaskResult(task.id, existing);
+    return existing;
+  }
+
+  await sendTaskRuntimeInput(
+    task.id,
+    actorUserId,
+    [
+      "Before auto-merge, generate a summary of this task.",
+      `Write it to ${TASK_SUMMARY_FILE_NAME} in the workspace root.`,
+      "Include:",
+      "- Goal and outcome",
+      "- Key code changes",
+      "- Tests/validation performed",
+      "- Remaining risks or follow-ups",
+      "After writing the file, wait for further input."
+    ].join("\n")
+  );
+
+  const deadline = Date.now() + TASK_SUMMARY_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const latestTask = getTask(task.id);
+    if (!latestTask) {
+      throw new Error("Task not found");
+    }
+    if (["cancelled", "failed", "merge_conflict", "merged"].includes(latestTask.status)) {
+      throw new Error(`Task entered terminal state ${latestTask.status} before summary capture completed`);
+    }
+
+    const summary = readTaskSummaryFromWorkspace(latestTask.workspace_path);
+    if (summary && latestTask.status === "waiting_input") {
+      saveTaskResult(latestTask.id, summary);
+      recordEvent({
+        projectId: latestTask.project_id,
+        taskId: latestTask.id,
+        eventType: "task.summary.captured",
+        payload: { file: TASK_SUMMARY_FILE_NAME }
+      });
+      return summary;
+    }
+
+    await sleep(TASK_SUMMARY_POLL_INTERVAL_MS);
+  }
+
+  throw new Error("Timed out waiting for runtime to write task summary");
 }
 
 function updateTaskStatus(params: {
@@ -296,6 +385,8 @@ async function runAutoMerge(taskId: string): Promise<void> {
   });
 
   try {
+    await ensureTaskSummaryCaptured(task.id, actorUserId);
+
     const pullResult = await pullRemoteRefIntoTaskWorkspace({
       workspacePath: task.workspace_path,
       remoteRef: project.default_branch
@@ -486,7 +577,8 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
     throw new Error(`Task cannot be started from status ${latestBeforeStart.status}`);
   }
 
-  const effectivePrompt = buildEffectivePrompt(project, task.task_prompt);
+  const dependencySummaries = getDependencySummariesForTask(task.id);
+  const effectivePrompt = buildEffectivePrompt(project, task.task_prompt, dependencySummaries);
   db.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
 
   const built = buildCommand(task.ai_command, effectivePrompt);
