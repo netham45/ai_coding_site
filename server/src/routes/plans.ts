@@ -39,7 +39,8 @@ const approvePlanSchema = z.object({
         itemKey: z.string().min(1).max(200),
         title: z.string().min(2).max(160),
         description: z.string().min(1).max(12000),
-        prompt: z.string().max(12000).optional()
+        prompt: z.string().max(12000).optional(),
+        aiCommand: z.string().min(1).max(500).optional()
       })
     )
     .max(1000)
@@ -702,6 +703,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       const description = edit?.description.trim() || row.item.prompt;
       const prompt = edit?.prompt?.trim() ?? "";
       const taskPrompt = [description, prompt].filter(Boolean).join("\n\n");
+      const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, req.user.id);
 
       projectDb.prepare(
         `INSERT INTO tasks (
@@ -717,7 +719,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
         title,
         taskPrompt,
         buildEffectivePrompt(project, taskPrompt),
-        resolveAiCommand(undefined, req.user.id),
+        aiCommand,
         autoMergeItemKeys.has(row.item.item_key.toLowerCase()) ? 1 : 0,
         plan.id,
         latestRevision.id,

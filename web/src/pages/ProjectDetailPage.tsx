@@ -44,7 +44,6 @@ type CreateTaskForm = {
 type CreatePlanForm = {
   title: string;
   taskPrompt: string;
-  aiCommand: string;
 };
 
 type ProjectInstructionsForm = {
@@ -64,8 +63,7 @@ const initialForm: CreateTaskForm = {
 
 const initialPlanForm: CreatePlanForm = {
   title: "",
-  taskPrompt: "",
-  aiCommand: "codex --yolo {prompt}"
+  taskPrompt: ""
 };
 
 const NON_SELECTABLE_DEPENDENCY_STATUSES = new Set(["merged", "cancelled", "failed"]);
@@ -93,6 +91,8 @@ export function ProjectDetailPage() {
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>(["codex --yolo {prompt}"]);
   const [taskAiCommandSelection, setTaskAiCommandSelection] = useState<string>("codex --yolo {prompt}");
   const [taskAiCommandOverride, setTaskAiCommandOverride] = useState("");
+  const [planAiCommandSelection, setPlanAiCommandSelection] = useState<string>("codex --yolo {prompt}");
+  const [planAiCommandOverride, setPlanAiCommandOverride] = useState("");
   const [planForm, setPlanForm] = useState<CreatePlanForm>(initialPlanForm);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
     projectPrompt: "",
@@ -133,8 +133,9 @@ export function ProjectDetailPage() {
     return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0 && hasCommand;
   }, [form, taskAiCommandOverride, taskAiCommandSelection]);
   const canCreatePlan = useMemo(() => {
-    return planForm.title.trim().length >= 2 && planForm.taskPrompt.trim().length > 0;
-  }, [planForm]);
+    const hasCommand = planAiCommandSelection === AI_COMMAND_OTHER ? planAiCommandOverride.trim().length > 0 : true;
+    return planForm.title.trim().length >= 2 && planForm.taskPrompt.trim().length > 0 && hasCommand;
+  }, [planAiCommandOverride, planAiCommandSelection, planForm]);
 
   const closeSuggestions = () => {
     setShowSuggestions(false);
@@ -259,6 +260,8 @@ export function ProjectDetailPage() {
     setTaskAiCommandOptions(commandOptions);
     setTaskAiCommandSelection(commandOptions[0] || "codex --yolo {prompt}");
     setTaskAiCommandOverride("");
+    setPlanAiCommandSelection(commandOptions[0] || "codex --yolo {prompt}");
+    setPlanAiCommandOverride("");
   }
 
   useEffect(() => {
@@ -357,6 +360,11 @@ export function ProjectDetailPage() {
   async function onCreatePlan(event: React.FormEvent) {
     event.preventDefault();
     if (!projectId) return;
+    const selectedAiCommand = planAiCommandSelection === AI_COMMAND_OTHER ? planAiCommandOverride.trim() : planAiCommandSelection;
+    if (!selectedAiCommand) {
+      toast({ status: "error", title: "AI command override is required" });
+      return;
+    }
 
     setCreatingPlan(true);
     try {
@@ -365,10 +373,12 @@ export function ProjectDetailPage() {
         body: JSON.stringify({
           title: planForm.title,
           taskPrompt: planForm.taskPrompt,
-          aiCommand: planForm.aiCommand
+          aiCommand: selectedAiCommand
         })
       });
       setPlanForm(initialPlanForm);
+      setPlanAiCommandSelection(taskAiCommandOptions[0] || "codex --yolo {prompt}");
+      setPlanAiCommandOverride("");
       await loadData();
       toast({ status: "success", title: "Plan created" });
       navigate(`/plans/${created.plan.id}?tab=ide`);
@@ -662,7 +672,32 @@ export function ProjectDetailPage() {
                   </FormControl>
                   <FormControl isRequired>
                     <FormLabel>AI Command</FormLabel>
-                    <Input value={planForm.aiCommand} onChange={(e) => setPlanForm((x) => ({ ...x, aiCommand: e.target.value }))} />
+                    <Stack spacing={2}>
+                      <Select
+                        value={planAiCommandSelection}
+                        onChange={(e) => {
+                          const selected = e.target.value;
+                          setPlanAiCommandSelection(selected);
+                          if (selected !== AI_COMMAND_OTHER) {
+                            setPlanAiCommandOverride("");
+                          }
+                        }}
+                      >
+                        {taskAiCommandOptions.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                        <option value={AI_COMMAND_OTHER}>Other</option>
+                      </Select>
+                      {planAiCommandSelection === AI_COMMAND_OTHER && (
+                        <Input
+                          placeholder="Enter custom AI command"
+                          value={planAiCommandOverride}
+                          onChange={(e) => setPlanAiCommandOverride(e.target.value)}
+                        />
+                      )}
+                    </Stack>
                   </FormControl>
                   <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
                     <FormLabel>Planning Prompt</FormLabel>
