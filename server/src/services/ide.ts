@@ -1,7 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -18,7 +17,6 @@ type Runtime = {
 };
 
 const runtimes = new Map<string, Runtime>();
-const ideWorkspaceRoot = path.join(os.tmpdir(), "ai-coding-site-ide-workspaces");
 
 async function commandExists(command: string): Promise<boolean> {
   try {
@@ -210,8 +208,7 @@ export async function prepareIdeWorkspace(params: {
     return params.workspacePath;
   }
 
-  await fs.promises.mkdir(ideWorkspaceRoot, { recursive: true });
-  const workspaceFilePath = path.join(ideWorkspaceRoot, `${compactId(params.taskId)}.code-workspace`);
+  const workspaceFilePath = path.join(params.workspacePath, `.ai-coding-site-${compactId(params.taskId)}.code-workspace`);
   const tmuxSocketPath = params.tmuxSocketPath as string;
   const tmuxSessionName = params.tmuxSessionName as string;
   const attachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
