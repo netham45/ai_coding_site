@@ -688,6 +688,7 @@ export function TaskDetailPage() {
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const isPlanOwnedExecutionTask = task.mode === "execution" && !!task.parentPlanTaskId;
+  const completionSummary = task.result.trim();
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -729,16 +730,21 @@ export function TaskDetailPage() {
           <Heading size="lg" mt={2}>
             {projectName ? `${projectName} - ${task.title}` : task.title}
           </Heading>
-          <Stack direction="row" mt={2} align="center">
-            <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
-            <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
-            <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
-              terminal: {terminalState}
-            </Badge>
-            <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
-              ide: {ide?.status ?? "stopped"}
-            </Badge>
-          </Stack>
+          <Flex mt={2} align={{ base: "flex-start", md: "center" }} justify="space-between" gap={3} flexWrap="wrap">
+            <Stack direction="row" align="center" flexWrap="wrap">
+              <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
+              <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
+              <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
+                terminal: {terminalState}
+              </Badge>
+              <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
+                ide: {ide?.status ?? "stopped"}
+              </Badge>
+            </Stack>
+            <Button colorScheme="blue" variant="outline" size="sm" onClick={markInProgress} isLoading={markingInProgress}>
+              In Progress
+            </Button>
+          </Flex>
         </Box>
 
         <Tabs index={activePane === "ide" ? 0 : activePane === "terminal" ? 1 : 2} onChange={(next) => setActivePane(next === 0 ? "ide" : next === 1 ? "terminal" : "info")} colorScheme="teal">
@@ -895,6 +901,17 @@ export function TaskDetailPage() {
                     {task.workspacePath}
                   </Code>
                 </Box>
+
+                {!!completionSummary && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Completion Summary
+                    </Heading>
+                    <Code display="block" whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
+                      {completionSummary}
+                    </Code>
+                  </Box>
+                )}
 
                 {task.mode === "plan" && (
                   <Box>

@@ -278,7 +278,7 @@ function updateTaskStatus(params: {
   });
 }
 
-async function awaitAutoMergeReady(taskId: string, actorUserId: string): Promise<TaskRow> {
+async function awaitAutoMergeReady(taskId: string): Promise<TaskRow> {
   const deadline = Date.now() + AUTO_MERGE_READY_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
@@ -300,19 +300,10 @@ async function awaitAutoMergeReady(taskId: string, actorUserId: string): Promise
       gitStatus.unstaged === 0 &&
       gitStatus.conflicted === 0;
     if (cleanWorkspace && ["in_progress", "waiting_input"].includes(task.status)) {
-      try {
-        const sessions = getActiveSessions(task.id);
-        if (sessions.length) {
-          await stopTaskRuntime(task.id, actorUserId);
-        }
-      } catch {
-        // Best effort. If stop fails due stale session, continue.
-      }
       updateTaskStatus({
         taskId: task.id,
         toStatus: "merge_ready",
         reason: "auto_merge_marked_merge_ready",
-        actorUserId
       });
       const ready = getTask(task.id);
       if (ready && ready.status === "merge_ready") {
@@ -327,20 +318,11 @@ async function awaitAutoMergeReady(taskId: string, actorUserId: string): Promise
 }
 
 async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Promise<void> {
-  try {
-    const sessions = getActiveSessions(taskId);
-    for (const _session of sessions) {
-      await stopTaskRuntime(taskId, actorUserId);
-    }
-  } catch {
-    // Best effort to ensure runtime is idle.
-  }
-
   const task = getTask(taskId);
   if (!task) {
     return;
   }
-  if (!["merged", "cancelled"].includes(task.status)) {
+  if (!["merge_ready", "merged", "cancelled"].includes(task.status)) {
     updateTaskStatus({
       taskId,
       toStatus: "waiting_input",
@@ -406,11 +388,11 @@ async function runAutoMerge(taskId: string): Promise<void> {
         "1) Pull in any latest changes if needed.",
         "2) Resolve any issues.",
         "3) Commit all required code changes to this task branch.",
-        "4) Exit the runtime with code 0 when done."
+        "4) Do not exit the runtime. Leave it running and wait for further input when done."
       ].join("\n")
     );
 
-    const mergeReadyTask = await awaitAutoMergeReady(task.id, actorUserId);
+    const mergeReadyTask = await awaitAutoMergeReady(task.id);
     const mergeResult = await mergeTaskWorkspaceIntoTarget({
       targetPath: project.base_path,
       targetBranch: project.default_branch,
@@ -510,7 +492,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   const initialDisallowed =
     task.mode === "plan"
       ? ["merged", "cancelled"]
-      : ["merged", "cancelled", "merge_ready", "merge_conflict"];
+      : ["merged", "cancelled", "merge_conflict"];
   if (initialDisallowed.includes(task.status)) {
     throw new Error(`Task cannot be started from status ${task.status}`);
   }
@@ -544,17 +526,9 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   await ensureTmuxAvailable();
 
   const existingSessions = getActiveSessions(taskId);
-  for (const existing of existingSessions) {
-    db.prepare(
-      "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_new_start') WHERE id = ?"
-    ).run(nowIso(), nowIso(), existing.id);
-    recordEvent({
-      projectId: task.project_id,
-      taskId: task.id,
-      sessionId: existing.id,
-      eventType: "session.restarted",
-      payload: { actorUserId }
-    });
+  if (existingSessions.length) {
+    // Runtime sessions are never force-stopped by server-side start requests.
+    return;
   }
 
   // Re-check task status after cleanup to avoid racing with cancel/merge actions.
@@ -565,7 +539,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   const latestDisallowed =
     latestBeforeStart.mode === "plan"
       ? ["merged", "cancelled"]
-      : ["merged", "cancelled", "merge_ready", "merge_conflict"];
+      : ["merged", "cancelled", "merge_conflict"];
   if (latestDisallowed.includes(latestBeforeStart.status)) {
     throw new Error(`Task cannot be started from status ${latestBeforeStart.status}`);
   }
@@ -588,7 +562,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
   const latestTask = getTask(task.id);
-  if (latestTask && ["queued", "failed", "waiting_input"].includes(latestTask.status)) {
+  if (latestTask && latestTask.status === "waiting_input") {
     db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
     insertTransition({
       taskId: task.id,
@@ -689,38 +663,9 @@ export async function sendTaskRuntimeInput(taskId: string, actorUserId: string, 
 }
 
 export async function stopTaskRuntime(taskId: string, actorUserId: string): Promise<void> {
-  const session = getLatestSession(taskId);
-  if (!session || !["starting", "running", "waiting_input"].includes(session.status)) {
-    throw new Error("No active session to stop");
-  }
-
-  let finalOutput = session.last_output;
-  try {
-    finalOutput = await capturePane(session.tmux_socket_path, session.tmux_session_name);
-  } catch {
-    // keep previous buffer
-  }
-
-  db.prepare("UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, last_output = ? WHERE id = ?").run(
-    nowIso(),
-    nowIso(),
-    finalOutput,
-    session.id
-  );
-
-  transitionTaskIfNeeded({ taskId, toStatus: "waiting_input", reason: "session_stopped_by_user", actorUserId });
-  maybeStartAutoMerge(taskId);
-
-  const task = getTask(taskId);
-  if (task) {
-    recordEvent({
-      projectId: task.project_id,
-      taskId: task.id,
-      sessionId: session.id,
-      eventType: "session.stopped",
-      payload: { actorUserId }
-    });
-  }
+  void taskId;
+  void actorUserId;
+  throw new Error("Stopping runtime sessions is disabled");
 }
 
 async function monitorSession(session: SessionRow): Promise<void> {
@@ -728,7 +673,7 @@ async function monitorSession(session: SessionRow): Promise<void> {
   if (!alive) {
     if (hasNewerActiveSession(session.task_id, session.started_at, session.id)) {
       db.prepare(
-        "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session') WHERE id = ?"
+        "UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session') WHERE id = ?"
       ).run(nowIso(), nowIso(), session.id);
       return;
     }
@@ -743,7 +688,7 @@ async function monitorSession(session: SessionRow): Promise<void> {
 
   const paneStatus = await paneExitStatus(session.tmux_socket_path, session.tmux_session_name);
   if (paneStatus.dead) {
-    const stopStatus = paneStatus.status === 0 ? "stopped" : "crashed";
+    const stopStatus = "crashed";
     db.prepare("UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ? WHERE id = ?").run(
       stopStatus,
       nowIso(),
@@ -838,7 +783,7 @@ export async function startRuntimeHeartbeat(): Promise<void> {
       } catch (error: any) {
         if (hasNewerActiveSession(session.task_id, session.started_at, session.id)) {
           db.prepare(
-            "UPDATE task_sessions SET status = 'stopped', ended_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session'), last_heartbeat_at = ? WHERE id = ?"
+            "UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session'), last_heartbeat_at = ? WHERE id = ?"
           ).run(nowIso(), nowIso(), nowIso(), session.id);
           continue;
         }
