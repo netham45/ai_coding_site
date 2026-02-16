@@ -2,9 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Router } from "express";
 import { z } from "zod";
-import type { Database as DatabaseType } from "better-sqlite3";
-import { appDb } from "../db/index.js";
-import { projectContextForUser, taskContextForUser } from "../db/ownership.js";
+import { db } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
@@ -73,7 +71,7 @@ function planOutputFilePath(workspacePath: string): string {
   return path.join(workspacePath, PLAN_OUTPUT_RELATIVE_PATH);
 }
 
-function readPlanOutputSource(projectDb: DatabaseType, plan: TaskRow): { raw: string; source: "file" | "session_output"; filePath: string } {
+function readPlanOutputSource(plan: TaskRow): { raw: string; source: "file" | "session_output"; filePath: string } {
   const filePath = planOutputFilePath(plan.workspace_path);
   try {
     const fileValue = fs.readFileSync(filePath, "utf8").trim();
@@ -84,27 +82,37 @@ function readPlanOutputSource(projectDb: DatabaseType, plan: TaskRow): { raw: st
     // Fall through to session output.
   }
 
-  const raw = getLatestSessionOutput(projectDb, plan.id);
+  const raw = getLatestSessionOutput(plan.id);
   return { raw, source: "session_output", filePath };
 }
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
-  return projectContextForUser(projectId, userId)?.project;
+  return db
+    .prepare(
+      `SELECT p.*
+       FROM projects p
+       JOIN project_members pm ON pm.project_id = p.id
+       WHERE p.id = ? AND pm.user_id = ?`
+    )
+    .get(projectId, userId) as ProjectRow | undefined;
 }
 
 function planForUser(planTaskId: string, userId: string): TaskRow | undefined {
-  const task = taskContextForUser(planTaskId, userId)?.task;
-  if (!task || task.mode !== "plan") {
-    return undefined;
-  }
-  return task;
+  return db
+    .prepare(
+      `SELECT t.*
+       FROM tasks t
+       JOIN project_members pm ON pm.project_id = t.project_id
+       WHERE t.id = ? AND pm.user_id = ? AND t.mode = 'plan'`
+    )
+    .get(planTaskId, userId) as TaskRow | undefined;
 }
 
-function serializeTask(projectDb: DatabaseType, task: TaskRow) {
-  const dependencyTaskIds = projectDb
+function serializeTask(task: TaskRow) {
+  const dependencyTaskIds = db
     .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as Array<{ dependency_task_id: string }>;
-  const blockedByTaskIds = projectDb
+  const blockedByTaskIds = db
     .prepare(
       `SELECT td.dependency_task_id
        FROM task_dependencies td
@@ -159,24 +167,21 @@ function resolveAiCommand(inputAiCommand: string | undefined, userId: string): s
   if (inputAiCommand) {
     return inputAiCommand;
   }
-  const settings = appDb
+  const settings = db
     .prepare("SELECT default_ai_command FROM user_settings WHERE user_id = ?")
     .get(userId) as { default_ai_command: string } | undefined;
   return settings?.default_ai_command || "codex --yolo {prompt}";
 }
 
-function nextRevisionNumber(projectDb: DatabaseType, planTaskId: string): number {
-  const row = projectDb
+function nextRevisionNumber(planTaskId: string): number {
+  const row = db
     .prepare("SELECT COALESCE(MAX(revision_number), 0) AS max_number FROM plan_revisions WHERE plan_task_id = ?")
     .get(planTaskId) as { max_number: number };
   return Number(row.max_number) + 1;
 }
 
-function getLatestSessionOutput(projectDb: DatabaseType | undefined, taskId: string): string {
-  if (!projectDb) {
-    return "";
-  }
-  const row = projectDb
+function getLatestSessionOutput(taskId: string): string {
+  const row = db
     .prepare("SELECT last_output FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as { last_output: string } | undefined;
   return (row?.last_output ?? "").trim();
@@ -191,12 +196,11 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
     return;
   }
 
-  const projectContext = projectContextForUser(req.params.projectId, req.user.id);
-  if (!projectContext) {
+  const project = projectForUser(req.params.projectId, req.user.id);
+  if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;
   }
-  const { project, db: projectDb } = projectContext;
 
   if (project.clone_status !== "ready") {
     res.status(409).json({ error: "Project base repository is not ready" });
@@ -223,8 +227,8 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
     return;
   }
 
-  projectDb.transaction(() => {
-    projectDb.prepare(
+  db.transaction(() => {
+    db.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
         auto_merge,
@@ -234,7 +238,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
       ) VALUES (?, ?, ?, ?, '', ?, ?, 0, 'plan', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(id, project.id, input.title, plannerPrompt, effectivePrompt, aiCommand, workspacePath, baseCommitSha, req.user.id, now, now);
 
-    projectDb.prepare(
+    db.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(makeId(), id, "null", "queued", "plan_created", req.user.id, now);
@@ -252,29 +256,28 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
     }
   });
 
-  const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
+  const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
   kickTaskQueueProcessing();
-  res.status(201).json({ plan: serializeTask(projectDb, task) });
+  res.status(201).json({ plan: serializeTask(task) });
 });
 
 plansRouter.get("/plans/:planId", (req, res) => {
-  const planContext = taskContextForUser(req.params.planId, req.user.id);
-  if (!planContext || planContext.task.mode !== "plan") {
+  const plan = planForUser(req.params.planId, req.user.id);
+  if (!plan) {
     res.status(404).json({ error: "Plan not found" });
     return;
   }
-  const { task: plan, db: projectDb } = planContext;
 
-  const transitions = projectDb
+  const transitions = db
     .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskTransitionRow[];
 
-  const revisions = projectDb
+  const revisions = db
     .prepare("SELECT * FROM plan_revisions WHERE plan_task_id = ? ORDER BY revision_number DESC")
     .all(plan.id) as PlanRevisionRow[];
 
   const revisionItems = revisions.length
-    ? (projectDb
+    ? (db
         .prepare(
           `SELECT *
            FROM plan_revision_items
@@ -285,7 +288,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
     : [];
 
   const dependencies = revisionItems.length
-    ? (projectDb
+    ? (db
         .prepare(
           `SELECT d.*
            FROM plan_revision_item_dependencies d
@@ -321,12 +324,12 @@ plansRouter.get("/plans/:planId", (req, res) => {
     });
   }
 
-  const approvedTasks = projectDb
+  const approvedTasks = db
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
 
   res.json({
-    plan: serializeTask(projectDb, plan),
+    plan: serializeTask(plan),
     transitions: transitions.map(serializeTransition),
     revisions: revisions.map((revision) => ({
       id: revision.id,
@@ -341,26 +344,25 @@ plansRouter.get("/plans/:planId", (req, res) => {
       approvedAt: revision.approved_at,
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
-    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task))
+    approvedTasks: approvedTasks.map(serializeTask)
   });
 });
 
 plansRouter.post("/plans/:planId/extract", (req, res) => {
-  const planContext = taskContextForUser(req.params.planId, req.user.id);
-  if (!planContext || planContext.task.mode !== "plan") {
+  const plan = planForUser(req.params.planId, req.user.id);
+  if (!plan) {
     res.status(404).json({ error: "Plan not found" });
     return;
   }
-  const { task: plan, db: projectDb } = planContext;
 
-  const source = readPlanOutputSource(projectDb, plan);
+  const source = readPlanOutputSource(plan);
   if (!source.raw) {
     res.status(409).json({ error: "No plan output available. Generate plan YAML first." });
     return;
   }
 
   const revisionId = makeId();
-  const revisionNumber = nextRevisionNumber(projectDb, plan.id);
+  const revisionNumber = nextRevisionNumber(plan.id);
   const createdAt = nowIso();
 
   try {
@@ -368,10 +370,10 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
     fs.mkdirSync(path.dirname(source.filePath), { recursive: true });
     fs.writeFileSync(source.filePath, `${parsed.yamlText.trim()}\n`, "utf8");
 
-    projectDb.transaction(() => {
-      projectDb.prepare("UPDATE plan_revisions SET status = 'superseded' WHERE plan_task_id = ? AND status = 'proposed'").run(plan.id);
+    db.transaction(() => {
+      db.prepare("UPDATE plan_revisions SET status = 'superseded' WHERE plan_task_id = ? AND status = 'proposed'").run(plan.id);
 
-      projectDb.prepare(
+      db.prepare(
         `INSERT INTO plan_revisions (
           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
          ) VALUES (?, ?, ?, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
@@ -380,13 +382,13 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
       for (let i = 0; i < parsed.tasks.length; i += 1) {
         const task = parsed.tasks[i];
         const itemId = makeId();
-        projectDb.prepare(
+        db.prepare(
           `INSERT INTO plan_revision_items (id, revision_id, item_key, title, prompt, ordinal, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).run(itemId, revisionId, task.itemKey, task.title, task.prompt, i + 1, createdAt);
 
         for (const dep of task.dependsOnItemKeys) {
-          projectDb.prepare(
+          db.prepare(
             `INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key)
              VALUES (?, ?)`
           ).run(itemId, dep);
@@ -404,7 +406,7 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
     res.json({ ok: true, revisionId, revisionNumber, tasksExtracted: parsed.tasks.length, source: source.source, planFile: source.filePath });
   } catch (error: any) {
     const parseError = String(error?.message ?? "Failed to parse plan output");
-    projectDb.prepare(
+    db.prepare(
       `INSERT INTO plan_revisions (
         id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
        ) VALUES (?, ?, ?, 'parse_failed', NULL, ?, ?, ?, ?, NULL)`
@@ -421,16 +423,15 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
     return;
   }
 
-  const planContext = taskContextForUser(req.params.planId, req.user.id);
-  if (!planContext || planContext.task.mode !== "plan") {
+  const plan = planForUser(req.params.planId, req.user.id);
+  if (!plan) {
     res.status(404).json({ error: "Plan not found" });
     return;
   }
-  const { task: plan, db: projectDb } = planContext;
 
   const feedback = parsed.data.feedback.trim();
   const revisionId = makeId();
-  const revisionNumber = nextRevisionNumber(projectDb, plan.id);
+  const revisionNumber = nextRevisionNumber(plan.id);
   const createdAt = nowIso();
   const guidance = [
     "Regenerate the plan based on this feedback and restate the complete plan.",
@@ -449,7 +450,7 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
     return;
   }
 
-  projectDb.prepare(
+  db.prepare(
     `INSERT INTO plan_revisions (
       id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
      ) VALUES (?, ?, ?, 'feedback_requested', ?, '', NULL, ?, ?, NULL)`
@@ -472,14 +473,13 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     return;
   }
 
-  const planContext = taskContextForUser(req.params.planId, req.user.id);
-  if (!planContext || planContext.task.mode !== "plan") {
+  const plan = planForUser(req.params.planId, req.user.id);
+  if (!plan) {
     res.status(404).json({ error: "Plan not found" });
     return;
   }
-  const { task: plan, db: projectDb } = planContext;
 
-  const latestRevision = projectDb
+  const latestRevision = db
     .prepare(
       `SELECT *
        FROM plan_revisions
@@ -494,17 +494,17 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     return;
   }
 
-  const alreadyApproved = projectDb
+  const alreadyApproved = db
     .prepare(
       "SELECT id FROM tasks WHERE source_plan_revision_id = ? AND parent_plan_task_id = ? LIMIT 1"
     )
     .get(latestRevision.id, plan.id) as { id: string } | undefined;
 
   if (alreadyApproved) {
-    const approvedTasks = projectDb
+    const approvedTasks = db
       .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
       .all(plan.id) as TaskRow[];
-    res.json({ approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) });
+    res.json({ approvedTasks: approvedTasks.map(serializeTask) });
     return;
   }
 
@@ -514,7 +514,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     return;
   }
 
-  const items = projectDb
+  const items = db
     .prepare("SELECT * FROM plan_revision_items WHERE revision_id = ? ORDER BY ordinal ASC")
     .all(latestRevision.id) as PlanRevisionItemRow[];
 
@@ -523,7 +523,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     return;
   }
 
-  const depRows = projectDb
+  const depRows = db
     .prepare(
       `SELECT d.*
        FROM plan_revision_item_dependencies d
@@ -590,8 +590,8 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
 
   const createdAt = nowIso();
 
-  projectDb.transaction(() => {
-    projectDb.prepare("UPDATE plan_revisions SET status = 'approved', approved_at = ? WHERE id = ?").run(createdAt, latestRevision.id);
+  db.transaction(() => {
+    db.prepare("UPDATE plan_revisions SET status = 'approved', approved_at = ? WHERE id = ?").run(createdAt, latestRevision.id);
 
     for (const row of taskRows) {
       const edit = taskEditsByItemKey.get(row.item.item_key.toLowerCase());
@@ -600,7 +600,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       const prompt = edit?.prompt?.trim() ?? "";
       const taskPrompt = [description, prompt].filter(Boolean).join("\n\n");
 
-      projectDb.prepare(
+      db.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
           auto_merge,
@@ -626,7 +626,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
         createdAt
       );
 
-      projectDb.prepare(
+      db.prepare(
         `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(
@@ -640,7 +640,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       );
 
       for (const dependencyTaskId of row.dependencyTaskIds) {
-        projectDb.prepare(
+        db.prepare(
           "INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)"
         ).run(row.taskId, dependencyTaskId, createdAt);
       }
@@ -659,9 +659,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
 
   kickTaskQueueProcessing();
 
-  const approvedTasks = projectDb
+  const approvedTasks = db
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
 
-  res.json({ approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) });
+  res.json({ approvedTasks: approvedTasks.map(serializeTask) });
 });

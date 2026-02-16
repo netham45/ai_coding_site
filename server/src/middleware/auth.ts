@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import { appDb, ensureLocalUser } from "../db/index.js";
+import { db, ensureLocalUser } from "../db/index.js";
 import type { UserRow } from "../types.js";
 
 declare global {
@@ -15,7 +15,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   const fallbackId = ensureLocalUser();
   const userId = headerUserId || fallbackId;
 
-  const user = appDb.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRow | undefined;
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRow | undefined;
   if (!user) {
     res.status(401).json({ error: "Unknown user" });
     return;

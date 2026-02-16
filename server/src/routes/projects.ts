@@ -4,14 +4,8 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { z } from "zod";
-import {
-  appDb,
-  hydrateProjectWithConfig,
-  initializeProjectDb,
-  ProjectDbError,
-  updateProjectConfig
-} from "../db/index.js";
-import type { AppProjectRow, ProjectRow } from "../types.js";
+import { db } from "../db/index.js";
+import type { ProjectRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nextSlug, slugify } from "../utils/slug.js";
 import { nowIso } from "../utils/time.js";
@@ -62,50 +56,15 @@ function serializeProject(project: ProjectRow) {
   };
 }
 
-function serializeProjectWithFallback(project: AppProjectRow): ReturnType<typeof serializeProject> {
-  try {
-    return serializeProject(hydrateProjectWithConfig(project));
-  } catch {
-    // Global listings remain available even if project DB is unavailable.
-    return serializeProject({
-      ...project,
-      project_prompt: "",
-      project_rules: "",
-      coding_standard: "",
-      coding_standard_other: "",
-      project_other: ""
-    });
-  }
-}
-
-function sendProjectDbError(res: any, error: unknown): void {
-  if (!(error instanceof ProjectDbError)) {
-    throw error;
-  }
-  if (error.code === "PROJECT_DB_UNAVAILABLE") {
-    res.status(503).json({ error: error.code, message: error.message });
-    return;
-  }
-  res.status(500).json({ error: error.code, message: error.message });
-}
-
-function appProjectForUser(projectId: string, userId: string): AppProjectRow | undefined {
-  return appDb
+function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
+  return db
     .prepare(
       `SELECT p.*
        FROM projects p
        JOIN project_members pm ON pm.project_id = p.id
        WHERE p.id = ? AND pm.user_id = ?`
     )
-    .get(projectId, userId) as AppProjectRow | undefined;
-}
-
-function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
-  const project = appProjectForUser(projectId, userId);
-  if (!project) {
-    return undefined;
-  }
-  return hydrateProjectWithConfig(project);
+    .get(projectId, userId) as ProjectRow | undefined;
 }
 
 export const projectsRouter = Router();
@@ -199,7 +158,7 @@ function proxyProjectIdeHttp(req: any, res: any, params: { projectId: string; ta
 }
 
 projectsRouter.get("/", (req, res) => {
-  const rows = appDb
+  const rows = db
     .prepare(
       `SELECT p.*
        FROM projects p
@@ -207,8 +166,8 @@ projectsRouter.get("/", (req, res) => {
        WHERE pm.user_id = ?
        ORDER BY p.created_at DESC`
     )
-    .all(req.user.id) as AppProjectRow[];
-  res.json({ projects: rows.map(serializeProjectWithFallback) });
+    .all(req.user.id) as ProjectRow[];
+  res.json({ projects: rows.map(serializeProject) });
 });
 
 projectsRouter.post("/", async (req, res) => {
@@ -228,43 +187,41 @@ projectsRouter.post("/", async (req, res) => {
   const id = makeId();
   const base = slugify(input.name);
   const slug = nextSlug(base, (candidate) => {
-    const found = appDb.prepare("SELECT id FROM projects WHERE slug = ?").get(candidate);
+    const found = db.prepare("SELECT id FROM projects WHERE slug = ?").get(candidate);
     return Boolean(found);
   });
 
   const basePath = path.join(reposRoot, slug, "base");
   fs.mkdirSync(path.dirname(basePath), { recursive: true });
 
-  appDb
-    .prepare(
-      `INSERT INTO projects (
-        id, name, slug, repo_url, default_branch, base_path, clone_status, clone_error, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)`
-    )
-    .run(id, input.name, slug, input.repoUrl, input.defaultBranch, basePath, req.user.id, now, now);
+  db.prepare(
+    `INSERT INTO projects (
+      id, name, slug, repo_url, default_branch, base_path,
+      project_prompt, project_rules, coding_standard, coding_standard_other, project_other,
+      clone_status, clone_error, created_by_user_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)`
+  ).run(
+    id,
+    input.name,
+    slug,
+    input.repoUrl,
+    input.defaultBranch,
+    basePath,
+    input.projectPrompt,
+    input.projectRules,
+    input.codingStandard,
+    input.codingStandardOther,
+    input.projectOther,
+    req.user.id,
+    now,
+    now
+  );
 
-  appDb.prepare("INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").run(
+  db.prepare("INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").run(
     id,
     req.user.id,
     now
   );
-
-  try {
-    initializeProjectDb({
-      projectId: id,
-      basePath,
-      config: {
-        projectPrompt: input.projectPrompt,
-        projectRules: input.projectRules,
-        codingStandard: input.codingStandard,
-        codingStandardOther: input.codingStandardOther,
-        projectOther: input.projectOther
-      }
-    });
-  } catch (error) {
-    sendProjectDbError(res, error);
-    return;
-  }
 
   recordEvent({
     projectId: id,
@@ -276,7 +233,7 @@ projectsRouter.post("/", async (req, res) => {
     }
   });
 
-  appDb.prepare("UPDATE projects SET clone_status = 'cloning', updated_at = ? WHERE id = ?").run(nowIso(), id);
+  db.prepare("UPDATE projects SET clone_status = 'cloning', updated_at = ? WHERE id = ?").run(nowIso(), id);
 
   try {
     await cloneRepo({
@@ -285,7 +242,7 @@ projectsRouter.post("/", async (req, res) => {
       branch: input.defaultBranch
     });
 
-    appDb.prepare("UPDATE projects SET clone_status = 'ready', clone_error = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id);
+    db.prepare("UPDATE projects SET clone_status = 'ready', clone_error = NULL, updated_at = ? WHERE id = ?").run(nowIso(), id);
     recordEvent({
       projectId: id,
       eventType: "project.clone.succeeded",
@@ -293,7 +250,7 @@ projectsRouter.post("/", async (req, res) => {
     });
   } catch (error: any) {
     const cloneError = String(error?.message ?? "Clone failed");
-    appDb.prepare("UPDATE projects SET clone_status = 'failed', clone_error = ?, updated_at = ? WHERE id = ?").run(
+    db.prepare("UPDATE projects SET clone_status = 'failed', clone_error = ?, updated_at = ? WHERE id = ?").run(
       cloneError,
       nowIso(),
       id
@@ -305,25 +262,21 @@ projectsRouter.post("/", async (req, res) => {
     });
   }
 
-  const project = appDb.prepare("SELECT * FROM projects WHERE id = ?").get(id) as AppProjectRow;
-  res.status(201).json({ project: serializeProject(hydrateProjectWithConfig(project)) });
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow;
+  res.status(201).json({ project: serializeProject(project) });
 });
 
 projectsRouter.get("/:projectId", (req, res) => {
-  try {
-    const project = projectForUser(req.params.projectId, req.user.id);
-    if (!project) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    res.json({ project: serializeProject(project) });
-  } catch (error) {
-    sendProjectDbError(res, error);
+  const project = projectForUser(req.params.projectId, req.user.id);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
   }
+  res.json({ project: serializeProject(project) });
 });
 
 projectsRouter.get("/:projectId/files", async (req, res) => {
-  const project = appProjectForUser(req.params.projectId, req.user.id);
+  const project = projectForUser(req.params.projectId, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;
@@ -357,7 +310,7 @@ projectsRouter.patch("/:projectId", (req, res) => {
     return;
   }
 
-  const existing = appProjectForUser(req.params.projectId, req.user.id);
+  const existing = projectForUser(req.params.projectId, req.user.id);
   if (!existing) {
     res.status(404).json({ error: "Project not found" });
     return;
@@ -365,24 +318,26 @@ projectsRouter.patch("/:projectId", (req, res) => {
 
   const updates = parsed.data;
   const nextName = updates.name ?? existing.name;
+  const nextPrompt = updates.projectPrompt ?? existing.project_prompt;
+  const nextRules = updates.projectRules ?? existing.project_rules;
+  const nextCodingStandard = updates.codingStandard ?? existing.coding_standard;
+  const nextCodingStandardOther = updates.codingStandardOther ?? existing.coding_standard_other;
+  const nextOther = updates.projectOther ?? existing.project_other;
 
-  appDb.prepare("UPDATE projects SET name = ?, updated_at = ? WHERE id = ?").run(nextName, nowIso(), existing.id);
-
-  try {
-    updateProjectConfig(
-      { projectId: existing.id, basePath: existing.base_path },
-      {
-        projectPrompt: updates.projectPrompt,
-        projectRules: updates.projectRules,
-        codingStandard: updates.codingStandard,
-        codingStandardOther: updates.codingStandardOther,
-        projectOther: updates.projectOther
-      }
-    );
-  } catch (error) {
-    sendProjectDbError(res, error);
-    return;
-  }
+  db.prepare(
+    `UPDATE projects
+     SET name = ?, project_prompt = ?, project_rules = ?, coding_standard = ?, coding_standard_other = ?, project_other = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(
+    nextName,
+    nextPrompt,
+    nextRules,
+    nextCodingStandard,
+    nextCodingStandardOther,
+    nextOther,
+    nowIso(),
+    existing.id
+  );
 
   recordEvent({
     projectId: existing.id,
@@ -390,12 +345,12 @@ projectsRouter.patch("/:projectId", (req, res) => {
     payload: updates
   });
 
-  const project = appDb.prepare("SELECT * FROM projects WHERE id = ?").get(existing.id) as AppProjectRow;
-  res.json({ project: serializeProject(hydrateProjectWithConfig(project)) });
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(existing.id) as ProjectRow;
+  res.json({ project: serializeProject(project) });
 });
 
 projectsRouter.post("/:projectId/ide/start", async (req, res) => {
-  const project = appProjectForUser(req.params.projectId, req.user.id);
+  const project = projectForUser(req.params.projectId, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;
@@ -423,7 +378,7 @@ projectsRouter.post("/:projectId/ide/start", async (req, res) => {
 });
 
 projectsRouter.post("/:projectId/ide/stop", (req, res) => {
-  const project = appProjectForUser(req.params.projectId, req.user.id);
+  const project = projectForUser(req.params.projectId, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;
@@ -433,7 +388,7 @@ projectsRouter.post("/:projectId/ide/stop", (req, res) => {
 });
 
 projectsRouter.get("/:projectId/ide/view", (req, res) => {
-  const project = appProjectForUser(req.params.projectId, req.user.id);
+  const project = projectForUser(req.params.projectId, req.user.id);
   if (!project) {
     res.status(404).send("Project not found");
     return;
@@ -461,7 +416,7 @@ projectsRouter.get("/:projectId/ide/view", (req, res) => {
 });
 
 projectsRouter.all("/:projectId/ide/proxy*", (req, res) => {
-  const project = appProjectForUser(req.params.projectId, req.user.id);
+  const project = projectForUser(req.params.projectId, req.user.id);
   if (!project) {
     res.status(404).json({ error: "Project not found" });
     return;

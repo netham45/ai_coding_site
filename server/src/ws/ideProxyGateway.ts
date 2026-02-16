@@ -1,28 +1,43 @@
 import net from "node:net";
 import type { Server as HttpServer, IncomingMessage } from "node:http";
 import { URL } from "node:url";
-import { appDb } from "../db/index.js";
-import { appProjectForUser, taskContextForUser } from "../db/ownership.js";
+import { db } from "../db/index.js";
 import { ideSessionTarget } from "../services/ide.js";
 
 function resolveUserIdFromUpgrade(req: IncomingMessage): string | null {
   const headerUserId = typeof req.headers["x-user-id"] === "string" ? req.headers["x-user-id"].trim() : "";
   if (headerUserId) {
-    const exists = appDb.prepare("SELECT id FROM users WHERE id = ?").get(headerUserId) as { id: string } | undefined;
+    const exists = db.prepare("SELECT id FROM users WHERE id = ?").get(headerUserId) as { id: string } | undefined;
     if (exists?.id) {
       return exists.id;
     }
   }
-  const firstUser = appDb.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
+  const firstUser = db.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
   return firstUser?.id ?? null;
 }
 
 function canAccessTask(taskId: string, userId: string): boolean {
-  return Boolean(taskContextForUser(taskId, userId));
+  const row = db
+    .prepare(
+      `SELECT t.id
+       FROM tasks t
+       JOIN project_members pm ON pm.project_id = t.project_id
+       WHERE t.id = ? AND pm.user_id = ?`
+    )
+    .get(taskId, userId) as { id: string } | undefined;
+  return Boolean(row?.id);
 }
 
 function canAccessProject(projectId: string, userId: string): boolean {
-  return Boolean(appProjectForUser(projectId, userId));
+  const row = db
+    .prepare(
+      `SELECT p.id
+       FROM projects p
+       JOIN project_members pm ON pm.project_id = p.id
+       WHERE p.id = ? AND pm.user_id = ?`
+    )
+    .get(projectId, userId) as { id: string } | undefined;
+  return Boolean(row?.id);
 }
 
 function buildUpgradeRequest(req: IncomingMessage, upstreamPath: string, targetPort: number): string {

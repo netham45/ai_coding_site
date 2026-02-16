@@ -1,7 +1,7 @@
 import type { Server as HttpServer } from "node:http";
 import { URL } from "node:url";
 import { WebSocketServer, type WebSocket } from "ws";
-import { taskContextById, taskContextForUser } from "../db/ownership.js";
+import { db } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
 import { capturePane, getPaneCursorPosition, hasSession, sendRawInput } from "../services/tmux.js";
 import { verifyTerminalToken } from "../services/terminalToken.js";
@@ -15,35 +15,31 @@ type WsPayload =
   | { type: "ack" };
 
 function latestSession(taskId: string): TaskSessionRow | undefined {
-  const context = taskContextById(taskId);
-  if (!context) {
-    return undefined;
-  }
-  return context.db.prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1").get(taskId) as
-    | TaskSessionRow
-    | undefined;
+  return db
+    .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
+    .get(taskId) as TaskSessionRow | undefined;
 }
 
 function taskStatus(taskId: string): string | undefined {
-  const context = taskContextById(taskId);
-  if (!context) {
-    return undefined;
-  }
-  const row = context.db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
+  const row = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
   return row?.status;
 }
 
-function sessionStatus(taskId: string, sessionId: string): string | undefined {
-  const context = taskContextById(taskId);
-  if (!context) {
-    return undefined;
-  }
-  const row = context.db.prepare("SELECT status FROM task_sessions WHERE id = ?").get(sessionId) as { status: string } | undefined;
+function sessionStatus(sessionId: string): string | undefined {
+  const row = db.prepare("SELECT status FROM task_sessions WHERE id = ?").get(sessionId) as { status: string } | undefined;
   return row?.status;
 }
 
 function canAccessTask(taskId: string, userId: string): boolean {
-  return Boolean(taskContextForUser(taskId, userId));
+  const row = db
+    .prepare(
+      `SELECT t.id
+       FROM tasks t
+       JOIN project_members pm ON pm.project_id = t.project_id
+       WHERE t.id = ? AND pm.user_id = ?`
+    )
+    .get(taskId, userId) as { id: string } | undefined;
+  return Boolean(row?.id);
 }
 
 function sendJson(ws: WebSocket, payload: WsPayload): void {
@@ -103,7 +99,7 @@ export function createTerminalGateway(server: HttpServer): void {
 
     const publishStatus = (force = false) => {
       const currentTaskStatus = taskStatus(meta.taskId) ?? "unknown";
-      const currentSessionStatus = sessionStatus(meta.taskId, session.id) ?? "unknown";
+      const currentSessionStatus = sessionStatus(session.id) ?? "unknown";
       if (!force && currentTaskStatus === lastTaskStatus && currentSessionStatus === lastSessionStatus) {
         return;
       }
@@ -140,8 +136,7 @@ export function createTerminalGateway(server: HttpServer): void {
 
         lastFrame = frame;
         lastCursor = cursor;
-        const context = taskContextById(meta.taskId);
-        context?.db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
+        db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
           frame,
           new Date().toISOString(),
           session.id
@@ -167,8 +162,7 @@ export function createTerminalGateway(server: HttpServer): void {
         lastFrame = snapshot;
         lastCursor = cursor;
         sendJson(ws, { type: "output", data: snapshot, reset: true, cursorX: cursor.x, cursorY: cursor.y });
-        const context = taskContextById(meta.taskId);
-        context?.db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
+        db.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(
           snapshot,
           new Date().toISOString(),
           session.id

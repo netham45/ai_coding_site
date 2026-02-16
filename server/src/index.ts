@@ -15,7 +15,7 @@ import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { createTerminalGateway } from "./ws/terminalGateway.js";
 import { workspaceRoot } from "./utils/paths.js";
-import { taskContextById } from "./db/ownership.js";
+import { db } from "./db/index.js";
 import { nowIso } from "./utils/time.js";
 
 const app = express();
@@ -69,12 +69,8 @@ startRuntimeHeartbeat().catch((error) => {
 startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {
-  const context = taskContextById(taskId);
-  if (!context) {
-    return;
-  }
   const now = nowIso();
-  context.db.prepare(
+  db.prepare(
     `UPDATE ide_instances
      SET status = 'failed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?
      WHERE task_id = ? AND status IN ('starting','running')`

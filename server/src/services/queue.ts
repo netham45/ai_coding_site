@@ -1,5 +1,4 @@
-import { projectDbForProject } from "../db/index.js";
-import { allAppProjects } from "../db/ownership.js";
+import { db } from "../db/index.js";
 import { startTaskRuntime } from "./runtime.js";
 
 const QUEUE_INTERVAL_MS = 1500;
@@ -12,41 +11,28 @@ type QueuedTaskRow = {
 };
 
 async function processQueuedTasksPass(): Promise<void> {
-  const rows: QueuedTaskRow[] = [];
-  for (const project of allAppProjects()) {
-    if (rows.length >= MAX_TASKS_PER_PASS) {
-      break;
-    }
-    try {
-      const db = projectDbForProject({ projectId: project.id, basePath: project.base_path });
-      const remaining = MAX_TASKS_PER_PASS - rows.length;
-      const projectRows = db
-        .prepare(
-          `SELECT t.id, t.created_by_user_id
-           FROM tasks t
-           WHERE t.status = 'queued'
-             AND NOT EXISTS (
-               SELECT 1
-               FROM task_dependencies td
-               JOIN tasks dep ON dep.id = td.dependency_task_id
-               WHERE td.task_id = t.id
-                 AND dep.status != 'merged'
-             )
-             AND NOT EXISTS (
-               SELECT 1
-               FROM task_sessions ts
-               WHERE ts.task_id = t.id
-                 AND ts.status IN ('starting','running','waiting_input')
-             )
-           ORDER BY t.created_at ASC
-           LIMIT ?`
-        )
-        .all(remaining) as QueuedTaskRow[];
-      rows.push(...projectRows);
-    } catch {
-      // Ignore unavailable/corrupt project DBs for this queue pass.
-    }
-  }
+  const rows = db
+    .prepare(
+      `SELECT t.id, t.created_by_user_id
+       FROM tasks t
+       WHERE t.status = 'queued'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM task_dependencies td
+           JOIN tasks dep ON dep.id = td.dependency_task_id
+           WHERE td.task_id = t.id
+             AND dep.status != 'merged'
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM task_sessions ts
+           WHERE ts.task_id = t.id
+             AND ts.status IN ('starting','running','waiting_input')
+         )
+       ORDER BY t.created_at ASC
+       LIMIT ?`
+    )
+    .all(MAX_TASKS_PER_PASS) as QueuedTaskRow[];
 
   for (const row of rows) {
     if (startingTaskIds.has(row.id)) {
@@ -84,3 +70,4 @@ export function startTaskQueueWorker(): void {
     void runQueuePass();
   }, QUEUE_INTERVAL_MS);
 }
+
