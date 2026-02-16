@@ -408,11 +408,11 @@ export function TaskDetailPage() {
         const count = response.sync.conflictFiles.length;
         toast({
           status: "warning",
-          title: "Pulled from main with conflicts",
+          title: isPlanOwnedExecutionTask ? "Pulled from plan branch with conflicts" : "Pulled from main with conflicts",
           description: count ? `${count} conflict file(s) detected.` : "Conflicts detected."
         });
       } else {
-        toast({ status: "success", title: "Pulled latest main into task workspace" });
+        toast({ status: "success", title: isPlanOwnedExecutionTask ? "Pulled latest plan branch into task workspace" : "Pulled latest main into task workspace" });
       }
     } catch (error: any) {
       toast({ status: "error", title: "Pull from main failed", description: error.message });
@@ -566,6 +566,7 @@ export function TaskDetailPage() {
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
+  const isPlanOwnedExecutionTask = task.mode === "execution" && !!task.parentPlanTaskId;
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -689,6 +690,19 @@ export function TaskDetailPage() {
                       <Button colorScheme="green" size="sm" onClick={approvePlanTasks} isLoading={approvingPlan} isDisabled={!latestProposedRevision}>
                         Approve All Tasks
                       </Button>
+                      <Button
+                        colorScheme="blue"
+                        variant="outline"
+                        size="sm"
+                        onClick={markMergeReady}
+                        isLoading={markingReady}
+                        isDisabled={!["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
+                      >
+                        Mark Merge Ready
+                      </Button>
+                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
+                        Merge Plan To Base
+                      </Button>
                       <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
                         Re-run Plan
                       </Button>
@@ -706,7 +720,7 @@ export function TaskDetailPage() {
                   ) : (
                     <Stack direction={{ base: "column", md: "row" }} spacing={2}>
                       <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
-                        Pull From Main Repo
+                        {isPlanOwnedExecutionTask ? "Pull From Plan Branch" : "Pull From Main Repo"}
                       </Button>
                       <Button
                         colorScheme="blue"
@@ -719,7 +733,7 @@ export function TaskDetailPage() {
                         Mark Merge Ready
                       </Button>
                       <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
-                        Merge Task
+                        {isPlanOwnedExecutionTask ? "Merge Task Into Plan" : "Merge Task"}
                       </Button>
                       <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
                         Re-run Task
@@ -847,10 +861,10 @@ export function TaskDetailPage() {
                   </Code>
                 </Box>
 
-                {task.mode === "execution" && (
+                {(task.mode === "execution" || task.mode === "plan") && (
                   <Box>
                     <Heading size="sm" mb={3}>
-                      Merge Audit
+                      {task.mode === "plan" ? "Plan Merge Audit" : "Merge Audit"}
                     </Heading>
                     <Stack spacing={3} mb={2}>
                       {mergeRecords.map((record) => (

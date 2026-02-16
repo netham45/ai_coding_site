@@ -43,15 +43,24 @@ export async function cloneRepo(params: {
   }
 }
 
-export async function cloneLocalBaseToWorkspace(params: { basePath: string; workspacePath: string }): Promise<void> {
+export async function cloneLocalRepoToWorkspace(params: {
+  sourcePath: string;
+  workspacePath: string;
+  sourceBranch?: string;
+}): Promise<void> {
   await fs.promises.mkdir(path.dirname(params.workspacePath), { recursive: true });
   try {
-    await execFileAsync("git", ["clone", params.basePath, params.workspacePath], { timeout: 120000 });
+    const cloneArgs = ["clone"];
+    if (params.sourceBranch) {
+      cloneArgs.push("--branch", params.sourceBranch);
+    }
+    cloneArgs.push(params.sourcePath, params.workspacePath);
+    await execFileAsync("git", cloneArgs, { timeout: 120000 });
     // Ensure task workspace origin fetch + push both point to the local base clone.
-    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "origin", params.basePath], {
+    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "origin", params.sourcePath], {
       timeout: 15000
     });
-    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "--push", "origin", params.basePath], {
+    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "--push", "origin", params.sourcePath], {
       timeout: 15000
     });
   } catch (error: any) {
@@ -59,6 +68,14 @@ export async function cloneLocalBaseToWorkspace(params: { basePath: string; work
     const message = stderr.trim() || error?.message || "git local clone failed";
     throw new Error(message);
   }
+}
+
+export async function cloneLocalBaseToWorkspace(params: { basePath: string; workspacePath: string; baseBranch?: string }): Promise<void> {
+  await cloneLocalRepoToWorkspace({
+    sourcePath: params.basePath,
+    workspacePath: params.workspacePath,
+    sourceBranch: params.baseBranch
+  });
 }
 
 export async function listRepoFiles(params: { repoPath: string; query?: string; limit?: number }): Promise<string[]> {
@@ -269,9 +286,9 @@ export type PullMainResult = {
   headCommitSha: string;
 };
 
-export async function pullMainIntoTaskWorkspace(params: { workspacePath: string; defaultBranch: string }): Promise<PullMainResult> {
+export async function pullRemoteRefIntoTaskWorkspace(params: { workspacePath: string; remoteRef: string }): Promise<PullMainResult> {
   try {
-    await execFileAsync("git", ["-C", params.workspacePath, "fetch", "origin", params.defaultBranch], {
+    await execFileAsync("git", ["-C", params.workspacePath, "fetch", "origin", params.remoteRef], {
       timeout: 30000,
       env: nonInteractiveGitEnv()
     });
@@ -283,7 +300,7 @@ export async function pullMainIntoTaskWorkspace(params: { workspacePath: string;
 
   let conflicted = false;
   try {
-    await execFileAsync("git", ["-C", params.workspacePath, "merge", "--no-edit", `origin/${params.defaultBranch}`], {
+    await execFileAsync("git", ["-C", params.workspacePath, "merge", "--no-edit", `origin/${params.remoteRef}`], {
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
@@ -342,29 +359,43 @@ export type MergeTaskResult =
       conflictFiles: string[];
     };
 
-export async function mergeTaskWorkspaceIntoBase(params: {
-  basePath: string;
+export async function mergeTaskWorkspaceIntoTarget(params: {
+  targetPath: string;
+  targetBranch: string;
+  syncTargetBranchFromOrigin?: boolean;
   workspacePath: string;
-  defaultBranch: string;
   taskId: string;
 }): Promise<MergeTaskResult> {
-  try {
-    await execFileAsync("git", ["-C", params.basePath, "fetch", "origin", params.defaultBranch], {
-      timeout: 45000,
-      env: nonInteractiveGitEnv()
-    });
-    await execFileAsync("git", ["-C", params.basePath, "checkout", params.defaultBranch], {
-      timeout: 15000,
-      env: nonInteractiveGitEnv()
-    });
-    await execFileAsync("git", ["-C", params.basePath, "merge", "--ff-only", `origin/${params.defaultBranch}`], {
-      timeout: 30000,
-      env: nonInteractiveGitEnv()
-    });
-  } catch (error: any) {
-    const stderr = error?.stderr ? String(error.stderr) : "";
-    const message = stderr.trim() || error?.message || "failed to sync base branch";
-    throw new Error(message);
+  if (params.syncTargetBranchFromOrigin) {
+    try {
+      await execFileAsync("git", ["-C", params.targetPath, "fetch", "origin", params.targetBranch], {
+        timeout: 45000,
+        env: nonInteractiveGitEnv()
+      });
+      await execFileAsync("git", ["-C", params.targetPath, "checkout", params.targetBranch], {
+        timeout: 15000,
+        env: nonInteractiveGitEnv()
+      });
+      await execFileAsync("git", ["-C", params.targetPath, "merge", "--ff-only", `origin/${params.targetBranch}`], {
+        timeout: 30000,
+        env: nonInteractiveGitEnv()
+      });
+    } catch (error: any) {
+      const stderr = error?.stderr ? String(error.stderr) : "";
+      const message = stderr.trim() || error?.message || "failed to sync target branch";
+      throw new Error(message);
+    }
+  } else {
+    try {
+      await execFileAsync("git", ["-C", params.targetPath, "checkout", params.targetBranch], {
+        timeout: 15000,
+        env: nonInteractiveGitEnv()
+      });
+    } catch (error: any) {
+      const stderr = error?.stderr ? String(error.stderr) : "";
+      const message = stderr.trim() || error?.message || "failed to checkout target branch";
+      throw new Error(message);
+    }
   }
 
   try {
@@ -373,7 +404,7 @@ export async function mergeTaskWorkspaceIntoBase(params: {
       timeout: 10000,
       env: nonInteractiveGitEnv()
     });
-    await execFileAsync("git", ["-C", params.basePath, "fetch", params.workspacePath, `refs/heads/${sourceBranch}`], {
+    await execFileAsync("git", ["-C", params.targetPath, "fetch", params.workspacePath, `refs/heads/${sourceBranch}`], {
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
@@ -384,12 +415,12 @@ export async function mergeTaskWorkspaceIntoBase(params: {
   }
 
   try {
-    await execFileAsync("git", ["-C", params.basePath, "merge", "--no-ff", "--no-edit", "FETCH_HEAD"], {
+    await execFileAsync("git", ["-C", params.targetPath, "merge", "--no-ff", "--no-edit", "FETCH_HEAD"], {
       timeout: 60000,
       env: nonInteractiveGitEnv()
     });
   } catch (error: any) {
-    const { stdout } = await execFileAsync("git", ["-C", params.basePath, "diff", "--name-only", "--diff-filter=U"], {
+    const { stdout } = await execFileAsync("git", ["-C", params.targetPath, "diff", "--name-only", "--diff-filter=U"], {
       timeout: 10000,
       env: nonInteractiveGitEnv()
     });
@@ -399,7 +430,7 @@ export async function mergeTaskWorkspaceIntoBase(params: {
       .filter(Boolean);
     if (conflictFiles.length > 0) {
       try {
-        await execFileAsync("git", ["-C", params.basePath, "merge", "--abort"], {
+        await execFileAsync("git", ["-C", params.targetPath, "merge", "--abort"], {
           timeout: 10000,
           env: nonInteractiveGitEnv()
         });
@@ -413,15 +444,37 @@ export async function mergeTaskWorkspaceIntoBase(params: {
       };
     }
     const stderr = error?.stderr ? String(error.stderr) : "";
-    const message = stderr.trim() || error?.message || "merge into base failed";
+    const message = stderr.trim() || error?.message || "merge into target failed";
     throw new Error(message);
   }
 
-  const mergeCommitSha = await getHeadCommitSha(params.basePath);
+  const mergeCommitSha = await getHeadCommitSha(params.targetPath);
 
   return {
     conflicted: false,
     mergeCommitSha,
     conflictFiles: []
   };
+}
+
+export async function mergeTaskWorkspaceIntoBase(params: {
+  basePath: string;
+  workspacePath: string;
+  defaultBranch: string;
+  taskId: string;
+}): Promise<MergeTaskResult> {
+  return mergeTaskWorkspaceIntoTarget({
+    targetPath: params.basePath,
+    targetBranch: params.defaultBranch,
+    syncTargetBranchFromOrigin: true,
+    workspacePath: params.workspacePath,
+    taskId: params.taskId
+  });
+}
+
+export async function pullMainIntoTaskWorkspace(params: { workspacePath: string; defaultBranch: string }): Promise<PullMainResult> {
+  return pullRemoteRefIntoTaskWorkspace({
+    workspacePath: params.workspacePath,
+    remoteRef: params.defaultBranch
+  });
 }

@@ -7,7 +7,7 @@ import { recordEvent } from "../services/events.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
-import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha } from "../services/git.js";
+import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInput } from "../services/runtime.js";
 import type {
   PlanRevisionItemDependencyRow,
@@ -201,7 +201,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   let baseCommitSha: string;
   try {
     baseCommitSha = await getHeadCommitSha(project.base_path);
-    await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath });
+    await cloneLocalBaseToWorkspace({ basePath: project.base_path, baseBranch: project.default_branch, workspacePath });
     await createTaskBranch(workspacePath, id);
     await fs.promises.mkdir(path.join(workspacePath, ".ai-plan"), { recursive: true });
   } catch (error: any) {
@@ -543,11 +543,16 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
 
   let baseCommitSha: string;
   try {
-    baseCommitSha = await getHeadCommitSha(project.base_path);
+    const planBranch = taskBranchName(plan.id);
+    baseCommitSha = await getHeadCommitSha(plan.workspace_path);
 
     for (const row of taskRows) {
       if (row.dependencyTaskIds.length > 0) continue;
-      await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath: row.workspacePath });
+      await cloneLocalBaseToWorkspace({
+        basePath: plan.workspace_path,
+        baseBranch: planBranch,
+        workspacePath: row.workspacePath
+      });
       await createTaskBranch(row.workspacePath, row.taskId);
     }
   } catch (error: any) {
