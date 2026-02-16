@@ -115,8 +115,9 @@ export function TaskDetailPage() {
     setIde(response.ide);
     setGitStatus(response.gitStatus);
     setMergeRecords(response.mergeRecords ?? []);
-    if (response.task.mode === "plan") {
-      await loadPlanDetails(response.task.id);
+    const planContextId = response.task.mode === "plan" ? response.task.id : response.task.parentPlanTaskId;
+    if (planContextId) {
+      await loadPlanDetails(planContextId);
     } else {
       setPlanRevisions([]);
       setApprovedPlanTasks([]);
@@ -563,6 +564,10 @@ export function TaskDetailPage() {
   if (!task) {
     return <Text>Loading task...</Text>;
   }
+  const inPlanContext = task.mode === "plan" || !!task.parentPlanTaskId;
+  const sidebarTasks = inPlanContext ? approvedPlanTasks : projectTasks;
+  const backLinkTo = task.parentPlanTaskId ? `/plans/${task.parentPlanTaskId}?tab=ide` : `/projects/${task.projectId}`;
+  const backLinkLabel = task.parentPlanTaskId ? "Back to plan" : "Back to project";
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
@@ -592,7 +597,7 @@ export function TaskDetailPage() {
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
       {!expandedPane && (
         <TaskSidebar
-          tasks={projectTasks}
+          tasks={sidebarTasks}
           selectedTaskId={task.id}
           isCollapsed={isTaskSidebarCollapsed}
           onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)}
@@ -601,8 +606,8 @@ export function TaskDetailPage() {
 
       <Box flex="1" bg="white" borderRadius={expandedPane ? "none" : "lg"} p={expandedPane ? 0 : 6} boxShadow={expandedPane ? "none" : "sm"} border={expandedPane ? "none" : "1px solid"} borderColor="blackAlpha.200">
         <Box mb={4}>
-          <Link as={RouterLink} to={`/projects/${task.projectId}`} color="teal.600" fontWeight="600">
-            Back to project
+          <Link as={RouterLink} to={backLinkTo} color="teal.600" fontWeight="600">
+            {backLinkLabel}
           </Link>
           <Heading size="lg" mt={2}>
             {projectName ? `${projectName} - ${task.title}` : task.title}
