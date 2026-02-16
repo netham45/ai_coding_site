@@ -144,7 +144,6 @@ export function TaskDetailPage() {
   useEffect(() => {
     if (!taskId || !task) return;
     if (autoStartedForTaskRef.current.has(taskId)) return;
-    if (task.isBlocked) return;
     autoStartedForTaskRef.current.add(taskId);
 
     (async () => {
@@ -161,7 +160,7 @@ export function TaskDetailPage() {
         }
       }
 
-      if (!ideActive && !task.isBlocked && !["merged", "cancelled", "failed"].includes(task.status)) {
+      if (!ideActive) {
         try {
           const response = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
           setIde(response.ide);
@@ -354,7 +353,6 @@ export function TaskDetailPage() {
 
   useEffect(() => {
     if (!taskId) return;
-    if (task?.isBlocked) return;
     if (!ide || !["starting", "running"].includes(ide.status)) return;
     if (ideLaunchUrl) return;
 
@@ -366,7 +364,7 @@ export function TaskDetailPage() {
       .catch(() => {
         // best-effort recovery
       });
-  }, [taskId, ide?.id, ide?.status, ideLaunchUrl, task?.isBlocked]);
+  }, [taskId, ide?.id, ide?.status, ideLaunchUrl]);
 
   async function pullFromMain() {
     if (!taskId) return;
@@ -492,9 +490,6 @@ export function TaskDetailPage() {
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
 
   const renderIdePanel = (height: string) => {
-    if (task.isBlocked) {
-      return <Text color="orange.700">Task is blocked by unmerged dependencies. IDE start is disabled.</Text>;
-    }
     if (ideLaunchUrl) {
       return (
         <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" overflow="hidden">
