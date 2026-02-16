@@ -17,7 +17,7 @@ import {
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
-import { sendTaskRuntimeInput, startTaskRuntime } from "../services/runtime.js";
+import { sendTaskRuntimeInput, startTaskRuntime, triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -442,7 +442,11 @@ function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, ac
       actorUserId
     });
   })();
-  return db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  if (updated.auto_merge && ["waiting_input", "merge_ready"].includes(updated.status)) {
+    triggerAutoMergeIfEligible(updated.id);
+  }
+  return updated;
 }
 
 export const tasksRouter = Router();

@@ -334,7 +334,7 @@ async function ensureIdleWaitingInput(taskId: string, actorUserId: string): Prom
 
 async function runAutoMerge(taskId: string): Promise<void> {
   const task = getTask(taskId);
-  if (!task || !task.auto_merge || task.status !== "waiting_input") {
+  if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
     return;
   }
 
@@ -460,7 +460,7 @@ function maybeStartAutoMerge(taskId: string): void {
     return;
   }
   const task = getTask(taskId);
-  if (!task || !task.auto_merge || task.status !== "waiting_input") {
+  if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
     return;
   }
 
@@ -468,6 +468,19 @@ function maybeStartAutoMerge(taskId: string): void {
   void runAutoMerge(taskId).finally(() => {
     autoMergeTaskIds.delete(taskId);
   });
+}
+
+export function triggerAutoMergeIfEligible(taskId: string): void {
+  maybeStartAutoMerge(taskId);
+}
+
+function kickPendingAutoMergeTasks(): void {
+  const pendingAutoMergeTasks = db
+    .prepare("SELECT id FROM tasks WHERE auto_merge = 1 AND status IN ('waiting_input', 'merge_ready')")
+    .all() as Array<{ id: string }>;
+  for (const task of pendingAutoMergeTasks) {
+    maybeStartAutoMerge(task.id);
+  }
 }
 
 function buildRuntimeEnv(): { env: Record<string, string>; cleanup?: () => void } {
@@ -562,7 +575,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   ).run(sessionId, task.id, sessionName, socketPath, built.detectedTool, `${built.command} ${built.args.join(" ")}`, now);
 
   const latestTask = getTask(task.id);
-  if (latestTask && latestTask.status === "waiting_input") {
+  if (latestTask && latestTask.status !== "in_progress") {
     db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?").run(nowIso(), task.id);
     insertTransition({
       taskId: task.id,
@@ -699,6 +712,7 @@ async function monitorSession(session: SessionRow): Promise<void> {
 
     if (paneStatus.status === 0) {
       transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "merge_ready", reason: "runtime_exited_cleanly" });
+      maybeStartAutoMerge(session.task_id);
     } else {
       transitionTaskIfNeeded({ taskId: session.task_id, toStatus: "failed", reason: "runtime_exited_nonzero" });
     }
@@ -741,12 +755,16 @@ async function monitorSession(session: SessionRow): Promise<void> {
     });
     if (signal.taskStatus === "waiting_input") {
       maybeStartAutoMerge(session.task_id);
+    } else if (signal.taskStatus === "merge_ready") {
+      maybeStartAutoMerge(session.task_id);
     }
   }
 }
 
 export async function recoverRuntimeSessions(): Promise<void> {
   await ensureTmuxAvailable();
+  kickPendingAutoMergeTasks();
+
   const rows = db
     .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
     .all() as SessionRow[];
@@ -773,6 +791,8 @@ export async function startRuntimeHeartbeat(): Promise<void> {
   }
 
   heartbeatTimer = setInterval(async () => {
+    kickPendingAutoMergeTasks();
+
     const activeSessions = db
       .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
       .all() as SessionRow[];
