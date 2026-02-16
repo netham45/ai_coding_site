@@ -1,9 +1,51 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileOptions } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { logGit, truncateForLog } from "../utils/backendLogger.js";
 
 const execFileAsync = promisify(execFile);
+
+function gitDurationMs(started: bigint): number {
+  return Number(process.hrtime.bigint() - started) / 1_000_000;
+}
+
+async function execGit(
+  args: string[],
+  options?: ExecFileOptions
+): Promise<{ stdout: string | Buffer; stderr: string | Buffer }> {
+  const started = process.hrtime.bigint();
+  logGit("git.command.start", {
+    args,
+    cwd: options?.cwd,
+    timeoutMs: options?.timeout
+  });
+  try {
+    const result = await execFileAsync("git", args, options);
+    logGit("git.command.success", {
+      args,
+      cwd: options?.cwd,
+      timeoutMs: options?.timeout,
+      durationMs: gitDurationMs(started),
+      stdout: truncateForLog(String(result.stdout ?? "")),
+      stderr: truncateForLog(String(result.stderr ?? ""))
+    });
+    return result;
+  } catch (error: any) {
+    logGit("git.command.failure", {
+      args,
+      cwd: options?.cwd,
+      timeoutMs: options?.timeout,
+      durationMs: gitDurationMs(started),
+      code: error?.code,
+      signal: error?.signal,
+      message: String(error?.message ?? "git command failed"),
+      stdout: truncateForLog(String(error?.stdout ?? "")),
+      stderr: truncateForLog(String(error?.stderr ?? ""))
+    });
+    throw error;
+  }
+}
 
 export function taskBranchName(taskId: string): string {
   return `task/${taskId}`;
@@ -32,7 +74,7 @@ export async function cloneRepo(params: {
 }): Promise<void> {
   await fs.promises.mkdir(path.dirname(params.destination), { recursive: true });
   try {
-    await execFileAsync("git", ["clone", "--origin", "origin", "--branch", params.branch, params.repoUrl, params.destination], {
+    await execGit(["clone", "--origin", "origin", "--branch", params.branch, params.repoUrl, params.destination], {
       env: baseGitEnv(),
       timeout: 120000
     });
@@ -55,12 +97,12 @@ export async function cloneLocalRepoToWorkspace(params: {
       cloneArgs.push("--branch", params.sourceBranch);
     }
     cloneArgs.push(params.sourcePath, params.workspacePath);
-    await execFileAsync("git", cloneArgs, { timeout: 120000 });
+    await execGit(cloneArgs, { timeout: 120000 });
     // Ensure task workspace origin fetch + push both point to the local base clone.
-    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "origin", params.sourcePath], {
+    await execGit(["-C", params.workspacePath, "remote", "set-url", "origin", params.sourcePath], {
       timeout: 15000
     });
-    await execFileAsync("git", ["-C", params.workspacePath, "remote", "set-url", "--push", "origin", params.sourcePath], {
+    await execGit(["-C", params.workspacePath, "remote", "set-url", "--push", "origin", params.sourcePath], {
       timeout: 15000
     });
   } catch (error: any) {
@@ -126,7 +168,7 @@ export async function listRepoFiles(params: { repoPath: string; query?: string; 
 
 export async function getHeadCommitSha(repoPath: string): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+    const { stdout } = await execGit(["-C", repoPath, "rev-parse", "HEAD"], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
@@ -141,7 +183,7 @@ export async function getHeadCommitSha(repoPath: string): Promise<string> {
 export async function createTaskBranch(workspacePath: string, taskId: string): Promise<void> {
   const branch = taskBranchName(taskId);
   try {
-    await execFileAsync("git", ["-C", workspacePath, "checkout", "-b", branch], {
+    await execGit(["-C", workspacePath, "checkout", "-b", branch], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
@@ -154,19 +196,19 @@ export async function createTaskBranch(workspacePath: string, taskId: string): P
 
 export async function refreshBaseFromOrigin(params: { basePath: string; defaultBranch: string }): Promise<string> {
   try {
-    await execFileAsync("git", ["-C", params.basePath, "fetch", "origin", params.defaultBranch], {
+    await execGit(["-C", params.basePath, "fetch", "origin", params.defaultBranch], {
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
-    await execFileAsync("git", ["-C", params.basePath, "checkout", params.defaultBranch], {
+    await execGit(["-C", params.basePath, "checkout", params.defaultBranch], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
-    await execFileAsync("git", ["-C", params.basePath, "reset", "--hard", `origin/${params.defaultBranch}`], {
+    await execGit(["-C", params.basePath, "reset", "--hard", `origin/${params.defaultBranch}`], {
       timeout: 30000,
       env: nonInteractiveGitEnv()
     });
-    await execFileAsync("git", ["-C", params.basePath, "clean", "-fd"], {
+    await execGit(["-C", params.basePath, "clean", "-fd"], {
       timeout: 20000,
       env: nonInteractiveGitEnv()
     });
@@ -196,7 +238,7 @@ export type WorkspaceGitStatus = {
 
 export async function getWorkspaceGitStatus(workspacePath: string): Promise<WorkspaceGitStatus> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", workspacePath, "status", "--porcelain=v1", "--branch"], {
+    const { stdout } = await execGit(["-C", workspacePath, "status", "--porcelain=v1", "--branch"], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
@@ -288,7 +330,7 @@ export type PullMainResult = {
 
 export async function pullRemoteRefIntoTaskWorkspace(params: { workspacePath: string; remoteRef: string }): Promise<PullMainResult> {
   try {
-    await execFileAsync("git", ["-C", params.workspacePath, "fetch", "origin", params.remoteRef], {
+    await execGit(["-C", params.workspacePath, "fetch", "origin", params.remoteRef], {
       timeout: 30000,
       env: nonInteractiveGitEnv()
     });
@@ -300,13 +342,13 @@ export async function pullRemoteRefIntoTaskWorkspace(params: { workspacePath: st
 
   let conflicted = false;
   try {
-    await execFileAsync("git", ["-C", params.workspacePath, "merge", "--no-edit", `origin/${params.remoteRef}`], {
+    await execGit(["-C", params.workspacePath, "merge", "--no-edit", `origin/${params.remoteRef}`], {
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
   } catch (error: any) {
     try {
-      const { stdout } = await execFileAsync("git", ["-C", params.workspacePath, "diff", "--name-only", "--diff-filter=U"], {
+      const { stdout } = await execGit(["-C", params.workspacePath, "diff", "--name-only", "--diff-filter=U"], {
         timeout: 10000,
         env: nonInteractiveGitEnv()
       });
@@ -329,7 +371,7 @@ export async function pullRemoteRefIntoTaskWorkspace(params: { workspacePath: st
 
   let conflictFiles: string[] = [];
   if (conflicted) {
-    const { stdout } = await execFileAsync("git", ["-C", params.workspacePath, "diff", "--name-only", "--diff-filter=U"], {
+    const { stdout } = await execGit(["-C", params.workspacePath, "diff", "--name-only", "--diff-filter=U"], {
       timeout: 10000,
       env: nonInteractiveGitEnv()
     });
@@ -368,15 +410,15 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
 }): Promise<MergeTaskResult> {
   if (params.syncTargetBranchFromOrigin) {
     try {
-      await execFileAsync("git", ["-C", params.targetPath, "fetch", "origin", params.targetBranch], {
+      await execGit(["-C", params.targetPath, "fetch", "origin", params.targetBranch], {
         timeout: 45000,
         env: nonInteractiveGitEnv()
       });
-      await execFileAsync("git", ["-C", params.targetPath, "checkout", params.targetBranch], {
+      await execGit(["-C", params.targetPath, "checkout", params.targetBranch], {
         timeout: 15000,
         env: nonInteractiveGitEnv()
       });
-      await execFileAsync("git", ["-C", params.targetPath, "merge", "--ff-only", `origin/${params.targetBranch}`], {
+      await execGit(["-C", params.targetPath, "merge", "--ff-only", `origin/${params.targetBranch}`], {
         timeout: 30000,
         env: nonInteractiveGitEnv()
       });
@@ -387,7 +429,7 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
     }
   } else {
     try {
-      await execFileAsync("git", ["-C", params.targetPath, "checkout", params.targetBranch], {
+      await execGit(["-C", params.targetPath, "checkout", params.targetBranch], {
         timeout: 15000,
         env: nonInteractiveGitEnv()
       });
@@ -400,11 +442,11 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
 
   try {
     const sourceBranch = taskBranchName(params.taskId);
-    await execFileAsync("git", ["-C", params.workspacePath, "rev-parse", "--verify", `refs/heads/${sourceBranch}`], {
+    await execGit(["-C", params.workspacePath, "rev-parse", "--verify", `refs/heads/${sourceBranch}`], {
       timeout: 10000,
       env: nonInteractiveGitEnv()
     });
-    await execFileAsync("git", ["-C", params.targetPath, "fetch", params.workspacePath, `refs/heads/${sourceBranch}`], {
+    await execGit(["-C", params.targetPath, "fetch", params.workspacePath, `refs/heads/${sourceBranch}`], {
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
@@ -415,12 +457,12 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
   }
 
   try {
-    await execFileAsync("git", ["-C", params.targetPath, "merge", "--no-ff", "--no-edit", "FETCH_HEAD"], {
+    await execGit(["-C", params.targetPath, "merge", "--no-ff", "--no-edit", "FETCH_HEAD"], {
       timeout: 60000,
       env: nonInteractiveGitEnv()
     });
   } catch (error: any) {
-    const { stdout } = await execFileAsync("git", ["-C", params.targetPath, "diff", "--name-only", "--diff-filter=U"], {
+    const { stdout } = await execGit(["-C", params.targetPath, "diff", "--name-only", "--diff-filter=U"], {
       timeout: 10000,
       env: nonInteractiveGitEnv()
     });
@@ -430,7 +472,7 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
       .filter(Boolean);
     if (conflictFiles.length > 0) {
       try {
-        await execFileAsync("git", ["-C", params.targetPath, "merge", "--abort"], {
+        await execGit(["-C", params.targetPath, "merge", "--abort"], {
           timeout: 10000,
           env: nonInteractiveGitEnv()
         });
@@ -481,7 +523,7 @@ export async function pullMainIntoTaskWorkspace(params: { workspacePath: string;
 
 export async function pushBranchToOrigin(params: { repoPath: string; branch: string }): Promise<void> {
   try {
-    await execFileAsync("git", ["-C", params.repoPath, "push", "origin", params.branch], {
+    await execGit(["-C", params.repoPath, "push", "origin", params.branch], {
       timeout: 60000,
       env: nonInteractiveGitEnv()
     });
