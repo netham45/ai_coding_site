@@ -18,6 +18,7 @@ type Runtime = {
 
 const runtimes = new Map<string, Runtime>();
 const disabledIdeExtensions = ["GitHub.copilot", "GitHub.copilot-chat"];
+const extensionDisableArgsByCommand = new Map<string, string[]>();
 
 async function commandExists(command: string): Promise<boolean> {
   try {
@@ -26,6 +27,36 @@ async function commandExists(command: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function resolveExtensionDisableArgs(command: string): Promise<string[]> {
+  const cached = extensionDisableArgsByCommand.get(command);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const { stdout, stderr } = await execFileAsync(command, ["--help"], { timeout: 5000, maxBuffer: 1024 * 1024 });
+    const help = `${String(stdout)}\n${String(stderr)}`;
+
+    if (help.includes("--disable-extension")) {
+      const args = disabledIdeExtensions.flatMap((extensionId) => ["--disable-extension", extensionId]);
+      extensionDisableArgsByCommand.set(command, args);
+      return args;
+    }
+
+    if (help.includes("--disable-extensions")) {
+      const args = ["--disable-extensions"];
+      extensionDisableArgsByCommand.set(command, args);
+      return args;
+    }
+  } catch {
+    // ignore and fall through
+  }
+
+  const args: string[] = [];
+  extensionDisableArgsByCommand.set(command, args);
+  return args;
 }
 
 async function reservePort(): Promise<number> {
@@ -266,6 +297,7 @@ export async function startIdeSession(params: { taskId: string; workspacePath: s
   if (await commandExists("code-server")) {
     provider = "code_server";
     command = "code-server";
+    const extensionDisableArgs = await resolveExtensionDisableArgs(command);
     args = [
       "--auth",
       "none",
@@ -274,19 +306,20 @@ export async function startIdeSession(params: { taskId: string; workspacePath: s
       "--disable-workspace-trust",
       "--bind-addr",
       `127.0.0.1:${port}`,
-      ...disabledIdeExtensions.flatMap((extensionId) => ["--disable-extension", extensionId]),
+      ...extensionDisableArgs,
       params.workspacePath
     ];
   } else if (await commandExists("openvscode-server")) {
     provider = "openvscode_server";
     command = "openvscode-server";
+    const extensionDisableArgs = await resolveExtensionDisableArgs(command);
     args = [
       "--host",
       "127.0.0.1",
       "--port",
       String(port),
       "--without-connection-token",
-      ...disabledIdeExtensions.flatMap((extensionId) => ["--disable-extension", extensionId]),
+      ...extensionDisableArgs,
       params.workspacePath
     ];
   } else {
