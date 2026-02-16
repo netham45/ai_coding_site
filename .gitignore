@@ -6,3 +6,4 @@ data/
 repos/*
 !repos/.gitkeep
 **/*.code-workspace
+!.ai-coding-site.code-workspace

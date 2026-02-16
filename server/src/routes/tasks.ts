@@ -14,7 +14,7 @@ import {
   mergeTaskWorkspaceIntoBase,
   pullMainIntoTaskWorkspace
 } from "../services/git.js";
-import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
+import { ideSessionRunning, ideSessionTarget, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
 import { hasSession, killSession } from "../services/tmux.js";
@@ -252,23 +252,11 @@ function issueIdeLaunchUrl(params: { taskId: string; ideId: string; folderPath?:
 }
 
 async function buildIdeLaunchUrl(task: TaskRow, ideId: string): Promise<string> {
-  try {
-    const session = latestSession(task.id);
-    const attachableSession = session && ["starting", "running", "waiting_input"].includes(session.status) ? session : null;
-    const openPath = await prepareIdeWorkspace({
-      taskId: task.id,
-      workspacePath: task.workspace_path,
-      tmuxSocketPath: attachableSession?.tmux_socket_path,
-      tmuxSessionName: attachableSession?.tmux_session_name
-    });
-    if (openPath.endsWith(".code-workspace")) {
-      return issueIdeLaunchUrl({ taskId: task.id, ideId, workspacePath: openPath });
-    }
-    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: openPath });
-  } catch {
-    // Fall back to direct folder launch if workspace file generation fails.
-    return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: task.workspace_path });
+  const workspacePath = path.join(task.workspace_path, ".ai-coding-site.code-workspace");
+  if (fs.existsSync(workspacePath)) {
+    return issueIdeLaunchUrl({ taskId: task.id, ideId, workspacePath });
   }
+  return issueIdeLaunchUrl({ taskId: task.id, ideId, folderPath: task.workspace_path });
 }
 
 function rewriteProxyLocation(params: { location: string; taskId: string; targetPort: number }): string {
