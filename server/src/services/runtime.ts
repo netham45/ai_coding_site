@@ -650,14 +650,27 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
 }
 
 export async function sendTaskRuntimeInput(taskId: string, actorUserId: string, text: string): Promise<void> {
-  const session = getLatestSession(taskId);
+  let session = getLatestSession(taskId);
+  const hasRunnableSession = session && ["running", "waiting_input"].includes(session.status);
+  if (!hasRunnableSession) {
+    await startTaskRuntime(taskId, actorUserId);
+    session = getLatestSession(taskId);
+  }
   if (!session || !["running", "waiting_input"].includes(session.status)) {
     throw new Error("No running session available for task");
   }
 
-  const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+  let alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
   if (!alive) {
-    throw new Error("Runtime session is not alive");
+    await startTaskRuntime(taskId, actorUserId);
+    session = getLatestSession(taskId);
+    if (!session || !["running", "waiting_input"].includes(session.status)) {
+      throw new Error("No running session available for task");
+    }
+    alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+    if (!alive) {
+      throw new Error("Runtime session is not alive");
+    }
   }
 
   await sendInput(session.tmux_socket_path, session.tmux_session_name, text);
