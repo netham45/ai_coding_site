@@ -2,6 +2,7 @@ import {
   Badge,
   Box,
   Button,
+  Code,
   Flex,
   FormControl,
   FormLabel,
@@ -589,6 +590,9 @@ export function ProjectDetailPage() {
               <Text color="gray.600" mb={4}>
                 Plan mode creates a planning runtime (IDE + terminal) that outputs a task graph for approval.
               </Text>
+              <Text color="gray.600" mb={4}>
+                YAML format is required and automatically enforced. The planner is instructed to write output to <Code>.ai-plan/latest-plan.yaml</Code>.
+              </Text>
               <form onSubmit={onCreatePlan}>
                 <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={4}>
                   <FormControl isRequired>
@@ -605,7 +609,7 @@ export function ProjectDetailPage() {
                       rows={6}
                       value={planForm.taskPrompt}
                       onChange={(e) => setPlanForm((x) => ({ ...x, taskPrompt: e.target.value }))}
-                      placeholder={"Ask for output format:\n<task X>\n<prompt>...</prompt>\n<depends on task Y>"}
+                      placeholder={"Example ask:\nBreak this into independent implementation tasks.\nInclude dependencies for conflicting work.\nReturn YAML with tasks:id/title/prompt/depends_on."}
                     />
                   </FormControl>
                 </Grid>
