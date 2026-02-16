@@ -30,6 +30,10 @@ const regenerateSchema = z.object({
   feedback: z.string().min(1).max(12000)
 });
 
+const approvePlanSchema = z.object({
+  autoMergeItemKeys: z.array(z.string().min(1).max(200)).max(1000).optional()
+});
+
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 
 function planningFormatInstructions(): string {
@@ -114,6 +118,7 @@ function serializeTask(task: TaskRow) {
     taskPrompt: task.task_prompt,
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
+    autoMerge: Boolean(task.auto_merge),
     mode: task.mode,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
@@ -214,10 +219,11 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
     db.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, effective_prompt, ai_command,
+        auto_merge,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'plan', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, 0, 'plan', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(id, project.id, input.title, plannerPrompt, effectivePrompt, aiCommand, workspacePath, baseCommitSha, req.user.id, now, now);
 
     db.prepare(
@@ -449,6 +455,12 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
 });
 
 plansRouter.post("/plans/:planId/approve", async (req, res) => {
+  const parsed = approvePlanSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+
   const plan = planForUser(req.params.planId, req.user.id);
   if (!plan) {
     res.status(404).json({ error: "Plan not found" });
@@ -509,6 +521,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     .all(latestRevision.id) as PlanRevisionItemDependencyRow[];
 
   const itemIdToDeps = new Map<string, string[]>();
+  const autoMergeItemKeys = new Set((parsed.data.autoMergeItemKeys ?? []).map((key) => key.toLowerCase()));
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
       itemIdToDeps.set(row.revision_item_id, []);
@@ -569,10 +582,11 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       db.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, effective_prompt, ai_command,
+          auto_merge,
           mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
           status, workspace_path, base_commit_sha_at_create, head_commit_sha,
           cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'execution', ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'execution', ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
       ).run(
         row.taskId,
         project.id,
@@ -580,6 +594,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
         row.item.prompt,
         buildEffectivePrompt(project, row.item.prompt),
         resolveAiCommand(undefined, req.user.id),
+        autoMergeItemKeys.has(row.item.item_key.toLowerCase()) ? 1 : 0,
         plan.id,
         latestRevision.id,
         row.item.item_key,

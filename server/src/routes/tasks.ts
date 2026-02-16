@@ -29,6 +29,7 @@ const createTaskSchema = z.object({
   title: z.string().min(2).max(160),
   taskPrompt: z.string().min(1).max(12000),
   aiCommand: z.string().min(1).max(500).optional(),
+  autoMerge: z.boolean().optional(),
   dependencyTaskIds: z.array(z.string().uuid()).max(200).optional()
 });
 
@@ -167,6 +168,7 @@ function serializeTask(task: TaskRow) {
     taskPrompt: task.task_prompt,
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
+    autoMerge: Boolean(task.auto_merge),
     mode: task.mode,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
@@ -458,6 +460,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
+  const autoMerge = Boolean(input.autoMerge);
 
   let dependencies: TaskRow[];
   try {
@@ -487,10 +490,11 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     db.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, effective_prompt, ai_command,
+        auto_merge,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -498,6 +502,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       input.taskPrompt,
       effectivePrompt,
       aiCommand,
+      autoMerge ? 1 : 0,
       workspacePath,
       baseCommitSha,
       req.user.id,
@@ -524,6 +529,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     payload: {
       title: input.title,
       aiCommand,
+      autoMerge,
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha,
       dependencyTaskIds: dependencies.map((x) => x.id),

@@ -1,4 +1,4 @@
-import { Badge, Box, Button, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, Textarea, useToast } from "@chakra-ui/react";
+import { Badge, Box, Button, Checkbox, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, Textarea, useToast } from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
 import { Terminal } from "@xterm/xterm";
@@ -98,6 +98,7 @@ export function TaskDetailPage() {
   const [extractingPlan, setExtractingPlan] = useState(false);
   const [regeneratingPlan, setRegeneratingPlan] = useState(false);
   const [approvingPlan, setApprovingPlan] = useState(false);
+  const [autoMergeItemKeys, setAutoMergeItemKeys] = useState<string[]>([]);
 
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -544,11 +545,16 @@ export function TaskDetailPage() {
 
   async function approvePlanTasks() {
     if (!entityId) return;
-    const confirmed = window.confirm("Approve all tasks from the latest proposed plan revision?");
+    const confirmed = window.confirm(
+      `Approve all tasks from the latest proposed plan revision?\n\nAuto-merge enabled for ${autoMergeItemKeys.length} task(s).`
+    );
     if (!confirmed) return;
     setApprovingPlan(true);
     try {
-      await api<{ approvedTasks: Task[] }>(`/api/plans/${entityId}/approve`, { method: "POST" });
+      await api<{ approvedTasks: Task[] }>(`/api/plans/${entityId}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ autoMergeItemKeys })
+      });
       await loadTask();
       if (task?.projectId) {
         await loadProjectContext(task.projectId);
@@ -561,6 +567,19 @@ export function TaskDetailPage() {
     }
   }
 
+  const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
+  const latestProposedItemKeys = (latestProposedRevision?.items ?? []).map((item) => item.itemKey);
+  const allAutoMergeSelected = latestProposedItemKeys.length > 0 && latestProposedItemKeys.every((itemKey) => autoMergeItemKeys.includes(itemKey));
+  const someAutoMergeSelected = autoMergeItemKeys.length > 0 && !allAutoMergeSelected;
+
+  useEffect(() => {
+    if (!latestProposedItemKeys.length) {
+      setAutoMergeItemKeys([]);
+      return;
+    }
+    setAutoMergeItemKeys((current) => current.filter((itemKey) => latestProposedItemKeys.includes(itemKey)));
+  }, [latestProposedRevision?.id]);
+
   if (!task) {
     return <Text>Loading task...</Text>;
   }
@@ -570,7 +589,6 @@ export function TaskDetailPage() {
   const backLinkLabel = task.parentPlanTaskId ? "Back to plan" : "Back to project";
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
-  const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
   const isPlanOwnedExecutionTask = task.mode === "execution" && !!task.parentPlanTaskId;
 
   const renderIdePanel = (height: string) => {
@@ -791,12 +809,42 @@ export function TaskDetailPage() {
                         <Text fontSize="sm" color="gray.700" mb={2}>
                           Latest proposed tasks: {latestProposedRevision?.items.length ?? 0}
                         </Text>
+                        {!!latestProposedRevision?.items.length && (
+                          <Checkbox
+                            mb={2}
+                            isChecked={allAutoMergeSelected}
+                            isIndeterminate={someAutoMergeSelected}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setAutoMergeItemKeys(latestProposedItemKeys);
+                                return;
+                              }
+                              setAutoMergeItemKeys([]);
+                            }}
+                          >
+                            Select/Deselect all for Auto-merge
+                          </Checkbox>
+                        )}
                         <Stack spacing={2}>
                           {(latestProposedRevision?.items ?? []).map((item) => (
                             <Box key={item.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
                               <Text fontWeight="700">
                                 {item.ordinal}. {item.title} ({item.itemKey})
                               </Text>
+                              <Checkbox
+                                mt={2}
+                                isChecked={autoMergeItemKeys.includes(item.itemKey)}
+                                onChange={(e) => {
+                                  setAutoMergeItemKeys((current) => {
+                                    if (e.target.checked) {
+                                      return current.includes(item.itemKey) ? current : [...current, item.itemKey];
+                                    }
+                                    return current.filter((value) => value !== item.itemKey);
+                                  });
+                                }}
+                              >
+                                Enable Auto-merge
+                              </Checkbox>
                               <Text fontSize="sm" color="gray.700" whiteSpace="pre-wrap">
                                 {item.prompt}
                               </Text>

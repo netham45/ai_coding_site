@@ -478,3 +478,16 @@ export async function pullMainIntoTaskWorkspace(params: { workspacePath: string;
     remoteRef: params.defaultBranch
   });
 }
+
+export async function pushBranchToOrigin(params: { repoPath: string; branch: string }): Promise<void> {
+  try {
+    await execFileAsync("git", ["-C", params.repoPath, "push", "origin", params.branch], {
+      timeout: 60000,
+      env: nonInteractiveGitEnv()
+    });
+  } catch (error: any) {
+    const stderr = error?.stderr ? String(error.stderr) : "";
+    const message = stderr.trim() || error?.message || "failed to push branch to origin";
+    throw new Error(message);
+  }
+}
