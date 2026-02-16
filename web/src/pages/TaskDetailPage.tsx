@@ -799,11 +799,10 @@ export function TaskDetailPage() {
                         size="sm"
                         onClick={markMergeReady}
                         isLoading={markingReady}
-                        isDisabled={!["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
                       >
                         Mark Merge Ready
                       </Button>
-                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
+                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask}>
                         Merge Plan To Base
                       </Button>
                       <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
@@ -815,7 +814,6 @@ export function TaskDetailPage() {
                         size="sm"
                         onClick={cancelTask}
                         isLoading={cancellingTask}
-                        isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
                       >
                         Cancel Plan
                       </Button>
@@ -831,11 +829,10 @@ export function TaskDetailPage() {
                         size="sm"
                         onClick={markMergeReady}
                         isLoading={markingReady}
-                        isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
                       >
                         Mark Merge Ready
                       </Button>
-                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
+                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask}>
                         {isPlanOwnedExecutionTask ? "Merge Task Into Plan" : "Merge Task"}
                       </Button>
                       <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
@@ -847,7 +844,6 @@ export function TaskDetailPage() {
                         size="sm"
                         onClick={cancelTask}
                         isLoading={cancellingTask}
-                        isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
                       >
                         Cancel Task
                       </Button>
