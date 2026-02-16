@@ -12,6 +12,7 @@ export function App() {
         <Route path="/" element={<ProjectsPage />} />
         <Route path="/projects/:projectId" element={<ProjectDetailPage />} />
         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+        <Route path="/plans/:planId" element={<TaskDetailPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

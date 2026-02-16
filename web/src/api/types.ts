@@ -27,6 +27,8 @@ export type TaskStatus =
   | "failed"
   | "merge_conflict";
 
+export type TaskMode = "execution" | "plan";
+
 export type Task = {
   id: string;
   projectId: string;
@@ -34,6 +36,10 @@ export type Task = {
   taskPrompt: string;
   effectivePrompt: string;
   aiCommand: string;
+  mode: TaskMode;
+  parentPlanTaskId: string | null;
+  sourcePlanRevisionId: string | null;
+  sourcePlanItemKey: string | null;
   status: TaskStatus;
   workspacePath: string;
   baseCommitShaAtCreate: string;
@@ -47,6 +53,29 @@ export type Task = {
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type PlanRevisionItem = {
+  id: string;
+  itemKey: string;
+  title: string;
+  prompt: string;
+  ordinal: number;
+  dependsOnItemKeys: string[];
+};
+
+export type PlanRevision = {
+  id: string;
+  planTaskId: string;
+  revisionNumber: number;
+  status: "proposed" | "approved" | "superseded" | "feedback_requested" | "parse_failed";
+  feedback: string | null;
+  rawOutput: string;
+  parseError: string | null;
+  createdByUserId: string;
+  createdAt: string;
+  approvedAt: string | null;
+  items: PlanRevisionItem[];
 };
 
 export type TaskTransition = {

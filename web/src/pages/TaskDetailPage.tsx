@@ -1,11 +1,11 @@
-import { Badge, Box, Button, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, useToast } from "@chakra-ui/react";
+import { Badge, Box, Button, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, Textarea, useToast } from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { api } from "../api/client";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, Project, Task, TaskSession, TaskStatus, TaskTransition } from "../api/types";
+import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskStatus, TaskTransition } from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -35,6 +35,13 @@ type IdeStartResponse = {
   launchUrl: string;
 };
 
+type PlanDetailResponse = {
+  plan: Task;
+  transitions: TaskTransition[];
+  revisions: PlanRevision[];
+  approvedTasks: Task[];
+};
+
 type TerminalMessage =
   | { type: "hello"; taskId: string; sessionId: string }
   | { type: "output"; data: string; reset?: boolean; cursorX?: number; cursorY?: number }
@@ -62,7 +69,8 @@ function taskStatusLabel(task: Task): string {
 }
 
 export function TaskDetailPage() {
-  const { taskId } = useParams();
+  const { taskId, planId } = useParams();
+  const entityId = taskId ?? planId;
   const [searchParams] = useSearchParams();
   const toast = useToast();
 
@@ -84,6 +92,12 @@ export function TaskDetailPage() {
   const [rerunningTask, setRerunningTask] = useState(false);
   const [cancellingTask, setCancellingTask] = useState(false);
   const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
+  const [planRevisions, setPlanRevisions] = useState<PlanRevision[]>([]);
+  const [approvedPlanTasks, setApprovedPlanTasks] = useState<Task[]>([]);
+  const [planFeedback, setPlanFeedback] = useState("");
+  const [extractingPlan, setExtractingPlan] = useState(false);
+  const [regeneratingPlan, setRegeneratingPlan] = useState(false);
+  const [approvingPlan, setApprovingPlan] = useState(false);
 
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -93,14 +107,26 @@ export function TaskDetailPage() {
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
 
   async function loadTask() {
-    if (!taskId) return;
-    const response = await api<TaskDetailResponse>(`/api/tasks/${taskId}`);
+    if (!entityId) return;
+    const response = await api<TaskDetailResponse>(`/api/tasks/${entityId}`);
     setTask(response.task);
     setTransitions(response.transitions);
     setSession(response.session);
     setIde(response.ide);
     setGitStatus(response.gitStatus);
     setMergeRecords(response.mergeRecords ?? []);
+    if (response.task.mode === "plan") {
+      await loadPlanDetails(response.task.id);
+    } else {
+      setPlanRevisions([]);
+      setApprovedPlanTasks([]);
+    }
+  }
+
+  async function loadPlanDetails(currentPlanId: string) {
+    const response = await api<PlanDetailResponse>(`/api/plans/${currentPlanId}`);
+    setPlanRevisions(response.revisions ?? []);
+    setApprovedPlanTasks(response.approvedTasks ?? []);
   }
 
   async function loadProjectContext(projectId: string) {
@@ -122,7 +148,7 @@ export function TaskDetailPage() {
       toast({ status: "error", title: "Failed to load task", description: error.message });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, searchParams]);
+  }, [entityId, searchParams]);
 
   useEffect(() => {
     if (!task?.projectId) return;
@@ -142,9 +168,9 @@ export function TaskDetailPage() {
   }, [projectName, task]);
 
   useEffect(() => {
-    if (!taskId || !task) return;
-    if (autoStartedForTaskRef.current.has(taskId)) return;
-    autoStartedForTaskRef.current.add(taskId);
+    if (!entityId || !task) return;
+    if (autoStartedForTaskRef.current.has(entityId)) return;
+    autoStartedForTaskRef.current.add(entityId);
 
     (async () => {
       let shouldReload = false;
@@ -153,7 +179,7 @@ export function TaskDetailPage() {
 
       if (!runtimeActive && !task.isBlocked && !["merge_ready", "merged", "cancelled", "failed"].includes(task.status)) {
         try {
-          await api(`/api/tasks/${taskId}/start`, { method: "POST" });
+          await api(`/api/tasks/${entityId}/start`, { method: "POST" });
           shouldReload = true;
         } catch {
           // best effort autostart
@@ -162,7 +188,7 @@ export function TaskDetailPage() {
 
       if (!ideActive) {
         try {
-          const response = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
+          const response = await api<IdeStartResponse>(`/api/tasks/${entityId}/ide/start`, { method: "POST" });
           setIde(response.ide);
           setIdeLaunchUrl(response.launchUrl);
           shouldReload = true;
@@ -176,7 +202,7 @@ export function TaskDetailPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, task?.id, task?.isBlocked]);
+  }, [entityId, task?.id, task?.isBlocked]);
 
   useEffect(() => {
     if (!terminalContainerRef.current || terminalRef.current) {
@@ -240,7 +266,7 @@ export function TaskDetailPage() {
   }, [session?.id, session?.lastOutput]);
 
   async function connectTerminal() {
-    if (!taskId) return;
+    if (!entityId) return;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       return;
     }
@@ -249,7 +275,7 @@ export function TaskDetailPage() {
     const term = terminalRef.current;
 
     try {
-      const tokenData = await api<TerminalTokenResponse>(`/api/tasks/${taskId}/terminal-token`);
+      const tokenData = await api<TerminalTokenResponse>(`/api/tasks/${entityId}/terminal-token`);
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${protocol}://${window.location.host}${tokenData.wsPath}?token=${encodeURIComponent(tokenData.token)}`);
       wsRef.current = ws;
@@ -297,7 +323,7 @@ export function TaskDetailPage() {
               return { ...current, status: nextTaskStatus };
             });
             setProjectTasks((current) =>
-              current.map((item) => (item.id === taskId && item.status !== nextTaskStatus ? { ...item, status: nextTaskStatus } : item))
+              current.map((item) => (item.id === entityId && item.status !== nextTaskStatus ? { ...item, status: nextTaskStatus } : item))
             );
           }
         }
@@ -352,11 +378,11 @@ export function TaskDetailPage() {
   }, [expandedPane]);
 
   useEffect(() => {
-    if (!taskId) return;
+    if (!entityId) return;
     if (!ide || !["starting", "running"].includes(ide.status)) return;
     if (ideLaunchUrl) return;
 
-    api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" })
+    api<IdeStartResponse>(`/api/tasks/${entityId}/ide/start`, { method: "POST" })
       .then((response) => {
         setIde(response.ide);
         setIdeLaunchUrl(response.launchUrl);
@@ -364,14 +390,14 @@ export function TaskDetailPage() {
       .catch(() => {
         // best-effort recovery
       });
-  }, [taskId, ide?.id, ide?.status, ideLaunchUrl]);
+  }, [entityId, ide?.id, ide?.status, ideLaunchUrl]);
 
   async function pullFromMain() {
-    if (!taskId) return;
+    if (!entityId) return;
     setSyncingMain(true);
     try {
       const response = await api<{ task: Task; sync: { conflicted: boolean; conflictFiles: string[]; headCommitSha: string } }>(
-        `/api/tasks/${taskId}/pull-main`,
+        `/api/tasks/${entityId}/pull-main`,
         { method: "POST" }
       );
       await loadTask();
@@ -396,10 +422,10 @@ export function TaskDetailPage() {
   }
 
   async function markMergeReady() {
-    if (!taskId) return;
+    if (!entityId) return;
     setMarkingReady(true);
     try {
-      await api<{ task: Task }>(`/api/tasks/${taskId}/mark-merge-ready`, { method: "POST" });
+      await api<{ task: Task }>(`/api/tasks/${entityId}/mark-merge-ready`, { method: "POST" });
       await loadTask();
       toast({ status: "success", title: "Task marked merge_ready" });
     } catch (error: any) {
@@ -410,10 +436,10 @@ export function TaskDetailPage() {
   }
 
   async function mergeTask() {
-    if (!taskId) return;
+    if (!entityId) return;
     setMergingTask(true);
     try {
-      await api<{ task: Task; mergeRecords: MergeRecord[] }>(`/api/tasks/${taskId}/merge`, { method: "POST" });
+      await api<{ task: Task; mergeRecords: MergeRecord[] }>(`/api/tasks/${entityId}/merge`, { method: "POST" });
       await loadTask();
       if (task?.projectId) {
         await loadProjectContext(task.projectId);
@@ -427,12 +453,12 @@ export function TaskDetailPage() {
   }
 
   async function cancelTask() {
-    if (!taskId) return;
+    if (!entityId) return;
     const reason = window.prompt("Cancel reason:");
     if (!reason || !reason.trim()) return;
     setCancellingTask(true);
     try {
-      await api<{ task: Task }>(`/api/tasks/${taskId}/cancel`, {
+      await api<{ task: Task }>(`/api/tasks/${entityId}/cancel`, {
         method: "POST",
         body: JSON.stringify({ reason: reason.trim() })
       });
@@ -449,7 +475,7 @@ export function TaskDetailPage() {
   }
 
   async function rerunTask() {
-    if (!taskId) return;
+    if (!entityId) return;
     const confirmed = window.confirm(
       "Re-run this task?\n\nThis will reset this task workspace repo to the latest base state and restart the task.\nAll unpushed task progress will be permanently lost."
     );
@@ -457,15 +483,15 @@ export function TaskDetailPage() {
 
     setRerunningTask(true);
     try {
-      await api<{ task: Task }>(`/api/tasks/${taskId}/rerun`, { method: "POST" });
+      await api<{ task: Task }>(`/api/tasks/${entityId}/rerun`, { method: "POST" });
       setIdeLaunchUrl(null);
       try {
-        await api(`/api/tasks/${taskId}/start`, { method: "POST" });
+        await api(`/api/tasks/${entityId}/start`, { method: "POST" });
       } catch {
         // best-effort restart
       }
       try {
-        const ideResponse = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
+        const ideResponse = await api<IdeStartResponse>(`/api/tasks/${entityId}/ide/start`, { method: "POST" });
         setIde(ideResponse.ide);
         setIdeLaunchUrl(ideResponse.launchUrl);
       } catch {
@@ -483,11 +509,63 @@ export function TaskDetailPage() {
     }
   }
 
+  async function extractPlanTasks() {
+    if (!entityId) return;
+    setExtractingPlan(true);
+    try {
+      await api<{ ok: boolean }>(`/api/plans/${entityId}/extract`, { method: "POST" });
+      await loadTask();
+      toast({ status: "success", title: "Plan tasks extracted" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Extract failed", description: error.message });
+    } finally {
+      setExtractingPlan(false);
+    }
+  }
+
+  async function regeneratePlanTasks() {
+    if (!entityId || !planFeedback.trim()) return;
+    setRegeneratingPlan(true);
+    try {
+      await api<{ ok: boolean }>(`/api/plans/${entityId}/regenerate`, {
+        method: "POST",
+        body: JSON.stringify({ feedback: planFeedback.trim() })
+      });
+      setPlanFeedback("");
+      await loadTask();
+      toast({ status: "info", title: "Feedback sent to plan runtime" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Regenerate failed", description: error.message });
+    } finally {
+      setRegeneratingPlan(false);
+    }
+  }
+
+  async function approvePlanTasks() {
+    if (!entityId) return;
+    const confirmed = window.confirm("Approve all tasks from the latest proposed plan revision?");
+    if (!confirmed) return;
+    setApprovingPlan(true);
+    try {
+      await api<{ approvedTasks: Task[] }>(`/api/plans/${entityId}/approve`, { method: "POST" });
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      toast({ status: "success", title: "Plan approved and tasks created" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Approve failed", description: error.message });
+    } finally {
+      setApprovingPlan(false);
+    }
+  }
+
   if (!task) {
     return <Text>Loading task...</Text>;
   }
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
+  const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -530,6 +608,7 @@ export function TaskDetailPage() {
             {projectName ? `${projectName} - ${task.title}` : task.title}
           </Heading>
           <Stack direction="row" mt={2} align="center">
+            <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
             <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
             <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
               terminal: {terminalState}
@@ -602,38 +681,121 @@ export function TaskDetailPage() {
             <TabPanel px={0} pt={4}>
               <Stack spacing={5}>
                 <Flex justify="flex-end">
-                  <Stack direction={{ base: "column", md: "row" }} spacing={2}>
-                    <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
-                      Pull From Main Repo
-                    </Button>
-                    <Button
-                      colorScheme="blue"
-                      variant="outline"
-                      size="sm"
-                      onClick={markMergeReady}
-                      isLoading={markingReady}
-                      isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
-                    >
-                      Mark Merge Ready
-                    </Button>
-                    <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
-                      Merge Task
-                    </Button>
-                    <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
-                      Re-run Task
-                    </Button>
-                    <Button
-                      colorScheme="red"
-                      variant="outline"
-                      size="sm"
-                      onClick={cancelTask}
-                      isLoading={cancellingTask}
-                      isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
-                    >
-                      Cancel Task
-                    </Button>
-                  </Stack>
+                  {task.mode === "plan" ? (
+                    <Stack direction={{ base: "column", md: "row" }} spacing={2}>
+                      <Button colorScheme="purple" variant="outline" size="sm" onClick={extractPlanTasks} isLoading={extractingPlan}>
+                        Extract Proposed Tasks
+                      </Button>
+                      <Button colorScheme="green" size="sm" onClick={approvePlanTasks} isLoading={approvingPlan} isDisabled={!latestProposedRevision}>
+                        Approve All Tasks
+                      </Button>
+                      <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
+                        Re-run Plan
+                      </Button>
+                      <Button
+                        colorScheme="red"
+                        variant="outline"
+                        size="sm"
+                        onClick={cancelTask}
+                        isLoading={cancellingTask}
+                        isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
+                      >
+                        Cancel Plan
+                      </Button>
+                    </Stack>
+                  ) : (
+                    <Stack direction={{ base: "column", md: "row" }} spacing={2}>
+                      <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
+                        Pull From Main Repo
+                      </Button>
+                      <Button
+                        colorScheme="blue"
+                        variant="outline"
+                        size="sm"
+                        onClick={markMergeReady}
+                        isLoading={markingReady}
+                        isDisabled={task.isBlocked || !["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)}
+                      >
+                        Mark Merge Ready
+                      </Button>
+                      <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
+                        Merge Task
+                      </Button>
+                      <Button colorScheme="orange" variant="outline" size="sm" onClick={rerunTask} isLoading={rerunningTask}>
+                        Re-run Task
+                      </Button>
+                      <Button
+                        colorScheme="red"
+                        variant="outline"
+                        size="sm"
+                        onClick={cancelTask}
+                        isLoading={cancellingTask}
+                        isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
+                      >
+                        Cancel Task
+                      </Button>
+                    </Stack>
+                  )}
                 </Flex>
+                {task.mode === "plan" && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Plan Review
+                    </Heading>
+                    <Stack spacing={3}>
+                      <Box>
+                        <Text mb={2} fontSize="sm" color="gray.700">
+                          Feedback for re-generation
+                        </Text>
+                        <Textarea
+                          rows={3}
+                          value={planFeedback}
+                          onChange={(e) => setPlanFeedback(e.target.value)}
+                          placeholder="Tell the planner what to change, then regenerate."
+                        />
+                        <Button mt={2} colorScheme="purple" variant="outline" size="sm" onClick={regeneratePlanTasks} isLoading={regeneratingPlan} isDisabled={!planFeedback.trim()}>
+                          Regenerate From Feedback
+                        </Button>
+                      </Box>
+
+                      <Box>
+                        <Text fontSize="sm" color="gray.700" mb={2}>
+                          Latest proposed tasks: {latestProposedRevision?.items.length ?? 0}
+                        </Text>
+                        <Stack spacing={2}>
+                          {(latestProposedRevision?.items ?? []).map((item) => (
+                            <Box key={item.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                              <Text fontWeight="700">
+                                {item.ordinal}. {item.title} ({item.itemKey})
+                              </Text>
+                              <Text fontSize="sm" color="gray.700" whiteSpace="pre-wrap">
+                                {item.prompt}
+                              </Text>
+                              <Text fontSize="sm" color="gray.600">
+                                depends on: {item.dependsOnItemKeys.length ? item.dependsOnItemKeys.join(", ") : "none"}
+                              </Text>
+                            </Box>
+                          ))}
+                          {!latestProposedRevision?.items.length && <Text color="gray.600">No proposed plan tasks extracted yet.</Text>}
+                        </Stack>
+                      </Box>
+
+                      <Box>
+                        <Text fontSize="sm" color="gray.700" mb={2}>
+                          Approved tasks from this plan: {approvedPlanTasks.length}
+                        </Text>
+                        <Stack spacing={1}>
+                          {approvedPlanTasks.map((approvedTask) => (
+                            <Link key={approvedTask.id} as={RouterLink} color="teal.700" fontWeight="600" to={`/tasks/${approvedTask.id}?tab=info`}>
+                              {approvedTask.title}
+                            </Link>
+                          ))}
+                          {!approvedPlanTasks.length && <Text color="gray.600">No approved tasks yet.</Text>}
+                        </Stack>
+                      </Box>
+                    </Stack>
+                  </Box>
+                )}
                 <Box>
                   <Heading size="sm" mb={2}>
                     Dependencies
@@ -675,54 +837,56 @@ export function TaskDetailPage() {
                   </Code>
                 </Box>
 
-                <Box>
-                  <Heading size="sm" mb={3}>
-                    Merge Audit
-                  </Heading>
-                  <Stack spacing={3} mb={2}>
-                    {mergeRecords.map((record) => (
-                      <Box key={record.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
-                        <Stack direction={{ base: "column", md: "row" }} justify="space-between" align={{ base: "start", md: "center" }}>
-                          <Badge
-                            colorScheme={
-                              record.status === "merged"
-                                ? "green"
-                                : record.status === "conflict"
-                                  ? "orange"
-                                  : record.status === "failed"
-                                    ? "red"
-                                    : "blue"
-                            }
-                          >
-                            {record.status}
-                          </Badge>
-                          <Text fontSize="sm" color="gray.600">
-                            {new Date(record.createdAt).toLocaleString()}
+                {task.mode === "execution" && (
+                  <Box>
+                    <Heading size="sm" mb={3}>
+                      Merge Audit
+                    </Heading>
+                    <Stack spacing={3} mb={2}>
+                      {mergeRecords.map((record) => (
+                        <Box key={record.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                          <Stack direction={{ base: "column", md: "row" }} justify="space-between" align={{ base: "start", md: "center" }}>
+                            <Badge
+                              colorScheme={
+                                record.status === "merged"
+                                  ? "green"
+                                  : record.status === "conflict"
+                                    ? "orange"
+                                    : record.status === "failed"
+                                      ? "red"
+                                      : "blue"
+                              }
+                            >
+                              {record.status}
+                            </Badge>
+                            <Text fontSize="sm" color="gray.600">
+                              {new Date(record.createdAt).toLocaleString()}
+                            </Text>
+                          </Stack>
+                          <Text fontSize="sm" mt={1}>
+                            source: {record.sourceCommitSha.slice(0, 12)} target: {record.targetBaseCommitSha.slice(0, 12)}
                           </Text>
-                        </Stack>
-                        <Text fontSize="sm" mt={1}>
-                          source: {record.sourceCommitSha.slice(0, 12)} target: {record.targetBaseCommitSha.slice(0, 12)}
-                        </Text>
-                        {!!record.mergeCommitSha && (
-                          <Text fontSize="sm" color="green.700">
-                            merge commit: {record.mergeCommitSha.slice(0, 12)}
-                          </Text>
-                        )}
-                        {!!record.conflictSummary && (
-                          <Text fontSize="sm" color="orange.700" whiteSpace="pre-wrap">
-                            conflicts: {record.conflictSummary}
-                          </Text>
-                        )}
-                        {!!record.errorMessage && (
-                          <Text fontSize="sm" color="red.700">
-                            error: {record.errorMessage}
-                          </Text>
-                        )}
-                      </Box>
-                    ))}
-                    {!mergeRecords.length && <Text color="gray.600">No merge records yet.</Text>}
-                  </Stack>
-                </Box>
+                          {!!record.mergeCommitSha && (
+                            <Text fontSize="sm" color="green.700">
+                              merge commit: {record.mergeCommitSha.slice(0, 12)}
+                            </Text>
+                          )}
+                          {!!record.conflictSummary && (
+                            <Text fontSize="sm" color="orange.700" whiteSpace="pre-wrap">
+                              conflicts: {record.conflictSummary}
+                            </Text>
+                          )}
+                          {!!record.errorMessage && (
+                            <Text fontSize="sm" color="red.700">
+                              error: {record.errorMessage}
+                            </Text>
+                          )}
+                        </Box>
+                      ))}
+                      {!mergeRecords.length && <Text color="gray.600">No merge records yet.</Text>}
+                    </Stack>
+                  </Box>
+                )}
 
                 <Box>
                   <Heading size="sm" mb={3}>

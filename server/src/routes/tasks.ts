@@ -107,6 +107,10 @@ function serializeTask(task: TaskRow) {
     taskPrompt: task.task_prompt,
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
+    mode: task.mode,
+    parentPlanTaskId: task.parent_plan_task_id,
+    sourcePlanRevisionId: task.source_plan_revision_id,
+    sourcePlanItemKey: task.source_plan_item_key,
     status: task.status,
     workspacePath: task.workspace_path,
     baseCommitShaAtCreate: task.base_commit_sha_at_create,
@@ -435,9 +439,10 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
     db.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, effective_prompt, ai_command,
+        mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -492,7 +497,7 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
   }
 
   const tasks = db
-    .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC")
+    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
     .all(project.id) as TaskRow[];
 
   res.json({ tasks: tasks.map(serializeTask) });
@@ -705,6 +710,10 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     res.status(404).json({ error: "Task not found" });
     return;
   }
+  if (task.mode === "plan") {
+    res.status(409).json({ error: "Plan tasks cannot be marked merge-ready" });
+    return;
+  }
 
   if (!["in_progress", "waiting_input", "merge_conflict", "merged"].includes(task.status)) {
     res.status(409).json({ error: "Task cannot be marked merge-ready from current state" });
@@ -883,6 +892,10 @@ tasksRouter.post("/tasks/:taskId/merge", async (req, res) => {
   const task = taskForUser(req.params.taskId, req.user.id);
   if (!task) {
     res.status(404).json({ error: "Task not found" });
+    return;
+  }
+  if (task.mode === "plan") {
+    res.status(409).json({ error: "Plan tasks cannot be merged" });
     return;
   }
   if (task.status !== "merge_ready") {
