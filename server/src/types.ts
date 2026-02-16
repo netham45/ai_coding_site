@@ -107,6 +107,7 @@ export type UserRow = {
 export type UserSettingsRow = {
   user_id: string;
   default_ai_command: string;
+  default_ai_commands: string;
   created_at: string;
   updated_at: string;
 };

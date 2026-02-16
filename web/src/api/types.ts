@@ -151,6 +151,7 @@ export type MergeRecord = {
 export type UserSettings = {
   userId: string;
   defaultAiCommand: string;
+  defaultAiCommands: string[];
   createdAt: string;
   updatedAt: string;
 };

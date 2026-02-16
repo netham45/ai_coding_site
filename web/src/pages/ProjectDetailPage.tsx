@@ -25,18 +25,18 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
-import type { Project, Task } from "../api/types";
+import type { Project, Task, UserSettings } from "../api/types";
 import { TaskSidebar } from "../components/TaskSidebar";
 
 type ProjectResponse = { project: Project };
 type TasksResponse = { tasks: Task[] };
 type ProjectIdeStartResponse = { launchUrl: string };
 type ProjectFilesResponse = { files: string[] };
+type SettingsResponse = { settings: UserSettings };
 
 type CreateTaskForm = {
   title: string;
   taskPrompt: string;
-  aiCommand: string;
   autoMerge: boolean;
   dependencyTaskIds: string[];
 };
@@ -58,7 +58,6 @@ type ProjectInstructionsForm = {
 const initialForm: CreateTaskForm = {
   title: "",
   taskPrompt: "",
-  aiCommand: "codex --yolo {prompt}",
   autoMerge: false,
   dependencyTaskIds: []
 };
@@ -70,6 +69,7 @@ const initialPlanForm: CreatePlanForm = {
 };
 
 const NON_SELECTABLE_DEPENDENCY_STATUSES = new Set(["merged", "cancelled", "failed"]);
+const AI_COMMAND_OTHER = "__other__";
 
 const CODING_STANDARD_OPTIONS = [
   { value: "", label: "None selected" },
@@ -90,6 +90,9 @@ export function ProjectDetailPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [form, setForm] = useState<CreateTaskForm>(initialForm);
+  const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>(["codex --yolo {prompt}"]);
+  const [taskAiCommandSelection, setTaskAiCommandSelection] = useState<string>("codex --yolo {prompt}");
+  const [taskAiCommandOverride, setTaskAiCommandOverride] = useState("");
   const [planForm, setPlanForm] = useState<CreatePlanForm>(initialPlanForm);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
     projectPrompt: "",
@@ -126,8 +129,9 @@ export function ProjectDetailPage() {
   const planTasks = useMemo(() => tasks.filter((task) => task.mode === "plan"), [tasks]);
 
   const canCreate = useMemo(() => {
-    return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0;
-  }, [form]);
+    const hasCommand = taskAiCommandSelection === AI_COMMAND_OTHER ? taskAiCommandOverride.trim().length > 0 : true;
+    return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0 && hasCommand;
+  }, [form, taskAiCommandOverride, taskAiCommandSelection]);
   const canCreatePlan = useMemo(() => {
     return planForm.title.trim().length >= 2 && planForm.taskPrompt.trim().length > 0;
   }, [planForm]);
@@ -235,9 +239,10 @@ export function ProjectDetailPage() {
 
   async function loadData() {
     if (!projectId) return;
-    const [projectRes, tasksRes] = await Promise.all([
+    const [projectRes, tasksRes, settingsRes] = await Promise.all([
       api<ProjectResponse>(`/api/projects/${projectId}`),
-      api<TasksResponse>(`/api/projects/${projectId}/tasks`)
+      api<TasksResponse>(`/api/projects/${projectId}/tasks`),
+      api<SettingsResponse>("/api/users/me/settings")
     ]);
     setProject(projectRes.project);
     setInstructionsForm({
@@ -248,6 +253,12 @@ export function ProjectDetailPage() {
       projectOther: projectRes.project.projectOther ?? ""
     });
     setTasks(tasksRes.tasks);
+    const commandOptions = settingsRes.settings.defaultAiCommands?.length
+      ? settingsRes.settings.defaultAiCommands
+      : [settingsRes.settings.defaultAiCommand || "codex --yolo {prompt}"];
+    setTaskAiCommandOptions(commandOptions);
+    setTaskAiCommandSelection(commandOptions[0] || "codex --yolo {prompt}");
+    setTaskAiCommandOverride("");
   }
 
   useEffect(() => {
@@ -303,6 +314,11 @@ export function ProjectDetailPage() {
     if (!projectId) return;
 
     const dependencyTaskIds = [...new Set(dependencySelections.filter((id) => id))];
+    const selectedAiCommand = taskAiCommandSelection === AI_COMMAND_OTHER ? taskAiCommandOverride.trim() : taskAiCommandSelection;
+    if (!selectedAiCommand) {
+      toast({ status: "error", title: "AI command override is required" });
+      return;
+    }
 
     setLoading(true);
     try {
@@ -311,12 +327,14 @@ export function ProjectDetailPage() {
         body: JSON.stringify({
           title: form.title,
           taskPrompt: form.taskPrompt,
-          aiCommand: form.aiCommand,
+          aiCommand: selectedAiCommand,
           autoMerge: form.autoMerge,
           dependencyTaskIds
         })
       });
       setForm(initialForm);
+      setTaskAiCommandSelection(taskAiCommandOptions[0] || "codex --yolo {prompt}");
+      setTaskAiCommandOverride("");
       setDependencySelections([""]);
       await loadData();
       toast({ status: "success", title: "Task created" });
@@ -428,7 +446,32 @@ export function ProjectDetailPage() {
                   </FormControl>
                   <FormControl isRequired>
                     <FormLabel>AI Command</FormLabel>
-                    <Input value={form.aiCommand} onChange={(e) => setForm((x) => ({ ...x, aiCommand: e.target.value }))} />
+                    <Stack spacing={2}>
+                      <Select
+                        value={taskAiCommandSelection}
+                        onChange={(e) => {
+                          const selected = e.target.value;
+                          setTaskAiCommandSelection(selected);
+                          if (selected !== AI_COMMAND_OTHER) {
+                            setTaskAiCommandOverride("");
+                          }
+                        }}
+                      >
+                        {taskAiCommandOptions.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                        <option value={AI_COMMAND_OTHER}>Other</option>
+                      </Select>
+                      {taskAiCommandSelection === AI_COMMAND_OTHER && (
+                        <Input
+                          placeholder="Enter custom AI command"
+                          value={taskAiCommandOverride}
+                          onChange={(e) => setTaskAiCommandOverride(e.target.value)}
+                        />
+                      )}
+                    </Stack>
                   </FormControl>
                   <FormControl>
                     <FormLabel>Dependencies</FormLabel>
