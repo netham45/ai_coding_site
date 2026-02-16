@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { authMiddleware } from "./middleware/auth.js";
 import { db as appDb } from "./db/index.js";
 import { plansRouter } from "./routes/plans.js";
@@ -12,15 +13,83 @@ import { endpointWorkerHandler, wrapRouterHandlersInAsyncWorkers } from "./middl
 import { workspaceRoot } from "./utils/paths.js";
 import { collectProjectDbDiagnosticsHealth } from "./db/projectDbDiagnostics.js";
 import { collectProjectMigrationHealth } from "./db/projectDataMigration.js";
+import { logEndpoint } from "./utils/backendLogger.js";
+
+function redactHeaders(headers: express.Request["headers"]): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lowered = key.toLowerCase();
+    if (lowered === "authorization" || lowered === "cookie" || lowered === "set-cookie") {
+      redacted[key] = "[REDACTED]";
+      continue;
+    }
+    redacted[key] = value;
+  }
+  return redacted;
+}
 
 export function createApp(): express.Express {
   const app = express();
 
   app.use(cors());
   app.use(express.json({ limit: "2mb" }));
+  app.use((req, res, next) => {
+    const requestId = randomUUID();
+    const startedAt = process.hrtime.bigint();
+    const startedAtIso = new Date().toISOString();
+
+    logEndpoint("http.request.start", {
+      requestId,
+      startedAt: startedAtIso,
+      method: req.method,
+      originalUrl: req.originalUrl,
+      path: req.path,
+      query: req.query,
+      params: req.params,
+      ip: req.ip,
+      userAgent: req.header("user-agent"),
+      headers: redactHeaders(req.headers),
+      body: req.body
+    });
+
+    res.on("finish", () => {
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      logEndpoint("http.request.finish", {
+        requestId,
+        finishedAt: new Date().toISOString(),
+        startedAt: startedAtIso,
+        durationMs,
+        method: req.method,
+        originalUrl: req.originalUrl,
+        routePath: req.route?.path,
+        statusCode: res.statusCode,
+        statusMessage: res.statusMessage,
+        contentLength: res.getHeader("content-length"),
+        userId: req.user?.id
+      });
+    });
+
+    res.on("close", () => {
+      if (res.writableEnded) {
+        return;
+      }
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      logEndpoint("http.request.aborted", {
+        requestId,
+        abortedAt: new Date().toISOString(),
+        startedAt: startedAtIso,
+        durationMs,
+        method: req.method,
+        originalUrl: req.originalUrl,
+        statusCode: res.statusCode
+      });
+    });
+
+    next();
+  });
   app.use(authMiddleware);
 
-  app.get("/api/health", endpointWorkerHandler((_req, res) => {
+  app.get("/api/health", endpointWorkerHandler((_req: express.Request, res: express.Response) => {
     res.json({
       ok: true,
       diagnostics: {
@@ -39,17 +108,22 @@ export function createApp(): express.Express {
   const webIndex = path.join(webDist, "index.html");
   if (fs.existsSync(webIndex)) {
     app.use(express.static(webDist));
-    app.get(/^\/(?!api).*/, endpointWorkerHandler((_req, res) => {
+    app.get(/^\/(?!api).*/, endpointWorkerHandler((_req: express.Request, res: express.Response) => {
       res.sendFile(webIndex);
     }));
   } else {
-    app.get("/", endpointWorkerHandler((_req, res) => {
+    app.get("/", endpointWorkerHandler((_req: express.Request, res: express.Response) => {
       res.status(200).send("Frontend not built yet. Run `npm run build -w web` or `npm run dev -w web`.");
     }));
   }
 
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const message = String((error as Error)?.message ?? "Unexpected server error");
+    logEndpoint("http.request.error", {
+      error: error instanceof Error
+        ? { name: error.name, message: error.message, stack: error.stack }
+        : String(error)
+    });
     res.status(500).json({ error: message });
   });
 
