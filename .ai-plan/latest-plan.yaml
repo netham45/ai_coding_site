@@ -1,0 +1,121 @@
+tasks:
+  - id: split-db-01
+    title: Introduce app/project DB architecture
+    prompt: >-
+      Create a new DB architecture where global data stays in `data/app.sqlite` and
+      each project has its own DB at `<project.base_path>/.ai-coding/project.sqlite`.
+      Add connection managers/helpers in `server/src/db/` for opening app DB and
+      project DBs, enabling WAL/foreign_keys/busy_timeout, validating project DB
+      metadata (`project_id`, `schema_version`, timestamps), and caching/reusing
+      handles safely.
+
+  - id: split-db-02
+    title: Split migrations into app and project schemas
+    prompt: >-
+      Refactor migrations into separate app and project migration sets. Keep
+      `users`, `user_settings`, `projects`, and `project_members` in the app schema.
+      Move `tasks`, `task_dependencies`, `task_state_transitions`, `task_sessions`,
+      `plan_revisions`, `plan_revision_items`, `plan_revision_item_dependencies`,
+      `ide_instances`, `merge_records`, and `events` to the project schema.
+      Add a project-local config table for prompt/config fields currently stored on
+      `projects` (`project_prompt`, `project_rules`, `coding_standard`,
+      `coding_standard_other`, `project_other`).
+    depends_on:
+      - split-db-01
+
+  - id: split-db-03
+    title: Bootstrap project DB lifecycle on project create/load
+    prompt: >-
+      Update project lifecycle so project creation writes app DB first, then creates
+      `<project.base_path>/.ai-coding/`, initializes/migrates project DB, and seeds
+      project config defaults. Add load-time behavior for missing/corrupt DBs:
+      create only for first-time initialization, otherwise fail closed with explicit
+      errors like `PROJECT_DB_UNAVAILABLE`/`PROJECT_DB_CORRUPT`.
+    depends_on:
+      - split-db-01
+      - split-db-02
+
+  - id: split-db-04
+    title: Migrate data from monolith DB into per-project DBs
+    prompt: >-
+      Implement an idempotent migration routine that iterates projects in app DB,
+      creates/migrates each project DB, copies project-owned entities into that DB,
+      copies project prompt/config fields into project config, verifies row counts
+      per table (and optional checksums), and records migration status. Only remove
+      migrated columns/data from app-owned scope after verification.
+    depends_on:
+      - split-db-02
+      - split-db-03
+
+  - id: split-db-05
+    title: Refactor project routes to mixed app/project reads
+    prompt: >-
+      Update `server/src/routes/projects.ts` to keep project list/membership/global
+      metadata in app DB while reading/writing prompt/config fields from project DB.
+      Ensure request auth still checks `project_members` in app DB before any
+      project DB access. Update serialization/types so project config values come
+      from project-local config.
+    depends_on:
+      - split-db-03
+      - split-db-04
+
+  - id: split-db-06
+    title: Refactor task and plan routes to project DB ownership
+    prompt: >-
+      Update `server/src/routes/tasks.ts` and `server/src/routes/plans.ts` so all
+      task/plan/session/dependency/transition operations execute against the target
+      project DB, never app DB fallback. Keep membership/authorization checks in app
+      DB before opening project DB, then execute project-scoped transactions in the
+      project DB handle.
+    depends_on:
+      - split-db-03
+      - split-db-04
+
+  - id: split-db-07
+    title: Move event and runtime persistence to project DB
+    prompt: >-
+      Refactor services that write/read runtime state (`events`, queue/runtime
+      helpers, IDE/task session persistence) so project-scoped records are stored in
+      the owning project DB. Adjust service function signatures to accept
+      project-aware DB context where needed and preserve existing behavior.
+    depends_on:
+      - split-db-06
+
+  - id: split-db-08
+    title: Add import portability behavior for cloned repos
+    prompt: >-
+      Ensure a project cloned from git with `.ai-coding/project.sqlite` can be
+      attached on another server instance: detect existing project DB metadata,
+      validate project ID consistency, and register/import project task+plan history
+      without destructive resets. Define conflict handling when app DB already has a
+      project with same path/slug/id.
+    depends_on:
+      - split-db-03
+      - split-db-06
+
+  - id: split-db-09
+    title: Add feature flag, cutover, and rollback strategy
+    prompt: >-
+      Implement a feature flag for split persistence to support staged rollout:
+      (1) read validation phase, (2) write cutover to project DB, (3) cleanup.
+      Provide rollback behavior that can temporarily route reads/writes back to
+      monolith structures if migration verification fails.
+    depends_on:
+      - split-db-04
+      - split-db-06
+      - split-db-07
+
+  - id: split-db-10
+    title: Expand tests and operational diagnostics
+    prompt: >-
+      Add integration tests covering app-vs-project ownership boundaries,
+      authorization checks, migration correctness, missing/corrupt project DB
+      behavior, and portability import flows. Add structured logs/health diagnostics
+      for per-project DB open/migration/validation failures and document backup and
+      recovery procedures.
+    depends_on:
+      - split-db-05
+      - split-db-06
+      - split-db-07
+      - split-db-08
+      - split-db-09
