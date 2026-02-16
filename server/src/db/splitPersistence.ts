@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
 import { getProjectDb, isProjectDbError } from "./projectDb.js";
+import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
+import { logWarn } from "../utils/structuredLog.js";
 
 export const SPLIT_PERSISTENCE_PHASES = ["monolith", "read_validation", "write_cutover", "cleanup"] as const;
 export type SplitPersistencePhase = (typeof SPLIT_PERSISTENCE_PHASES)[number];
@@ -116,6 +118,18 @@ export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): Re
       if (!isProjectDbError(error) || !monolithSupported) {
         throw error;
       }
+      const diagnostic = recordProjectDbFailure({
+        stage: "resolve",
+        code: error.code,
+        projectId: params.projectId,
+        basePath: params.basePath,
+        message: error.message
+      });
+      logWarn("split_persistence.fallback_to_monolith", {
+        ...diagnostic,
+        phase,
+        migrationStatus
+      });
     }
   }
 
@@ -125,4 +139,9 @@ export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): Re
     phase,
     migrationStatus
   };
+}
+
+export function resetSplitPersistenceCachesForTests(): void {
+  monolithTableSupportCache = undefined;
+  migrationTableSupportCache = undefined;
 }

@@ -2,7 +2,9 @@ import type Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "../utils/time.js";
+import { logWarn } from "../utils/structuredLog.js";
 import { projectBaselineMigration } from "./migrations.js";
+import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
@@ -93,6 +95,61 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
+function tableExists(db: Database.Database, table: string): boolean {
+  const row = db
+    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+    .get(table) as { ok: number } | undefined;
+  return Boolean(row?.ok);
+}
+
+function validateProjectMetadataRow(existing: ProjectDbMetadata, expectedProjectId?: string): ProjectDbMetadata {
+  if (!existing.project_id || typeof existing.project_id !== "string") {
+    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata is invalid: project_id is required");
+  }
+  if (expectedProjectId && existing.project_id !== expectedProjectId) {
+    throw new ProjectDbError(
+      "PROJECT_DB_CORRUPT",
+      `Project database metadata mismatch: expected project_id=${expectedProjectId}, found project_id=${existing.project_id}`
+    );
+  }
+  if (existing.schema_version !== PROJECT_DB_SCHEMA_VERSION) {
+    throw new ProjectDbError(
+      "PROJECT_DB_CORRUPT",
+      `Project database schema version mismatch: expected ${PROJECT_DB_SCHEMA_VERSION}, found ${existing.schema_version}`
+    );
+  }
+  if (!isValidIsoTimestamp(existing.created_at) || !isValidIsoTimestamp(existing.updated_at)) {
+    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata timestamps are invalid");
+  }
+  if (Date.parse(existing.updated_at) < Date.parse(existing.created_at)) {
+    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata timestamps are invalid: updated_at is older than created_at");
+  }
+  return existing;
+}
+
+function logProjectDbFailure(params: {
+  stage: "open" | "validation";
+  code: ProjectDbErrorCode;
+  message: string;
+  projectId: string;
+  basePath: string;
+  dbPath: string;
+  error?: unknown;
+}): void {
+  const diagnostic = recordProjectDbFailure({
+    stage: params.stage,
+    code: params.code,
+    projectId: params.projectId,
+    basePath: params.basePath,
+    dbPath: params.dbPath,
+    message: params.message
+  });
+  logWarn("project_db.failure", {
+    ...diagnostic,
+    error: params.error ? errorMessage(params.error) : undefined
+  });
+}
+
 function readValidatedProjectMetadata(
   db: Database.Database,
   expectedProjectId: string,
@@ -130,29 +187,7 @@ function readValidatedProjectMetadata(
     };
   }
 
-  if (existing.project_id !== expectedProjectId) {
-    throw new ProjectDbError(
-      "PROJECT_DB_CORRUPT",
-      `Project database metadata mismatch: expected project_id=${expectedProjectId}, found project_id=${existing.project_id}`
-    );
-  }
-
-  if (existing.schema_version !== PROJECT_DB_SCHEMA_VERSION) {
-    throw new ProjectDbError(
-      "PROJECT_DB_CORRUPT",
-      `Project database schema version mismatch: expected ${PROJECT_DB_SCHEMA_VERSION}, found ${existing.schema_version}`
-    );
-  }
-
-  if (!isValidIsoTimestamp(existing.created_at) || !isValidIsoTimestamp(existing.updated_at)) {
-    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata timestamps are invalid");
-  }
-
-  if (Date.parse(existing.updated_at) < Date.parse(existing.created_at)) {
-    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata timestamps are invalid: updated_at is older than created_at");
-  }
-
-  return existing;
+  return validateProjectMetadataRow(existing, expectedProjectId);
 }
 
 function ensureProjectConfigRow(
@@ -249,6 +284,19 @@ function validateCachedHandle(params: {
       metadata
     };
   } catch (error) {
+    const message = isProjectDbError(error)
+      ? error.message
+      : `Project database validation failed: ${errorMessage(error)}`;
+    const code = isProjectDbError(error) ? error.code : "PROJECT_DB_CORRUPT";
+    logProjectDbFailure({
+      stage: "validation",
+      code,
+      message,
+      projectId: params.projectId,
+      basePath: params.cached.basePath,
+      dbPath: params.dbPath,
+      error
+    });
     closeProjectDb({ dbPath: params.dbPath });
     if (isProjectDbError(error)) {
       throw error;
@@ -285,6 +333,15 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
 
   const dbExists = fs.existsSync(dbPath);
   if (!dbExists && !allowCreate) {
+    const message = `Project database is unavailable at ${dbPath}`;
+    logProjectDbFailure({
+      stage: "open",
+      code: "PROJECT_DB_UNAVAILABLE",
+      message,
+      projectId,
+      basePath,
+      dbPath
+    });
     throw new ProjectDbError("PROJECT_DB_UNAVAILABLE", `Project database is unavailable at ${dbPath}`);
   }
   if (allowCreate) {
@@ -296,8 +353,28 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
     db = openSqliteDatabase(dbPath);
   } catch (error) {
     if (!fs.existsSync(dbPath)) {
+      const message = `Project database is unavailable at ${dbPath}`;
+      logProjectDbFailure({
+        stage: "open",
+        code: "PROJECT_DB_UNAVAILABLE",
+        message,
+        projectId,
+        basePath,
+        dbPath,
+        error
+      });
       throw new ProjectDbError("PROJECT_DB_UNAVAILABLE", `Project database is unavailable at ${dbPath}`);
     }
+    const message = `Project database could not be opened: ${errorMessage(error)}`;
+    logProjectDbFailure({
+      stage: "open",
+      code: "PROJECT_DB_CORRUPT",
+      message,
+      projectId,
+      basePath,
+      dbPath,
+      error
+    });
     throw new ProjectDbError("PROJECT_DB_CORRUPT", `Project database could not be opened: ${errorMessage(error)}`);
   }
 
@@ -318,6 +395,19 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
       metadata
     };
   } catch (error) {
+    const message = isProjectDbError(error)
+      ? error.message
+      : `Project database initialization failed: ${errorMessage(error)}`;
+    const code = isProjectDbError(error) ? error.code : "PROJECT_DB_CORRUPT";
+    logProjectDbFailure({
+      stage: "validation",
+      code,
+      message,
+      projectId,
+      basePath,
+      dbPath,
+      error
+    });
     db.close();
     if (isProjectDbError(error)) {
       throw error;
@@ -328,6 +418,45 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
 
 export function getProjectDb(params: { projectId: string; basePath: string }): Database.Database {
   return ensureProjectDb({ ...params, initializeIfMissing: false }).db;
+}
+
+export function detectProjectDbMetadata(params: { basePath: string }): ProjectDbMetadata | null {
+  const basePath = path.resolve(params.basePath);
+  const dbPath = getProjectDbPath(basePath);
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+
+  let db: Database.Database;
+  try {
+    db = openSqliteDatabase(dbPath);
+  } catch (error) {
+    throw new ProjectDbError("PROJECT_DB_CORRUPT", `Project database could not be opened: ${errorMessage(error)}`);
+  }
+
+  try {
+    if (!tableExists(db, "project_metadata")) {
+      return null;
+    }
+    const rowCount = db.prepare("SELECT COUNT(*) AS count FROM project_metadata").get() as { count: number };
+    if (rowCount.count === 0) {
+      return null;
+    }
+    if (rowCount.count > 1) {
+      throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project database metadata is invalid: expected exactly one metadata row");
+    }
+    const existing = db
+      .prepare("SELECT project_id, schema_version, created_at, updated_at FROM project_metadata LIMIT 1")
+      .get() as ProjectDbMetadata | undefined;
+    if (!existing) {
+      return null;
+    }
+    return validateProjectMetadataRow(existing);
+  } finally {
+    if (db.open) {
+      db.close();
+    }
+  }
 }
 
 export function getProjectConfig(params: { projectId: string; basePath: string }): ProjectConfigRow {

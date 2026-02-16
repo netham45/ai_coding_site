@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "rm -rf .tmp/test-data .tmp/test-repos && mkdir -p .tmp/test-data .tmp/test-repos && AI_CODING_DATA_ROOT=.tmp/test-data AI_CODING_REPOS_ROOT=.tmp/test-repos tsx --test src/integration.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

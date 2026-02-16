@@ -20,6 +20,7 @@ AI Coding Site is a local-first web app for running AI coding tasks against Git 
 - [Usage flow](#usage-flow)
 - [API overview](#api-overview)
 - [Repository layout](#repository-layout)
+- [Backup and recovery](#backup-and-recovery)
 - [Troubleshooting](#troubleshooting)
 - [Development notes](#development-notes)
 
@@ -133,6 +134,8 @@ Server environment variables:
 - `PORT`: API port. Default: `3001`
 - `TERMINAL_TOKEN_SECRET`: HMAC secret for terminal WS tokens. Default: `dev-terminal-secret`
 - `TERMINAL_TOKEN_TTL_SECONDS`: terminal token TTL in seconds. Default: `300`
+- `AI_CODING_DATA_ROOT`: override app DB root. Default: `<workspace>/data`
+- `AI_CODING_REPOS_ROOT`: override repos root. Default: `<workspace>/repos`
 
 Example:
 
@@ -217,6 +220,8 @@ When `web/dist` exists, the server also serves the frontend for non-API routes.
 Health:
 
 - `GET /api/health`
+  - includes `diagnostics.projectDb` open/validation/migration failure counters
+  - includes `diagnostics.migration` status counts from `project_data_migrations`
 
 Projects:
 
@@ -289,6 +294,10 @@ WebSocket:
 ├── repos/                 # cloned project bases and task workspaces (runtime)
 └── data/                  # sqlite database (runtime)
 ```
+
+## Backup and recovery
+
+- Runbook: `docs/backup-and-recovery.md`
 
 ## Troubleshooting
 
