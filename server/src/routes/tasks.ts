@@ -18,7 +18,6 @@ import {
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { sendTaskRuntimeInput, startTaskRuntime, stopTaskRuntime } from "../services/runtime.js";
-import { hasSession, killSession } from "../services/tmux.js";
 import { issueTerminalToken } from "../services/terminalToken.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -910,10 +909,6 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
 
     const sessions = activeSessions(task.id);
     for (const session of sessions) {
-      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
-      if (alive) {
-        await killSession(session.tmux_socket_path, session.tmux_session_name);
-      }
       db.prepare(
         "UPDATE task_sessions SET status = 'stopped', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'task_rerun_reset') WHERE id = ?"
       ).run(nowIso(), nowIso(), session.id);
