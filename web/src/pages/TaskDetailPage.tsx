@@ -1,4 +1,28 @@
-import { Badge, Box, Button, Checkbox, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, Textarea, useToast } from "@chakra-ui/react";
+import {
+  Accordion,
+  AccordionButton,
+  AccordionIcon,
+  AccordionItem,
+  AccordionPanel,
+  Badge,
+  Box,
+  Button,
+  Checkbox,
+  Code,
+  Flex,
+  Heading,
+  Input,
+  Link,
+  Stack,
+  Tab,
+  TabList,
+  TabPanel,
+  TabPanels,
+  Tabs,
+  Text,
+  Textarea,
+  useToast
+} from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
 import { Terminal } from "@xterm/xterm";
@@ -48,6 +72,12 @@ type TerminalMessage =
   | { type: "status"; sessionStatus: string; taskStatus?: string }
   | { type: "error"; message: string }
   | { type: "ack" };
+
+type PlanItemDraft = {
+  title: string;
+  description: string;
+  prompt: string;
+};
 
 const TASK_STATUSES: TaskStatus[] = ["queued", "in_progress", "waiting_input", "merge_ready", "merged", "cancelled", "failed", "merge_conflict"];
 
@@ -99,6 +129,7 @@ export function TaskDetailPage() {
   const [regeneratingPlan, setRegeneratingPlan] = useState(false);
   const [approvingPlan, setApprovingPlan] = useState(false);
   const [autoMergeItemKeys, setAutoMergeItemKeys] = useState<string[]>([]);
+  const [planItemDrafts, setPlanItemDrafts] = useState<Record<string, PlanItemDraft>>({});
 
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -545,6 +576,37 @@ export function TaskDetailPage() {
 
   async function approvePlanTasks() {
     if (!entityId) return;
+    const proposedItems = latestProposedRevision?.items ?? [];
+    const taskEdits = proposedItems.map((item) => {
+      const draft = planItemDrafts[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" };
+      return {
+        itemKey: item.itemKey,
+        title: draft.title.trim(),
+        description: draft.description.trim(),
+        prompt: draft.prompt.trim()
+      };
+    });
+
+    const invalidTitle = taskEdits.find((item) => item.title.length < 2);
+    if (invalidTitle) {
+      toast({
+        status: "warning",
+        title: "Title is too short",
+        description: `Task ${invalidTitle.itemKey} needs a title with at least 2 characters.`
+      });
+      return;
+    }
+
+    const invalidDescription = taskEdits.find((item) => item.description.length < 1);
+    if (invalidDescription) {
+      toast({
+        status: "warning",
+        title: "Description is required",
+        description: `Task ${invalidDescription.itemKey} needs a description before approval.`
+      });
+      return;
+    }
+
     const confirmed = window.confirm(
       `Approve all tasks from the latest proposed plan revision?\n\nAuto-merge enabled for ${autoMergeItemKeys.length} task(s).`
     );
@@ -553,7 +615,7 @@ export function TaskDetailPage() {
     try {
       await api<{ approvedTasks: Task[] }>(`/api/plans/${entityId}/approve`, {
         method: "POST",
-        body: JSON.stringify({ autoMergeItemKeys })
+        body: JSON.stringify({ autoMergeItemKeys, taskEdits })
       });
       await loadTask();
       if (task?.projectId) {
@@ -571,6 +633,24 @@ export function TaskDetailPage() {
   const latestProposedItemKeys = (latestProposedRevision?.items ?? []).map((item) => item.itemKey);
   const allAutoMergeSelected = latestProposedItemKeys.length > 0 && latestProposedItemKeys.every((itemKey) => autoMergeItemKeys.includes(itemKey));
   const someAutoMergeSelected = autoMergeItemKeys.length > 0 && !allAutoMergeSelected;
+  const getPlanItemDraft = (itemKey: string): PlanItemDraft | undefined => planItemDrafts[itemKey.toLowerCase()];
+
+  useEffect(() => {
+    const items = latestProposedRevision?.items ?? [];
+    if (!items.length) {
+      setPlanItemDrafts({});
+      return;
+    }
+    const next: Record<string, PlanItemDraft> = {};
+    for (const item of items) {
+      next[item.itemKey.toLowerCase()] = {
+        title: item.title,
+        description: item.prompt,
+        prompt: ""
+      };
+    }
+    setPlanItemDrafts(next);
+  }, [latestProposedRevision?.id]);
 
   useEffect(() => {
     if (!latestProposedItemKeys.length) {
@@ -827,31 +907,107 @@ export function TaskDetailPage() {
                         )}
                         <Stack spacing={2}>
                           {(latestProposedRevision?.items ?? []).map((item) => (
-                            <Box key={item.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
-                              <Text fontWeight="700">
-                                {item.ordinal}. {item.title} ({item.itemKey})
-                              </Text>
-                              <Checkbox
-                                mt={2}
-                                isChecked={autoMergeItemKeys.includes(item.itemKey)}
-                                onChange={(e) => {
-                                  setAutoMergeItemKeys((current) => {
-                                    if (e.target.checked) {
-                                      return current.includes(item.itemKey) ? current : [...current, item.itemKey];
-                                    }
-                                    return current.filter((value) => value !== item.itemKey);
-                                  });
-                                }}
-                              >
-                                Enable Auto-merge
-                              </Checkbox>
-                              <Text fontSize="sm" color="gray.700" whiteSpace="pre-wrap">
-                                {item.prompt}
-                              </Text>
-                              <Text fontSize="sm" color="gray.600">
-                                depends on: {item.dependsOnItemKeys.length ? item.dependsOnItemKeys.join(", ") : "none"}
-                              </Text>
-                            </Box>
+                            <Accordion key={item.id} allowToggle>
+                              <AccordionItem border="1px solid" borderColor="blackAlpha.200" borderRadius="md" overflow="hidden">
+                                <AccordionButton px={4} py={3} _hover={{ bg: "gray.50" }}>
+                                  <Flex direction="column" align="start" flex="1" gap={1}>
+                                    <Text fontWeight="700">
+                                      {item.ordinal}. {getPlanItemDraft(item.itemKey)?.title || item.title}
+                                    </Text>
+                                    <Text fontSize="sm" color="gray.600">
+                                      id: {item.itemKey}
+                                    </Text>
+                                    <Text fontSize="sm" color="gray.600">
+                                      depends on: {item.dependsOnItemKeys.length ? item.dependsOnItemKeys.join(", ") : "none"}
+                                    </Text>
+                                  </Flex>
+                                  <AccordionIcon />
+                                </AccordionButton>
+                                <AccordionPanel pt={0} pb={4}>
+                                  <Stack spacing={3}>
+                                    <Checkbox
+                                      isChecked={autoMergeItemKeys.includes(item.itemKey)}
+                                      onChange={(e) => {
+                                        setAutoMergeItemKeys((current) => {
+                                          if (e.target.checked) {
+                                            return current.includes(item.itemKey) ? current : [...current, item.itemKey];
+                                          }
+                                          return current.filter((value) => value !== item.itemKey);
+                                        });
+                                      }}
+                                    >
+                                      Enable Auto-merge
+                                    </Checkbox>
+                                    <Box>
+                                      <Text fontSize="sm" color="gray.700" mb={1}>
+                                        Title
+                                      </Text>
+                                      <Input
+                                        value={getPlanItemDraft(item.itemKey)?.title ?? item.title}
+                                        onChange={(e) => {
+                                          const nextTitle = e.target.value;
+                                          setPlanItemDrafts((current) => ({
+                                            ...current,
+                                            [item.itemKey.toLowerCase()]: {
+                                              ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
+                                              title: nextTitle
+                                            }
+                                          }));
+                                        }}
+                                        placeholder="Task title"
+                                      />
+                                    </Box>
+                                    <Box>
+                                      <Text fontSize="sm" color="gray.700" mb={1}>
+                                        Description
+                                      </Text>
+                                      <Textarea
+                                        rows={4}
+                                        value={getPlanItemDraft(item.itemKey)?.description ?? item.prompt}
+                                        onChange={(e) => {
+                                          const nextDescription = e.target.value;
+                                          setPlanItemDrafts((current) => ({
+                                            ...current,
+                                            [item.itemKey.toLowerCase()]: {
+                                              ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
+                                              description: nextDescription
+                                            }
+                                          }));
+                                        }}
+                                        placeholder="Task description"
+                                      />
+                                    </Box>
+                                    <Accordion allowToggle>
+                                      <AccordionItem border="1px solid" borderColor="blackAlpha.100" borderRadius="md">
+                                        <AccordionButton _hover={{ bg: "gray.50" }}>
+                                          <Box flex="1" textAlign="left" fontSize="sm" fontWeight="600">
+                                            Prompt
+                                          </Box>
+                                          <AccordionIcon />
+                                        </AccordionButton>
+                                        <AccordionPanel pt={0}>
+                                          <Textarea
+                                            rows={5}
+                                            value={getPlanItemDraft(item.itemKey)?.prompt ?? ""}
+                                            onChange={(e) => {
+                                              const nextPrompt = e.target.value;
+                                              setPlanItemDrafts((current) => ({
+                                                ...current,
+                                                [item.itemKey.toLowerCase()]: {
+                                                  ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
+                                                  prompt: nextPrompt
+                                                }
+                                              }));
+                                            }}
+                                            placeholder="Optional extra implementation prompt"
+                                          />
+                                        </AccordionPanel>
+                                      </AccordionItem>
+                                    </Accordion>
+                                  </Stack>
+                                </AccordionPanel>
+                              </AccordionItem>
+                            </Accordion>
                           ))}
                           {!latestProposedRevision?.items.length && <Text color="gray.600">No proposed plan tasks extracted yet.</Text>}
                         </Stack>

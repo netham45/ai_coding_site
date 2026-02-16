@@ -31,7 +31,18 @@ const regenerateSchema = z.object({
 });
 
 const approvePlanSchema = z.object({
-  autoMergeItemKeys: z.array(z.string().min(1).max(200)).max(1000).optional()
+  autoMergeItemKeys: z.array(z.string().min(1).max(200)).max(1000).optional(),
+  taskEdits: z
+    .array(
+      z.object({
+        itemKey: z.string().min(1).max(200),
+        title: z.string().min(2).max(160),
+        description: z.string().min(1).max(12000),
+        prompt: z.string().max(12000).optional()
+      })
+    )
+    .max(1000)
+    .optional()
 });
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
@@ -522,6 +533,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
 
   const itemIdToDeps = new Map<string, string[]>();
   const autoMergeItemKeys = new Set((parsed.data.autoMergeItemKeys ?? []).map((key) => key.toLowerCase()));
+  const taskEditsByItemKey = new Map(
+    (parsed.data.taskEdits ?? []).map((edit) => [edit.itemKey.toLowerCase(), edit])
+  );
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
       itemIdToDeps.set(row.revision_item_id, []);
@@ -579,6 +593,12 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     db.prepare("UPDATE plan_revisions SET status = 'approved', approved_at = ? WHERE id = ?").run(createdAt, latestRevision.id);
 
     for (const row of taskRows) {
+      const edit = taskEditsByItemKey.get(row.item.item_key.toLowerCase());
+      const title = edit?.title.trim() || row.item.title;
+      const description = edit?.description.trim() || row.item.prompt;
+      const prompt = edit?.prompt?.trim() ?? "";
+      const taskPrompt = [description, prompt].filter(Boolean).join("\n\n");
+
       db.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, effective_prompt, ai_command,
@@ -590,9 +610,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       ).run(
         row.taskId,
         project.id,
-        row.item.title,
-        row.item.prompt,
-        buildEffectivePrompt(project, row.item.prompt),
+        title,
+        taskPrompt,
+        buildEffectivePrompt(project, taskPrompt),
         resolveAiCommand(undefined, req.user.id),
         autoMergeItemKeys.has(row.item.item_key.toLowerCase()) ? 1 : 0,
         plan.id,
