@@ -10,7 +10,7 @@ import type { TaskSessionRow } from "../types.js";
 type WsPayload =
   | { type: "hello"; taskId: string; sessionId: string }
   | { type: "output"; data: string; reset?: boolean; cursorX?: number; cursorY?: number }
-  | { type: "status"; sessionStatus: string }
+  | { type: "status"; sessionStatus: string; taskStatus: string }
   | { type: "error"; message: string }
   | { type: "ack" };
 
@@ -18,6 +18,16 @@ function latestSession(taskId: string): TaskSessionRow | undefined {
   return db
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as TaskSessionRow | undefined;
+}
+
+function taskStatus(taskId: string): string | undefined {
+  const row = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
+  return row?.status;
+}
+
+function sessionStatus(sessionId: string): string | undefined {
+  const row = db.prepare("SELECT status FROM task_sessions WHERE id = ?").get(sessionId) as { status: string } | undefined;
+  return row?.status;
 }
 
 function canAccessTask(taskId: string, userId: string): boolean {
@@ -84,7 +94,22 @@ export function createTerminalGateway(server: HttpServer): void {
 
     let lastFrame = "";
     let lastCursor = { x: -1, y: -1 };
+    let lastTaskStatus = "";
+    let lastSessionStatus = "";
+
+    const publishStatus = (force = false) => {
+      const currentTaskStatus = taskStatus(meta.taskId) ?? "unknown";
+      const currentSessionStatus = sessionStatus(session.id) ?? "unknown";
+      if (!force && currentTaskStatus === lastTaskStatus && currentSessionStatus === lastSessionStatus) {
+        return;
+      }
+      sendJson(ws, { type: "status", taskStatus: currentTaskStatus, sessionStatus: currentSessionStatus });
+      lastTaskStatus = currentTaskStatus;
+      lastSessionStatus = currentSessionStatus;
+    };
+
     sendJson(ws, { type: "hello", taskId: meta.taskId, sessionId: session.id });
+    publishStatus(true);
     recordEvent({
       taskId: meta.taskId,
       sessionId: session.id,
@@ -94,6 +119,7 @@ export function createTerminalGateway(server: HttpServer): void {
 
     const streamTick = async () => {
       try {
+        publishStatus();
         const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
         if (!alive) {
           sendJson(ws, { type: "error", message: "Session ended" });
@@ -124,6 +150,7 @@ export function createTerminalGateway(server: HttpServer): void {
     // Always snapshot tmux on attach and reset the terminal with the full buffer.
     (async () => {
       try {
+        publishStatus();
         const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
         if (!alive) {
           sendJson(ws, { type: "error", message: "Session ended" });
@@ -163,6 +190,7 @@ export function createTerminalGateway(server: HttpServer): void {
         await sendRawInput(session.tmux_socket_path, session.tmux_session_name, payload);
         // Push output immediately after input to reduce perceived typing latency.
         await streamTick();
+        publishStatus();
         sendJson(ws, { type: "ack" });
       } catch (error: any) {
         sendJson(ws, { type: "error", message: String(error?.message ?? "input handling failed") });
