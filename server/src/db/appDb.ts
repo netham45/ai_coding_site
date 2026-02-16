@@ -9,6 +9,7 @@ import { runProjectDataMigrationBackfill } from "./projectDataMigration.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
 const DEFAULT_AI_COMMAND = "codex --yolo {prompt}";
+const DEFAULT_AI_COMMANDS_JSON = JSON.stringify([DEFAULT_AI_COMMAND]);
 const APP_DB_FILENAME = "app.sqlite";
 
 let appDb: Database.Database | undefined;
@@ -26,6 +27,12 @@ function ensureColumn(db: Database.Database, table: string, column: string, alte
 
 function applyLegacyMigrations(db: Database.Database): void {
   ensureColumn(db, "user_settings", "default_ai_command", "ALTER TABLE user_settings ADD COLUMN default_ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}'");
+  ensureColumn(
+    db,
+    "user_settings",
+    "default_ai_commands",
+    `ALTER TABLE user_settings ADD COLUMN default_ai_commands TEXT NOT NULL DEFAULT '${DEFAULT_AI_COMMANDS_JSON}'`
+  );
 }
 
 function initializeAppDb(): Database.Database {
@@ -56,9 +63,9 @@ export function ensureLocalUser(): string {
     if (!settings) {
       const now = nowIso();
       app.prepare(
-        `INSERT INTO user_settings (user_id, default_ai_command, created_at, updated_at)
-         VALUES (?, ?, ?, ?)`
-      ).run(row.id, DEFAULT_AI_COMMAND, now, now);
+        `INSERT INTO user_settings (user_id, default_ai_command, default_ai_commands, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(row.id, DEFAULT_AI_COMMAND, DEFAULT_AI_COMMANDS_JSON, now, now);
     }
     app.prepare(
       "UPDATE user_settings SET default_ai_command = ?, updated_at = ? WHERE user_id = ? AND default_ai_command IN ('codex --yolo', 'codex --yolo --prompt {prompt}')"
@@ -67,6 +74,9 @@ export function ensureLocalUser(): string {
       nowIso(),
       row.id
     );
+    app.prepare(
+      "UPDATE user_settings SET default_ai_commands = ?, updated_at = ? WHERE user_id = ? AND (default_ai_commands IS NULL OR TRIM(default_ai_commands) = '')"
+    ).run(DEFAULT_AI_COMMANDS_JSON, nowIso(), row.id);
     return row.id;
   }
 
@@ -80,8 +90,8 @@ export function ensureLocalUser(): string {
     now
   );
   app.prepare(
-    `INSERT INTO user_settings (user_id, default_ai_command, created_at, updated_at)
-     VALUES (?, ?, ?, ?)`
-  ).run(id, DEFAULT_AI_COMMAND, now, now);
+    `INSERT INTO user_settings (user_id, default_ai_command, default_ai_commands, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(id, DEFAULT_AI_COMMAND, DEFAULT_AI_COMMANDS_JSON, now, now);
   return id;
 }

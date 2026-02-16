@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS user_settings (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   default_ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+  default_ai_commands TEXT NOT NULL DEFAULT '["codex --yolo {prompt}"]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

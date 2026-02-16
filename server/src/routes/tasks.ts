@@ -450,9 +450,25 @@ function resolveAiCommand(inputAiCommand: string | undefined, userId: string): s
     return inputAiCommand;
   }
   const settings = appDb
-    .prepare("SELECT default_ai_command FROM user_settings WHERE user_id = ?")
-    .get(userId) as { default_ai_command: string } | undefined;
-  return settings?.default_ai_command || "codex --yolo {prompt}";
+    .prepare("SELECT default_ai_command, default_ai_commands FROM user_settings WHERE user_id = ?")
+    .get(userId) as { default_ai_command: string; default_ai_commands?: string } | undefined;
+  if (!settings) {
+    return "codex --yolo {prompt}";
+  }
+
+  try {
+    const parsed = JSON.parse(settings.default_ai_commands ?? "[]");
+    if (Array.isArray(parsed)) {
+      const first = parsed.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+      if (first) {
+        return first.trim();
+      }
+    }
+  } catch {
+    // Fall through to legacy value.
+  }
+
+  return settings.default_ai_command || "codex --yolo {prompt}";
 }
 
 function recordTaskTransition(params: {
