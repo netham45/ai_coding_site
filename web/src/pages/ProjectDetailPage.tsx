@@ -1,4 +1,5 @@
 import {
+  Badge,
   Box,
   Button,
   Flex,
@@ -28,6 +29,7 @@ import { TaskSidebar } from "../components/TaskSidebar";
 type ProjectResponse = { project: Project };
 type TasksResponse = { tasks: Task[] };
 type ProjectIdeStartResponse = { launchUrl: string };
+type ProjectFilesResponse = { files: string[] };
 
 type CreateTaskForm = {
   title: string;
@@ -84,10 +86,110 @@ export function ProjectDetailPage() {
   const [projectIdeRetryNonce, setProjectIdeRetryNonce] = useState(0);
   const [expandedIde, setExpandedIde] = useState(false);
   const projectIdeAutoAttemptedRef = useRef(false);
+  const taskPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  const suggestionRequestSeqRef = useRef(0);
+  const suggestionDebounceRef = useRef<number | null>(null);
+  const [fileSuggestions, setFileSuggestions] = useState<string[]>([]);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
+  const [mentionQuery, setMentionQuery] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
 
   const canCreate = useMemo(() => {
     return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0;
   }, [form]);
+
+  const closeSuggestions = () => {
+    setShowSuggestions(false);
+    setMentionRange(null);
+    setMentionQuery("");
+    setFileSuggestions([]);
+    setActiveSuggestionIndex(0);
+  };
+
+  const updateMentionContext = (text: string, cursor: number | null) => {
+    if (!projectId || cursor === null || cursor < 0) {
+      closeSuggestions();
+      return;
+    }
+
+    const atPos = text.lastIndexOf("@", cursor - 1);
+    if (atPos < 0) {
+      closeSuggestions();
+      return;
+    }
+
+    const token = text.slice(atPos + 1, cursor);
+    if (/\s/.test(token)) {
+      closeSuggestions();
+      return;
+    }
+
+    if (token.includes("@")) {
+      closeSuggestions();
+      return;
+    }
+
+    setMentionRange({ start: atPos, end: cursor });
+    setMentionQuery(token);
+    setShowSuggestions(true);
+  };
+
+  const insertSuggestion = (filePath: string) => {
+    if (!mentionRange) return;
+    const before = form.taskPrompt.slice(0, mentionRange.start + 1);
+    const after = form.taskPrompt.slice(mentionRange.end);
+    const nextTaskPrompt = `${before}${filePath}${after}`;
+    const nextCursorPos = mentionRange.start + 1 + filePath.length;
+
+    setForm((prev) => ({ ...prev, taskPrompt: nextTaskPrompt }));
+    closeSuggestions();
+
+    window.requestAnimationFrame(() => {
+      const input = taskPromptRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(nextCursorPos, nextCursorPos);
+    });
+  };
+
+  useEffect(() => {
+    if (!showSuggestions || !projectId || !mentionRange) return;
+
+    if (suggestionDebounceRef.current !== null) {
+      window.clearTimeout(suggestionDebounceRef.current);
+    }
+
+    suggestionDebounceRef.current = window.setTimeout(() => {
+      const requestSeq = ++suggestionRequestSeqRef.current;
+      api<ProjectFilesResponse>(
+        `/api/projects/${projectId}/files?query=${encodeURIComponent(mentionQuery)}&limit=8`
+      )
+        .then((response) => {
+          if (requestSeq !== suggestionRequestSeqRef.current) return;
+          setFileSuggestions(response.files);
+          setActiveSuggestionIndex(0);
+        })
+        .catch(() => {
+          if (requestSeq !== suggestionRequestSeqRef.current) return;
+          setFileSuggestions([]);
+        });
+    }, 120);
+
+    return () => {
+      if (suggestionDebounceRef.current !== null) {
+        window.clearTimeout(suggestionDebounceRef.current);
+      }
+    };
+  }, [mentionQuery, mentionRange, projectId, showSuggestions]);
+
+  useEffect(() => {
+    return () => {
+      if (suggestionDebounceRef.current !== null) {
+        window.clearTimeout(suggestionDebounceRef.current);
+      }
+    };
+  }, []);
 
   async function loadData() {
     if (!projectId) return;
@@ -256,11 +358,101 @@ export function ProjectDetailPage() {
                   </FormControl>
                   <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
                     <FormLabel>Task Prompt</FormLabel>
-                    <Textarea
-                      rows={5}
-                      value={form.taskPrompt}
-                      onChange={(e) => setForm((x) => ({ ...x, taskPrompt: e.target.value }))}
-                    />
+                    <Box position="relative">
+                      <Textarea
+                        ref={taskPromptRef}
+                        rows={5}
+                        value={form.taskPrompt}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          const cursor = e.target.selectionStart;
+                          setForm((x) => ({ ...x, taskPrompt: value }));
+                          updateMentionContext(value, cursor);
+                        }}
+                        onClick={(e) => {
+                          updateMentionContext(e.currentTarget.value, e.currentTarget.selectionStart);
+                        }}
+                        onKeyUp={(e) => {
+                          updateMentionContext(e.currentTarget.value, e.currentTarget.selectionStart);
+                        }}
+                        onBlur={() => {
+                          window.setTimeout(() => {
+                            closeSuggestions();
+                          }, 100);
+                        }}
+                        onKeyDown={(e) => {
+                          if (!showSuggestions || fileSuggestions.length === 0) return;
+                          if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setActiveSuggestionIndex((index) => (index + 1) % fileSuggestions.length);
+                            return;
+                          }
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setActiveSuggestionIndex((index) => (index - 1 + fileSuggestions.length) % fileSuggestions.length);
+                            return;
+                          }
+                          if (e.key === "Enter" || e.key === "Tab") {
+                            e.preventDefault();
+                            const picked = fileSuggestions[activeSuggestionIndex];
+                            if (picked) {
+                              insertSuggestion(picked);
+                            }
+                            return;
+                          }
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            closeSuggestions();
+                          }
+                        }}
+                      />
+                      {showSuggestions && (
+                        <Box
+                          position="absolute"
+                          top="calc(100% + 6px)"
+                          left={0}
+                          right={0}
+                          zIndex={20}
+                          bg="white"
+                          border="1px solid"
+                          borderColor="blackAlpha.300"
+                          borderRadius="md"
+                          boxShadow="md"
+                          maxH="220px"
+                          overflowY="auto"
+                          p={1}
+                        >
+                          {fileSuggestions.length ? (
+                            <Stack spacing={1}>
+                              {fileSuggestions.map((file, index) => (
+                                <Button
+                                  key={file}
+                                  justifyContent="space-between"
+                                  variant={index === activeSuggestionIndex ? "solid" : "ghost"}
+                                  colorScheme={index === activeSuggestionIndex ? "teal" : undefined}
+                                  onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    insertSuggestion(file);
+                                  }}
+                                  size="sm"
+                                  fontFamily="mono"
+                                  fontWeight="500"
+                                >
+                                  {file}
+                                </Button>
+                              ))}
+                            </Stack>
+                          ) : (
+                            <Flex px={2} py={2} align="center" justify="space-between">
+                              <Text fontSize="sm" color="gray.600">
+                                No file matches
+                              </Text>
+                              <Badge colorScheme="gray">@{mentionQuery}</Badge>
+                            </Flex>
+                          )}
+                        </Box>
+                      )}
+                    </Box>
                   </FormControl>
                 </Grid>
                 <Button mt={4} colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
