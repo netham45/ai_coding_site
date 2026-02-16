@@ -1714,9 +1714,10 @@ export function runProjectDataMigrationBackfill(db: Database.Database): void {
     if (existingStatus === "cleaned") {
       continue;
     }
-    if (existingStatus === "verified" && !enableCleanup) {
-      // Verified projects may continue receiving writes in project DB during cutover.
+    if ((existingStatus === "verified" || existingStatus === "failed") && !enableCleanup) {
+      // Verified/failed projects may continue receiving writes in project DB during cutover.
       // Re-running source-vs-target count verification would create false mismatches.
+      // Failed status can be retried manually by resetting the status in app DB.
       continue;
     }
 
