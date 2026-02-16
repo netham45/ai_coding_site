@@ -42,6 +42,11 @@ function countIndent(line: string): number {
   return indent;
 }
 
+function isYamlBlockScalarToken(value: string): boolean {
+  const token = value.trim();
+  return token === "|" || token === ">" || token === "|-" || token === "|+" || token === ">-" || token === ">+";
+}
+
 export function extractYamlDocument(rawText: string): string {
   const fencedMatch = rawText.match(/```ya?ml\s*\n([\s\S]*?)```/i);
   if (fencedMatch?.[1]?.trim()) {
@@ -163,7 +168,7 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
         continue;
       }
       if (key === "prompt") {
-        if (value.trim() === "|" || value.trim() === ">") {
+        if (isYamlBlockScalarToken(value)) {
           index += 1;
           const promptLines: string[] = [];
           while (index < lines.length) {
