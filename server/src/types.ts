@@ -1,0 +1,121 @@
+export type CloneStatus = "pending" | "cloning" | "ready" | "failed";
+
+export type TaskStatus =
+  | "queued"
+  | "in_progress"
+  | "waiting_input"
+  | "merge_ready"
+  | "merged"
+  | "cancelled"
+  | "failed"
+  | "merge_conflict";
+
+export type ProjectRow = {
+  id: string;
+  name: string;
+  slug: string;
+  repo_url: string;
+  default_branch: string;
+  base_path: string;
+  project_prompt: string;
+  clone_status: CloneStatus;
+  clone_error: string | null;
+  created_by_user_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TaskRow = {
+  id: string;
+  project_id: string;
+  title: string;
+  task_prompt: string;
+  effective_prompt: string;
+  ai_command: string;
+  status: TaskStatus;
+  workspace_path: string;
+  base_commit_sha_at_create: string;
+  head_commit_sha: string | null;
+  cancel_reason: string | null;
+  merged_at: string | null;
+  merged_by_user_id: string | null;
+  created_by_user_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TaskTransitionRow = {
+  id: string;
+  task_id: string;
+  from_status: string;
+  to_status: string;
+  reason: string;
+  actor_user_id: string | null;
+  created_at: string;
+};
+
+export type TaskSessionStatus = "starting" | "running" | "waiting_input" | "stopped" | "crashed" | "failed";
+
+export type TaskSessionRow = {
+  id: string;
+  task_id: string;
+  tmux_session_name: string;
+  tmux_socket_path: string;
+  pane_id: string | null;
+  detected_tool: string | null;
+  backend_command: string;
+  status: TaskSessionStatus;
+  started_at: string;
+  ended_at: string | null;
+  last_heartbeat_at: string | null;
+  last_output: string;
+  exit_code: number | null;
+  failure_reason: string | null;
+};
+
+export type UserRow = {
+  id: string;
+  email: string;
+  display_name: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type UserSettingsRow = {
+  user_id: string;
+  default_ai_command: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type IdeInstanceStatus = "starting" | "running" | "stopped" | "failed";
+export type IdeProvider = "openvscode_server" | "code_server";
+
+export type IdeInstanceRow = {
+  id: string;
+  task_id: string;
+  provider: IdeProvider;
+  url: string;
+  access_token_hash: string;
+  status: IdeInstanceStatus;
+  started_at: string | null;
+  ended_at: string | null;
+  last_heartbeat_at: string | null;
+};
+
+export type MergeRecordStatus = "pending" | "merged" | "conflict" | "failed";
+
+export type MergeRecordRow = {
+  id: string;
+  task_id: string;
+  project_id: string;
+  source_commit_sha: string;
+  target_base_commit_sha: string;
+  merge_commit_sha: string | null;
+  status: MergeRecordStatus;
+  conflict_summary: string | null;
+  error_message: string | null;
+  created_by_user_id: string;
+  created_at: string;
+  completed_at: string | null;
+};

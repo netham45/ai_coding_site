@@ -1,0 +1,646 @@
+import { Badge, Box, Button, Code, Flex, Heading, Link, Stack, Tab, TabList, TabPanel, TabPanels, Tabs, Text, useToast } from "@chakra-ui/react";
+import { useEffect, useRef, useState } from "react";
+import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { api } from "../api/client";
+import { TaskSidebar } from "../components/TaskSidebar";
+import type { GitStatusSummary, IdeInstance, MergeRecord, Project, Task, TaskSession, TaskTransition } from "../api/types";
+
+type TaskDetailResponse = {
+  task: Task;
+  transitions: TaskTransition[];
+  session: TaskSession | null;
+  ide: IdeInstance | null;
+  gitStatus: GitStatusSummary | null;
+  mergeRecords: MergeRecord[];
+};
+
+type TasksResponse = {
+  tasks: Task[];
+};
+
+type ProjectResponse = {
+  project: Project;
+};
+
+type TerminalTokenResponse = {
+  token: string;
+  expiresAt: string;
+  wsPath: string;
+};
+
+type IdeStartResponse = {
+  ide: IdeInstance;
+  launchUrl: string;
+};
+
+type TerminalMessage =
+  | { type: "hello"; taskId: string; sessionId: string }
+  | { type: "output"; data: string; reset?: boolean; cursorX?: number; cursorY?: number }
+  | { type: "status"; sessionStatus: string }
+  | { type: "error"; message: string }
+  | { type: "ack" };
+
+function statusColor(status: Task["status"]) {
+  if (status === "queued") return "gray";
+  if (status === "in_progress") return "blue";
+  if (status === "merge_ready") return "green";
+  if (status === "failed" || status === "cancelled" || status === "merge_conflict") return "red";
+  return "purple";
+}
+
+export function TaskDetailPage() {
+  const { taskId } = useParams();
+  const [searchParams] = useSearchParams();
+  const toast = useToast();
+
+  const [task, setTask] = useState<Task | null>(null);
+  const [projectName, setProjectName] = useState<string>("");
+  const [projectTasks, setProjectTasks] = useState<Task[]>([]);
+  const [transitions, setTransitions] = useState<TaskTransition[]>([]);
+  const [mergeRecords, setMergeRecords] = useState<MergeRecord[]>([]);
+  const [session, setSession] = useState<TaskSession | null>(null);
+  const [ide, setIde] = useState<IdeInstance | null>(null);
+  const [gitStatus, setGitStatus] = useState<GitStatusSummary | null>(null);
+  const [ideLaunchUrl, setIdeLaunchUrl] = useState<string | null>(null);
+  const [activePane, setActivePane] = useState<"ide" | "terminal" | "info">("ide");
+  const [expandedPane, setExpandedPane] = useState<"ide" | "terminal" | null>(null);
+  const [terminalState, setTerminalState] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+  const [syncingMain, setSyncingMain] = useState(false);
+  const [mergingTask, setMergingTask] = useState(false);
+  const [markingReady, setMarkingReady] = useState(false);
+  const [cancellingTask, setCancellingTask] = useState(false);
+
+  const terminalContainerRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const autoStartedForTaskRef = useRef<Set<string>>(new Set());
+
+  async function loadTask() {
+    if (!taskId) return;
+    const response = await api<TaskDetailResponse>(`/api/tasks/${taskId}`);
+    setTask(response.task);
+    setTransitions(response.transitions);
+    setSession(response.session);
+    setIde(response.ide);
+    setGitStatus(response.gitStatus);
+    setMergeRecords(response.mergeRecords ?? []);
+  }
+
+  async function loadProjectContext(projectId: string) {
+    const [tasksRes, projectRes] = await Promise.all([
+      api<TasksResponse>(`/api/projects/${projectId}/tasks`),
+      api<ProjectResponse>(`/api/projects/${projectId}`)
+    ]);
+    setProjectTasks(tasksRes.tasks);
+    setProjectName(projectRes.project.name);
+  }
+
+  useEffect(() => {
+    setIdeLaunchUrl(null);
+    const tab = searchParams.get("tab");
+    setActivePane(tab === "terminal" ? "terminal" : tab === "info" ? "info" : "ide");
+    setExpandedPane(null);
+    loadTask().catch((error: Error) => {
+      toast({ status: "error", title: "Failed to load task", description: error.message });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId, searchParams]);
+
+  useEffect(() => {
+    if (!task?.projectId) return;
+    loadProjectContext(task.projectId).catch((error: Error) => {
+      toast({ status: "error", title: "Failed to load task list", description: error.message });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task?.projectId]);
+
+  useEffect(() => {
+    if (!task) return;
+    const nextTitle = projectName ? `${projectName} - ${task.title}` : task.title;
+    document.title = nextTitle;
+    return () => {
+      document.title = "AI Coding Web View";
+    };
+  }, [projectName, task]);
+
+  useEffect(() => {
+    if (!taskId || !task) return;
+    if (autoStartedForTaskRef.current.has(taskId)) return;
+    autoStartedForTaskRef.current.add(taskId);
+
+    (async () => {
+      let shouldReload = false;
+      const runtimeActive = !!session && ["starting", "running", "waiting_input"].includes(session.status);
+      const ideActive = !!ide && ["starting", "running"].includes(ide.status);
+
+      if (!runtimeActive && !["merged", "cancelled", "failed"].includes(task.status)) {
+        try {
+          await api(`/api/tasks/${taskId}/start`, { method: "POST" });
+          shouldReload = true;
+        } catch {
+          // best effort autostart
+        }
+      }
+
+      if (!ideActive && !["merged", "cancelled", "failed"].includes(task.status)) {
+        try {
+          const response = await api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" });
+          setIde(response.ide);
+          setIdeLaunchUrl(response.launchUrl);
+          shouldReload = true;
+        } catch {
+          // best effort autostart
+        }
+      }
+
+      if (shouldReload) {
+        await loadTask();
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId, task?.id]);
+
+  useEffect(() => {
+    if (!terminalContainerRef.current || terminalRef.current) {
+      return;
+    }
+
+    const term = new Terminal({
+      convertEol: true,
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      theme: {
+        background: "#0f1720",
+        foreground: "#e7edf3"
+      }
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(terminalContainerRef.current);
+    fitAddon.fit();
+    if (session?.lastOutput) {
+      term.write(session.lastOutput);
+    }
+
+    term.onData((data) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      ws.send(JSON.stringify({ type: "input", data }));
+    });
+
+    terminalRef.current = term;
+    fitAddonRef.current = fitAddon;
+
+    const onResize = () => fitAddon.fit();
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      wsRef.current?.close();
+      term.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+    };
+  }, [session?.lastOutput]);
+
+  useEffect(() => {
+    const term = terminalRef.current;
+    if (!term || !session?.lastOutput) {
+      return;
+    }
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return;
+    }
+    term.clear();
+    term.write(session.lastOutput);
+  }, [session?.id, session?.lastOutput]);
+
+  async function connectTerminal() {
+    if (!taskId) return;
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    setTerminalState("connecting");
+    const term = terminalRef.current;
+
+    try {
+      const tokenData = await api<TerminalTokenResponse>(`/api/tasks/${taskId}/terminal-token`);
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${protocol}://${window.location.host}${tokenData.wsPath}?token=${encodeURIComponent(tokenData.token)}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setTerminalState("connected");
+      };
+
+      ws.onmessage = (event) => {
+        const payload = JSON.parse(String(event.data)) as TerminalMessage;
+        if (payload.type === "output") {
+          if (payload.reset) {
+            term?.clear();
+          }
+          term?.write(payload.data, () => {
+            if (!term) return;
+            if (typeof payload.cursorX === "number" && typeof payload.cursorY === "number") {
+              const row = Math.max(1, payload.cursorY - 2);
+              const col = Math.max(1, payload.cursorX + 1);
+              term.write(`\u001b[${row};${col}H`);
+              term.scrollToBottom();
+            } else {
+              term.scrollToBottom();
+            }
+          });
+          return;
+        }
+        if (payload.type === "error") {
+          term?.writeln(`\r\n[error] ${payload.message}\r\n`);
+        }
+      };
+
+      ws.onclose = () => {
+        setTerminalState("disconnected");
+        wsRef.current = null;
+        if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
+          reconnectTimerRef.current = window.setTimeout(() => {
+            connectTerminal().catch(() => {
+              // no-op
+            });
+          }, 1500);
+        }
+      };
+
+      ws.onerror = () => {
+        setTerminalState("disconnected");
+      };
+    } catch (error: any) {
+      setTerminalState("disconnected");
+      toast({ status: "error", title: "Terminal connect failed", description: error.message });
+    }
+  }
+
+  useEffect(() => {
+    if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
+      connectTerminal().catch(() => {
+        // handled in connectTerminal
+      });
+    } else {
+      wsRef.current?.close();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id, session?.status]);
+
+  useEffect(() => {
+    const fit = () => {
+      fitAddonRef.current?.fit();
+    };
+    window.setTimeout(fit, 40);
+  }, [activePane, expandedPane]);
+
+  useEffect(() => {
+    if (!expandedPane) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [expandedPane]);
+
+  useEffect(() => {
+    if (!taskId) return;
+    if (!ide || !["starting", "running"].includes(ide.status)) return;
+    if (ideLaunchUrl) return;
+
+    api<IdeStartResponse>(`/api/tasks/${taskId}/ide/start`, { method: "POST" })
+      .then((response) => {
+        setIde(response.ide);
+        setIdeLaunchUrl(response.launchUrl);
+      })
+      .catch(() => {
+        // best-effort recovery
+      });
+  }, [taskId, ide?.id, ide?.status, ideLaunchUrl]);
+
+  async function pullFromMain() {
+    if (!taskId) return;
+    setSyncingMain(true);
+    try {
+      const response = await api<{ task: Task; sync: { conflicted: boolean; conflictFiles: string[]; headCommitSha: string } }>(
+        `/api/tasks/${taskId}/pull-main`,
+        { method: "POST" }
+      );
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      if (response.sync.conflicted) {
+        const count = response.sync.conflictFiles.length;
+        toast({
+          status: "warning",
+          title: "Pulled from main with conflicts",
+          description: count ? `${count} conflict file(s) detected.` : "Conflicts detected."
+        });
+      } else {
+        toast({ status: "success", title: "Pulled latest main into task workspace" });
+      }
+    } catch (error: any) {
+      toast({ status: "error", title: "Pull from main failed", description: error.message });
+    } finally {
+      setSyncingMain(false);
+    }
+  }
+
+  async function markMergeReady() {
+    if (!taskId) return;
+    setMarkingReady(true);
+    try {
+      await api<{ task: Task }>(`/api/tasks/${taskId}/mark-merge-ready`, { method: "POST" });
+      await loadTask();
+      toast({ status: "success", title: "Task marked merge_ready" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Mark merge-ready failed", description: error.message });
+    } finally {
+      setMarkingReady(false);
+    }
+  }
+
+  async function mergeTask() {
+    if (!taskId) return;
+    setMergingTask(true);
+    try {
+      await api<{ task: Task; mergeRecords: MergeRecord[] }>(`/api/tasks/${taskId}/merge`, { method: "POST" });
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      toast({ status: "success", title: "Merge action completed" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Merge failed", description: error.message });
+    } finally {
+      setMergingTask(false);
+    }
+  }
+
+  async function cancelTask() {
+    if (!taskId) return;
+    const reason = window.prompt("Cancel reason:");
+    if (!reason || !reason.trim()) return;
+    setCancellingTask(true);
+    try {
+      await api<{ task: Task }>(`/api/tasks/${taskId}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ reason: reason.trim() })
+      });
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      toast({ status: "info", title: "Task cancelled" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Cancel failed", description: error.message });
+    } finally {
+      setCancellingTask(false);
+    }
+  }
+
+  if (!task) {
+    return <Text>Loading task...</Text>;
+  }
+
+  const renderIdePanel = (height: string) => {
+    if (ideLaunchUrl) {
+      return (
+        <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" overflow="hidden">
+          <Box as="iframe" src={ideLaunchUrl} title="Task IDE" h={height} w="full" border="0" sandbox="allow-same-origin allow-scripts" />
+        </Box>
+      );
+    }
+    return <Text color="gray.700">Starting IDE session...</Text>;
+  };
+
+  const renderTerminalPanel = (height: string) => (
+    <Box border="1px solid" borderColor="blackAlpha.300" borderRadius="md" p={2} bg="#0f1720">
+      <Box ref={terminalContainerRef} h={height} />
+    </Box>
+  );
+
+  return (
+    <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
+      {!expandedPane && <TaskSidebar tasks={projectTasks} selectedTaskId={task.id} />}
+
+      <Box flex="1" bg="white" borderRadius={expandedPane ? "none" : "lg"} p={expandedPane ? 0 : 6} boxShadow={expandedPane ? "none" : "sm"} border={expandedPane ? "none" : "1px solid"} borderColor="blackAlpha.200">
+        <Box mb={4}>
+          <Link as={RouterLink} to={`/projects/${task.projectId}`} color="teal.600" fontWeight="600">
+            Back to project
+          </Link>
+          <Heading size="lg" mt={2}>
+            {projectName ? `${projectName} - ${task.title}` : task.title}
+          </Heading>
+          <Stack direction="row" mt={2} align="center">
+            <Badge colorScheme={statusColor(task.status)}>{task.status}</Badge>
+            <Badge colorScheme={terminalState === "connected" ? "green" : terminalState === "connecting" ? "blue" : "gray"}>
+              terminal: {terminalState}
+            </Badge>
+            <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
+              ide: {ide?.status ?? "stopped"}
+            </Badge>
+          </Stack>
+        </Box>
+
+        <Tabs index={activePane === "ide" ? 0 : activePane === "terminal" ? 1 : 2} onChange={(next) => setActivePane(next === 0 ? "ide" : next === 1 ? "terminal" : "info")} colorScheme="teal">
+          <TabList>
+            <Tab>IDE</Tab>
+            <Tab>Terminal</Tab>
+            <Tab>Task Info</Tab>
+          </TabList>
+          <TabPanels>
+            <TabPanel px={0} pt={4}>
+              <Box
+                position={expandedPane === "ide" ? "fixed" : "relative"}
+                inset={expandedPane === "ide" ? "0" : "auto"}
+                zIndex={expandedPane === "ide" ? 2000 : "auto"}
+                bg="white"
+              >
+                <Flex h="44px" px={3} borderBottom="1px solid" borderColor="blackAlpha.300" align="center" justify="space-between">
+                  <Text fontWeight="700">IDE</Text>
+                  {expandedPane === "ide" ? (
+                    <Button size="sm" onClick={() => setExpandedPane(null)}>
+                      Exit Full View
+                    </Button>
+                  ) : (
+                    <Button size="sm" variant="outline" onClick={() => setExpandedPane("ide")}>
+                      Expand
+                    </Button>
+                  )}
+                </Flex>
+                <Box p={2}>{renderIdePanel(expandedPane === "ide" ? "calc(100vh - 60px)" : "640px")}</Box>
+              </Box>
+              <Text mt={3} fontSize="sm" color="gray.600">
+                Git snapshot:{" "}
+                {gitStatus
+                  ? `${gitStatus.branch} | +${gitStatus.ahead}/-${gitStatus.behind} | staged ${gitStatus.staged} | unstaged ${gitStatus.unstaged} | untracked ${gitStatus.untracked}`
+                  : "unavailable"}
+              </Text>
+            </TabPanel>
+
+            <TabPanel px={0} pt={4}>
+              <Box
+                position={expandedPane === "terminal" ? "fixed" : "relative"}
+                inset={expandedPane === "terminal" ? "0" : "auto"}
+                zIndex={expandedPane === "terminal" ? 2000 : "auto"}
+                bg="white"
+              >
+                <Flex h="44px" px={3} borderBottom="1px solid" borderColor="blackAlpha.300" align="center" justify="space-between">
+                  <Text fontWeight="700">Terminal</Text>
+                  {expandedPane === "terminal" ? (
+                    <Button size="sm" onClick={() => setExpandedPane(null)}>
+                      Exit Full View
+                    </Button>
+                  ) : (
+                    <Button size="sm" variant="outline" onClick={() => setExpandedPane("terminal")}>
+                      Expand
+                    </Button>
+                  )}
+                </Flex>
+                <Box p={2}>{renderTerminalPanel(expandedPane === "terminal" ? "calc(100vh - 60px)" : "520px")}</Box>
+              </Box>
+            </TabPanel>
+
+            <TabPanel px={0} pt={4}>
+              <Stack spacing={5}>
+                <Flex justify="flex-end">
+                  <Stack direction={{ base: "column", md: "row" }} spacing={2}>
+                    <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain}>
+                      Pull From Main Repo
+                    </Button>
+                    <Button
+                      colorScheme="blue"
+                      variant="outline"
+                      size="sm"
+                      onClick={markMergeReady}
+                      isLoading={markingReady}
+                      isDisabled={!["in_progress", "waiting_input", "merge_conflict"].includes(task.status)}
+                    >
+                      Mark Merge Ready
+                    </Button>
+                    <Button colorScheme="green" size="sm" onClick={mergeTask} isLoading={mergingTask} isDisabled={task.status !== "merge_ready"}>
+                      Merge Task
+                    </Button>
+                    <Button
+                      colorScheme="red"
+                      variant="outline"
+                      size="sm"
+                      onClick={cancelTask}
+                      isLoading={cancellingTask}
+                      isDisabled={!["queued", "in_progress", "waiting_input", "merge_ready", "merge_conflict"].includes(task.status)}
+                    >
+                      Cancel Task
+                    </Button>
+                  </Stack>
+                </Flex>
+                <Box>
+                  <Heading size="sm" mb={2}>
+                    Effective Prompt
+                  </Heading>
+                  <Code whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
+                    {task.effectivePrompt}
+                  </Code>
+                </Box>
+
+                <Box>
+                  <Heading size="sm" mb={2}>
+                    Task Prompt
+                  </Heading>
+                  <Code whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
+                    {task.taskPrompt}
+                  </Code>
+                </Box>
+
+                <Box>
+                  <Heading size="sm" mb={3}>
+                    Merge Audit
+                  </Heading>
+                  <Stack spacing={3} mb={2}>
+                    {mergeRecords.map((record) => (
+                      <Box key={record.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                        <Stack direction={{ base: "column", md: "row" }} justify="space-between" align={{ base: "start", md: "center" }}>
+                          <Badge
+                            colorScheme={
+                              record.status === "merged"
+                                ? "green"
+                                : record.status === "conflict"
+                                  ? "orange"
+                                  : record.status === "failed"
+                                    ? "red"
+                                    : "blue"
+                            }
+                          >
+                            {record.status}
+                          </Badge>
+                          <Text fontSize="sm" color="gray.600">
+                            {new Date(record.createdAt).toLocaleString()}
+                          </Text>
+                        </Stack>
+                        <Text fontSize="sm" mt={1}>
+                          source: {record.sourceCommitSha.slice(0, 12)} target: {record.targetBaseCommitSha.slice(0, 12)}
+                        </Text>
+                        {!!record.mergeCommitSha && (
+                          <Text fontSize="sm" color="green.700">
+                            merge commit: {record.mergeCommitSha.slice(0, 12)}
+                          </Text>
+                        )}
+                        {!!record.conflictSummary && (
+                          <Text fontSize="sm" color="orange.700" whiteSpace="pre-wrap">
+                            conflicts: {record.conflictSummary}
+                          </Text>
+                        )}
+                        {!!record.errorMessage && (
+                          <Text fontSize="sm" color="red.700">
+                            error: {record.errorMessage}
+                          </Text>
+                        )}
+                      </Box>
+                    ))}
+                    {!mergeRecords.length && <Text color="gray.600">No merge records yet.</Text>}
+                  </Stack>
+                </Box>
+
+                <Box>
+                  <Heading size="sm" mb={3}>
+                    History
+                  </Heading>
+                  <Stack spacing={3}>
+                    {transitions.map((item) => (
+                      <Box key={item.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                        <Text fontWeight="600">
+                          {item.fromStatus} -&gt; {item.toStatus}
+                        </Text>
+                        <Text fontSize="sm" color="gray.700">
+                          reason: {item.reason}
+                        </Text>
+                        <Text fontSize="sm" color="gray.600">
+                          {new Date(item.createdAt).toLocaleString()}
+                        </Text>
+                      </Box>
+                    ))}
+                    {!transitions.length && <Text color="gray.600">No transitions recorded.</Text>}
+                  </Stack>
+                </Box>
+              </Stack>
+            </TabPanel>
+          </TabPanels>
+        </Tabs>
+      </Box>
+    </Flex>
+  );
+}
