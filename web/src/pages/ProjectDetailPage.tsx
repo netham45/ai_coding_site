@@ -38,6 +38,12 @@ type CreateTaskForm = {
   dependencyTaskIds: string[];
 };
 
+type CreatePlanForm = {
+  title: string;
+  taskPrompt: string;
+  aiCommand: string;
+};
+
 type ProjectInstructionsForm = {
   projectPrompt: string;
   projectRules: string;
@@ -51,6 +57,12 @@ const initialForm: CreateTaskForm = {
   taskPrompt: "",
   aiCommand: "codex --yolo {prompt}",
   dependencyTaskIds: []
+};
+
+const initialPlanForm: CreatePlanForm = {
+  title: "",
+  taskPrompt: "",
+  aiCommand: "codex --yolo {prompt}"
 };
 
 const NON_SELECTABLE_DEPENDENCY_STATUSES = new Set(["merged", "cancelled", "failed"]);
@@ -74,6 +86,7 @@ export function ProjectDetailPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [form, setForm] = useState<CreateTaskForm>(initialForm);
+  const [planForm, setPlanForm] = useState<CreatePlanForm>(initialPlanForm);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
     projectPrompt: "",
     projectRules: "",
@@ -84,7 +97,7 @@ export function ProjectDetailPage() {
   const [loading, setLoading] = useState(false);
   const [creatingPlan, setCreatingPlan] = useState(false);
   const [savingProjectInstructions, setSavingProjectInstructions] = useState(false);
-  const [activePane, setActivePane] = useState<"tasks" | "project" | "ide">("tasks");
+  const [activePane, setActivePane] = useState<"tasks" | "plans" | "project" | "ide">("tasks");
   const [projectIdeLaunchUrl, setProjectIdeLaunchUrl] = useState<string | null>(null);
   const [startingProjectIde, setStartingProjectIde] = useState(false);
   const [projectIdeStartFailed, setProjectIdeStartFailed] = useState(false);
@@ -103,13 +116,17 @@ export function ProjectDetailPage() {
   const [dependencySelections, setDependencySelections] = useState<string[]>([""]);
 
   const selectableDependencyTasks = useMemo(
-    () => tasks.filter((task) => !NON_SELECTABLE_DEPENDENCY_STATUSES.has(task.status)),
+    () => tasks.filter((task) => task.mode === "execution" && !NON_SELECTABLE_DEPENDENCY_STATUSES.has(task.status)),
     [tasks]
   );
+  const planTasks = useMemo(() => tasks.filter((task) => task.mode === "plan"), [tasks]);
 
   const canCreate = useMemo(() => {
     return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0;
   }, [form]);
+  const canCreatePlan = useMemo(() => {
+    return planForm.title.trim().length >= 2 && planForm.taskPrompt.trim().length > 0;
+  }, [planForm]);
 
   const closeSuggestions = () => {
     setShowSuggestions(false);
@@ -306,7 +323,8 @@ export function ProjectDetailPage() {
     }
   }
 
-  async function onCreatePlan() {
+  async function onCreatePlan(event: React.FormEvent) {
+    event.preventDefault();
     if (!projectId) return;
 
     setCreatingPlan(true);
@@ -314,13 +332,12 @@ export function ProjectDetailPage() {
       const created = await api<{ plan: Task }>(`/api/projects/${projectId}/plans`, {
         method: "POST",
         body: JSON.stringify({
-          title: form.title,
-          taskPrompt: form.taskPrompt,
-          aiCommand: form.aiCommand
+          title: planForm.title,
+          taskPrompt: planForm.taskPrompt,
+          aiCommand: planForm.aiCommand
         })
       });
-      setForm(initialForm);
-      setDependencySelections([""]);
+      setPlanForm(initialPlanForm);
       await loadData();
       toast({ status: "success", title: "Plan created" });
       navigate(`/plans/${created.plan.id}?tab=ide`);
@@ -383,12 +400,13 @@ export function ProjectDetailPage() {
         </Box>
 
         <Tabs
-          index={activePane === "tasks" ? 0 : activePane === "project" ? 1 : 2}
-          onChange={(index) => setActivePane(index === 0 ? "tasks" : index === 1 ? "project" : "ide")}
+          index={activePane === "tasks" ? 0 : activePane === "plans" ? 1 : activePane === "project" ? 2 : 3}
+          onChange={(index) => setActivePane(index === 0 ? "tasks" : index === 1 ? "plans" : index === 2 ? "project" : "ide")}
           colorScheme="teal"
         >
           <TabList>
             <Tab>Tasks</Tab>
+            <Tab>Plans</Tab>
             <Tab>Project Prompt</Tab>
             <Tab>IDE</Tab>
           </TabList>
@@ -559,15 +577,59 @@ export function ProjectDetailPage() {
                     </Box>
                   </FormControl>
                 </Grid>
-                <Flex mt={4} gap={2}>
-                  <Button colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
-                    Create Task
-                  </Button>
-                  <Button colorScheme="purple" variant="outline" type="button" isDisabled={!canCreate} isLoading={creatingPlan} onClick={onCreatePlan}>
-                    Create Plan
-                  </Button>
-                </Flex>
+                <Button mt={4} colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
+                  Create Task
+                </Button>
               </form>
+            </TabPanel>
+            <TabPanel px={0} pt={4}>
+              <Heading size="md" mb={2}>
+                Create Plan
+              </Heading>
+              <Text color="gray.600" mb={4}>
+                Plan mode creates a planning runtime (IDE + terminal) that outputs a task graph for approval.
+              </Text>
+              <form onSubmit={onCreatePlan}>
+                <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={4}>
+                  <FormControl isRequired>
+                    <FormLabel>Plan Title</FormLabel>
+                    <Input value={planForm.title} onChange={(e) => setPlanForm((x) => ({ ...x, title: e.target.value }))} />
+                  </FormControl>
+                  <FormControl isRequired>
+                    <FormLabel>AI Command</FormLabel>
+                    <Input value={planForm.aiCommand} onChange={(e) => setPlanForm((x) => ({ ...x, aiCommand: e.target.value }))} />
+                  </FormControl>
+                  <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
+                    <FormLabel>Planning Prompt</FormLabel>
+                    <Textarea
+                      rows={6}
+                      value={planForm.taskPrompt}
+                      onChange={(e) => setPlanForm((x) => ({ ...x, taskPrompt: e.target.value }))}
+                      placeholder={"Ask for output format:\n<task X>\n<prompt>...</prompt>\n<depends on task Y>"}
+                    />
+                  </FormControl>
+                </Grid>
+                <Button mt={4} colorScheme="purple" type="submit" isDisabled={!canCreatePlan} isLoading={creatingPlan}>
+                  Create Plan
+                </Button>
+              </form>
+
+              <Heading size="sm" mt={8} mb={3}>
+                Existing Plans
+              </Heading>
+              <Stack spacing={2}>
+                {planTasks.map((planTask) => (
+                  <Box key={planTask.id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                    <Flex align="center" justify="space-between" gap={3}>
+                      <Link as={RouterLink} to={`/plans/${planTask.id}?tab=ide`} color="teal.700" fontWeight="700">
+                        {planTask.title}
+                      </Link>
+                      <Badge colorScheme={planTask.isBlocked ? "orange" : "purple"}>{planTask.isBlocked ? "blocked" : planTask.status}</Badge>
+                    </Flex>
+                  </Box>
+                ))}
+                {!planTasks.length && <Text color="gray.600">No plans yet.</Text>}
+              </Stack>
             </TabPanel>
             <TabPanel px={0} pt={4}>
               <Heading size="md" mb={2}>
