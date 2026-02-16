@@ -10,6 +10,8 @@ export type TaskStatus =
   | "failed"
   | "merge_conflict";
 
+export type TaskMode = "execution" | "plan";
+
 export type ProjectRow = {
   id: string;
   name: string;
@@ -36,6 +38,10 @@ export type TaskRow = {
   task_prompt: string;
   effective_prompt: string;
   ai_command: string;
+  mode: TaskMode;
+  parent_plan_task_id: string | null;
+  source_plan_revision_id: string | null;
+  source_plan_item_key: string | null;
   status: TaskStatus;
   workspace_path: string;
   base_commit_sha_at_create: string;
@@ -128,4 +134,34 @@ export type MergeRecordRow = {
   created_by_user_id: string;
   created_at: string;
   completed_at: string | null;
+};
+
+export type PlanRevisionStatus = "proposed" | "approved" | "superseded" | "feedback_requested" | "parse_failed";
+
+export type PlanRevisionRow = {
+  id: string;
+  plan_task_id: string;
+  revision_number: number;
+  status: PlanRevisionStatus;
+  feedback: string | null;
+  raw_output: string;
+  parse_error: string | null;
+  created_by_user_id: string;
+  created_at: string;
+  approved_at: string | null;
+};
+
+export type PlanRevisionItemRow = {
+  id: string;
+  revision_id: string;
+  item_key: string;
+  title: string;
+  prompt: string;
+  ordinal: number;
+  created_at: string;
+};
+
+export type PlanRevisionItemDependencyRow = {
+  revision_item_id: string;
+  depends_on_item_key: string;
 };

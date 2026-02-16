@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_prompt TEXT NOT NULL,
   effective_prompt TEXT NOT NULL,
   ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+  mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+  parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+  source_plan_item_key TEXT,
   status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','merge_ready','merged','cancelled','failed','merge_conflict')),
   workspace_path TEXT NOT NULL,
   base_commit_sha_at_create TEXT NOT NULL,
@@ -64,6 +68,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_plan_task_id ON tasks(parent_plan_task_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_mode ON tasks(mode);
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -137,6 +143,41 @@ CREATE TABLE IF NOT EXISTS merge_records (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_records_task_id ON merge_records(task_id);
 CREATE INDEX IF NOT EXISTS idx_merge_records_status ON merge_records(status);
+
+CREATE TABLE IF NOT EXISTS plan_revisions (
+  id TEXT PRIMARY KEY,
+  plan_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  revision_number INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('proposed','approved','superseded','feedback_requested','parse_failed')),
+  feedback TEXT,
+  raw_output TEXT NOT NULL DEFAULT '',
+  parse_error TEXT,
+  created_by_user_id TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  approved_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revisions_plan_task_number ON plan_revisions(plan_task_id, revision_number);
+CREATE INDEX IF NOT EXISTS idx_plan_revisions_plan_task_id ON plan_revisions(plan_task_id);
+CREATE INDEX IF NOT EXISTS idx_plan_revisions_status ON plan_revisions(status);
+
+CREATE TABLE IF NOT EXISTS plan_revision_items (
+  id TEXT PRIMARY KEY,
+  revision_id TEXT NOT NULL REFERENCES plan_revisions(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  title TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_revision_items_revision_item_key ON plan_revision_items(revision_id, item_key);
+CREATE INDEX IF NOT EXISTS idx_plan_revision_items_revision_id ON plan_revision_items(revision_id);
+
+CREATE TABLE IF NOT EXISTS plan_revision_item_dependencies (
+  revision_item_id TEXT NOT NULL REFERENCES plan_revision_items(id) ON DELETE CASCADE,
+  depends_on_item_key TEXT NOT NULL,
+  PRIMARY KEY (revision_item_id, depends_on_item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_revision_item_dependencies_revision_item_id ON plan_revision_item_dependencies(revision_item_id);
 
 CREATE TABLE IF NOT EXISTS ide_instances (
   id TEXT PRIMARY KEY,

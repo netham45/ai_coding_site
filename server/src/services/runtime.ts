@@ -148,7 +148,11 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   if (taskIsBlocked(task.id)) {
     throw new Error("Task is blocked by unmerged dependencies");
   }
-  if (["merged", "cancelled", "merge_ready", "merge_conflict"].includes(task.status)) {
+  const initialDisallowed =
+    task.mode === "plan"
+      ? ["merged", "cancelled"]
+      : ["merged", "cancelled", "merge_ready", "merge_conflict"];
+  if (initialDisallowed.includes(task.status)) {
     throw new Error(`Task cannot be started from status ${task.status}`);
   }
   const project = getProject(task.project_id);
@@ -188,7 +192,11 @@ export async function startTaskRuntime(taskId: string, actorUserId: string): Pro
   if (!latestBeforeStart) {
     throw new Error("Task not found");
   }
-  if (["merged", "cancelled", "merge_ready", "merge_conflict"].includes(latestBeforeStart.status)) {
+  const latestDisallowed =
+    latestBeforeStart.mode === "plan"
+      ? ["merged", "cancelled"]
+      : ["merged", "cancelled", "merge_ready", "merge_conflict"];
+  if (latestDisallowed.includes(latestBeforeStart.status)) {
     throw new Error(`Task cannot be started from status ${latestBeforeStart.status}`);
   }
 

@@ -59,7 +59,7 @@ export function TaskSidebar({
   return (
     <Box w={{ base: "full", lg: "320px" }} bg="white" borderRadius="lg" p={4} boxShadow="sm" border="1px solid" borderColor="blackAlpha.200">
       <Flex align="center" justify="space-between" mb={3}>
-        <Heading size="sm">Tasks</Heading>
+        <Heading size="sm">Tasks & Plans</Heading>
         {onToggleCollapse ? (
           <Button size="xs" variant="ghost" onClick={onToggleCollapse} leftIcon={<ChevronLeftIcon />} aria-label="Collapse tasks sidebar">
             Hide
@@ -76,10 +76,13 @@ export function TaskSidebar({
             p={3}
             bg={selectedTaskId === task.id ? "teal.50" : "white"}
           >
-            <Link as={RouterLink} to={`/tasks/${task.id}?tab=ide`} color="teal.700" fontWeight="700">
+            <Link as={RouterLink} to={task.mode === "plan" ? `/plans/${task.id}?tab=ide` : `/tasks/${task.id}?tab=ide`} color="teal.700" fontWeight="700">
               {task.title}
             </Link>
             <Box mt={1}>
+              <Badge mr={2} colorScheme={task.mode === "plan" ? "purple" : "cyan"}>
+                {task.mode}
+              </Badge>
               <Badge colorScheme={task.isBlocked ? "orange" : taskStatusColor(task.status)}>{taskStatusLabel(task)}</Badge>
             </Box>
           </Box>

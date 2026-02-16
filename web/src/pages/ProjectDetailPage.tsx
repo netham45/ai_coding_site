@@ -82,6 +82,7 @@ export function ProjectDetailPage() {
     projectOther: ""
   });
   const [loading, setLoading] = useState(false);
+  const [creatingPlan, setCreatingPlan] = useState(false);
   const [savingProjectInstructions, setSavingProjectInstructions] = useState(false);
   const [activePane, setActivePane] = useState<"tasks" | "project" | "ide">("tasks");
   const [projectIdeLaunchUrl, setProjectIdeLaunchUrl] = useState<string | null>(null);
@@ -302,6 +303,31 @@ export function ProjectDetailPage() {
       toast({ status: "error", title: "Task create failed", description: error.message });
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function onCreatePlan() {
+    if (!projectId) return;
+
+    setCreatingPlan(true);
+    try {
+      const created = await api<{ plan: Task }>(`/api/projects/${projectId}/plans`, {
+        method: "POST",
+        body: JSON.stringify({
+          title: form.title,
+          taskPrompt: form.taskPrompt,
+          aiCommand: form.aiCommand
+        })
+      });
+      setForm(initialForm);
+      setDependencySelections([""]);
+      await loadData();
+      toast({ status: "success", title: "Plan created" });
+      navigate(`/plans/${created.plan.id}?tab=ide`);
+    } catch (error: any) {
+      toast({ status: "error", title: "Plan create failed", description: error.message });
+    } finally {
+      setCreatingPlan(false);
     }
   }
 
@@ -533,9 +559,14 @@ export function ProjectDetailPage() {
                     </Box>
                   </FormControl>
                 </Grid>
-                <Button mt={4} colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
-                  Create Task
-                </Button>
+                <Flex mt={4} gap={2}>
+                  <Button colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
+                    Create Task
+                  </Button>
+                  <Button colorScheme="purple" variant="outline" type="button" isDisabled={!canCreate} isLoading={creatingPlan} onClick={onCreatePlan}>
+                    Create Plan
+                  </Button>
+                </Flex>
               </form>
             </TabPanel>
             <TabPanel px={0} pt={4}>

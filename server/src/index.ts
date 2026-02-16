@@ -8,6 +8,7 @@ import { authMiddleware } from "./middleware/auth.js";
 import { projectsRouter } from "./routes/projects.js";
 import { settingsRouter } from "./routes/settings.js";
 import { tasksRouter } from "./routes/tasks.js";
+import { plansRouter } from "./routes/plans.js";
 import { startIdeHeartbeat } from "./services/ide.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
@@ -34,6 +35,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/projects", projectsRouter);
 app.use("/api/users/me/settings", settingsRouter);
 app.use("/api", tasksRouter);
+app.use("/api", plansRouter);
 
 const webDist = path.join(workspaceRoot, "web", "dist");
 const webIndex = path.join(webDist, "index.html");

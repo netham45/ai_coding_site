@@ -33,6 +33,10 @@ ensureColumn(
   "ALTER TABLE projects ADD COLUMN coding_standard_other TEXT NOT NULL DEFAULT ''"
 );
 ensureColumn("projects", "project_other", "ALTER TABLE projects ADD COLUMN project_other TEXT NOT NULL DEFAULT ''");
+ensureColumn("tasks", "mode", "ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'execution'");
+ensureColumn("tasks", "parent_plan_task_id", "ALTER TABLE tasks ADD COLUMN parent_plan_task_id TEXT");
+ensureColumn("tasks", "source_plan_revision_id", "ALTER TABLE tasks ADD COLUMN source_plan_revision_id TEXT");
+ensureColumn("tasks", "source_plan_item_key", "ALTER TABLE tasks ADD COLUMN source_plan_item_key TEXT");
 
 export function ensureLocalUser(): string {
   const row = db.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
