@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { Router } from "express";
 import { z } from "zod";
@@ -28,6 +29,47 @@ const createPlanSchema = z.object({
 const regenerateSchema = z.object({
   feedback: z.string().min(1).max(12000)
 });
+
+const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
+
+function planningFormatInstructions(): string {
+  return [
+    "Planner Output Contract:",
+    "Return the final plan as YAML only.",
+    "Wrap YAML in a fenced block using ```yaml.",
+    "Top-level key must be `tasks:`.",
+    "Each task entry must include:",
+    "- id: unique task identifier",
+    "- title: short task title",
+    "- prompt: implementation prompt for that task",
+    "- depends_on: list of task ids (optional)",
+    "After generating YAML, write the exact same YAML to this file in the workspace:",
+    `${PLAN_OUTPUT_RELATIVE_PATH}`
+  ].join("\n");
+}
+
+function buildPlanTaskPrompt(userPrompt: string): string {
+  return `${userPrompt.trim()}\n\n${planningFormatInstructions()}`.trim();
+}
+
+function planOutputFilePath(workspacePath: string): string {
+  return path.join(workspacePath, PLAN_OUTPUT_RELATIVE_PATH);
+}
+
+function readPlanOutputSource(plan: TaskRow): { raw: string; source: "file" | "session_output"; filePath: string } {
+  const filePath = planOutputFilePath(plan.workspace_path);
+  try {
+    const fileValue = fs.readFileSync(filePath, "utf8").trim();
+    if (fileValue) {
+      return { raw: fileValue, source: "file", filePath };
+    }
+  } catch {
+    // Fall through to session output.
+  }
+
+  const raw = getLatestSessionOutput(plan.id);
+  return { raw, source: "session_output", filePath };
+}
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
   return db
@@ -149,17 +191,19 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   }
 
   const input = parsed.data;
+  const plannerPrompt = buildPlanTaskPrompt(input.taskPrompt);
   const id = makeId();
   const now = nowIso();
   const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
-  const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
+  const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
 
   let baseCommitSha: string;
   try {
     baseCommitSha = await getHeadCommitSha(project.base_path);
     await cloneLocalBaseToWorkspace({ basePath: project.base_path, workspacePath });
     await createTaskBranch(workspacePath, id);
+    await fs.promises.mkdir(path.join(workspacePath, ".ai-plan"), { recursive: true });
   } catch (error: any) {
     const message = String(error?.message ?? "Failed to initialize plan workspace");
     res.status(500).json({ error: message });
@@ -174,7 +218,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, 'plan', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-    ).run(id, project.id, input.title, input.taskPrompt, effectivePrompt, aiCommand, workspacePath, baseCommitSha, req.user.id, now, now);
+    ).run(id, project.id, input.title, plannerPrompt, effectivePrompt, aiCommand, workspacePath, baseCommitSha, req.user.id, now, now);
 
     db.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
@@ -293,9 +337,9 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
     return;
   }
 
-  const rawOutput = getLatestSessionOutput(plan.id);
-  if (!rawOutput) {
-    res.status(409).json({ error: "No runtime output available to extract from" });
+  const source = readPlanOutputSource(plan);
+  if (!source.raw) {
+    res.status(409).json({ error: "No plan output available. Generate plan YAML first." });
     return;
   }
 
@@ -304,7 +348,9 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
   const createdAt = nowIso();
 
   try {
-    const parsed = parsePlanOutput(rawOutput);
+    const parsed = parsePlanOutput(source.raw);
+    fs.mkdirSync(path.dirname(source.filePath), { recursive: true });
+    fs.writeFileSync(source.filePath, `${parsed.yamlText.trim()}\n`, "utf8");
 
     db.transaction(() => {
       db.prepare("UPDATE plan_revisions SET status = 'superseded' WHERE plan_task_id = ? AND status = 'proposed'").run(plan.id);
@@ -313,7 +359,7 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
         `INSERT INTO plan_revisions (
           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
          ) VALUES (?, ?, ?, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
-      ).run(revisionId, plan.id, revisionNumber, rawOutput, req.user.id, createdAt);
+      ).run(revisionId, plan.id, revisionNumber, parsed.yamlText, req.user.id, createdAt);
 
       for (let i = 0; i < parsed.tasks.length; i += 1) {
         const task = parsed.tasks[i];
@@ -336,17 +382,17 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
       projectId: plan.project_id,
       taskId: plan.id,
       eventType: "plan.revision.extracted",
-      payload: { revisionId, revisionNumber, items: parsed.tasks.length }
+      payload: { revisionId, revisionNumber, items: parsed.tasks.length, source: source.source, planFile: source.filePath }
     });
 
-    res.json({ ok: true, revisionId, revisionNumber, tasksExtracted: parsed.tasks.length });
+    res.json({ ok: true, revisionId, revisionNumber, tasksExtracted: parsed.tasks.length, source: source.source, planFile: source.filePath });
   } catch (error: any) {
     const parseError = String(error?.message ?? "Failed to parse plan output");
     db.prepare(
       `INSERT INTO plan_revisions (
         id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
        ) VALUES (?, ?, ?, 'parse_failed', NULL, ?, ?, ?, ?, NULL)`
-    ).run(revisionId, plan.id, revisionNumber, rawOutput, parseError, req.user.id, createdAt);
+    ).run(revisionId, plan.id, revisionNumber, source.raw, parseError, req.user.id, createdAt);
 
     res.status(400).json({ error: parseError });
   }
@@ -371,10 +417,10 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
   const createdAt = nowIso();
   const guidance = [
     "Regenerate the plan based on this feedback and restate the complete plan.",
-    "Use exact format per task:",
-    "<task X>",
-    "<prompt>...</prompt>",
-    "<depends on task Y, task Z>",
+    "Return plan output as YAML using the required schema under top-level `tasks:`.",
+    "Write the exact YAML to file:",
+    PLAN_OUTPUT_RELATIVE_PATH,
+    "Then print the YAML in a ```yaml fenced block.",
     "Feedback:",
     feedback
   ].join("\n");
