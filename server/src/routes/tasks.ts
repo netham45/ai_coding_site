@@ -426,9 +426,9 @@ function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, ac
   const now = nowIso();
   db.transaction(() => {
     if (nextStatus === "merged") {
-      db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
     } else {
-      db.prepare("UPDATE tasks SET status = ?, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
+      db.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?").run(
         nextStatus,
         now,
         task.id
@@ -822,6 +822,31 @@ tasksRouter.post("/tasks/:taskId/mark-merge-ready", async (req, res) => {
     taskId: updated.id,
     eventType: "task.mark_merge_ready",
     payload: {}
+  });
+  res.json({ task: serializeTask(updated) });
+});
+
+tasksRouter.post("/tasks/:taskId/in-progress", (req, res) => {
+  const task = taskForUser(req.params.taskId, req.user.id);
+  if (!task) {
+    res.status(404).json({ error: "Task not found" });
+    return;
+  }
+
+  if (task.status === "waiting_input") {
+    res.json({ task: serializeTask(task) });
+    return;
+  }
+
+  const updated = setTaskStatus(task, "waiting_input", "user_marked_in_progress", req.user.id);
+  recordEvent({
+    projectId: updated.project_id,
+    taskId: updated.id,
+    eventType: "task.mark_in_progress",
+    payload: {
+      fromStatus: task.status,
+      toStatus: "waiting_input"
+    }
   });
   res.json({ task: serializeTask(updated) });
 });

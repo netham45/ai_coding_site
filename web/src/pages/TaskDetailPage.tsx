@@ -119,6 +119,7 @@ export function TaskDetailPage() {
   const [syncingMain, setSyncingMain] = useState(false);
   const [mergingTask, setMergingTask] = useState(false);
   const [markingReady, setMarkingReady] = useState(false);
+  const [markingInProgress, setMarkingInProgress] = useState(false);
   const [rerunningTask, setRerunningTask] = useState(false);
   const [cancellingTask, setCancellingTask] = useState(false);
   const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
@@ -468,6 +469,23 @@ export function TaskDetailPage() {
     }
   }
 
+  async function markInProgress() {
+    if (!entityId) return;
+    setMarkingInProgress(true);
+    try {
+      await api<{ task: Task }>(`/api/tasks/${entityId}/in-progress`, { method: "POST" });
+      await loadTask();
+      if (task?.projectId) {
+        await loadProjectContext(task.projectId);
+      }
+      toast({ status: "success", title: "Task moved to waiting_input" });
+    } catch (error: any) {
+      toast({ status: "error", title: "Move to waiting_input failed", description: error.message });
+    } finally {
+      setMarkingInProgress(false);
+    }
+  }
+
   async function mergeTask() {
     if (!entityId) return;
     setMergingTask(true);
@@ -797,6 +815,15 @@ export function TaskDetailPage() {
                         colorScheme="blue"
                         variant="outline"
                         size="sm"
+                        onClick={markInProgress}
+                        isLoading={markingInProgress}
+                      >
+                        In Progress
+                      </Button>
+                      <Button
+                        colorScheme="blue"
+                        variant="outline"
+                        size="sm"
                         onClick={markMergeReady}
                         isLoading={markingReady}
                       >
@@ -822,6 +849,15 @@ export function TaskDetailPage() {
                     <Stack direction={{ base: "column", md: "row" }} spacing={2}>
                       <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
                         {isPlanOwnedExecutionTask ? "Pull From Plan Branch" : "Pull From Main Repo"}
+                      </Button>
+                      <Button
+                        colorScheme="blue"
+                        variant="outline"
+                        size="sm"
+                        onClick={markInProgress}
+                        isLoading={markingInProgress}
+                      >
+                        In Progress
                       </Button>
                       <Button
                         colorScheme="blue"
