@@ -728,14 +728,18 @@ tasksRouter.patch("/tasks/:taskId", (req, res) => {
 tasksRouter.post("/tasks/:taskId/start", async (req, res) => {
   const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
   if (!scopedTask) return;
-  const { task, projectDb } = scopedTask;
+  const { task, project, projectDb } = scopedTask;
   if (taskIsBlocked(projectDb, task.id)) {
     res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
   }
 
   try {
-    await startTaskRuntime(task.id, req.user.id);
+    await startTaskRuntime(task.id, req.user.id, {
+      projectId: project.id,
+      basePath: project.base_path,
+      projectDb
+    });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to start task runtime") });
     return;
@@ -754,10 +758,14 @@ tasksRouter.post("/tasks/:taskId/input", async (req, res) => {
 
   const scopedTask = getTaskAccessOrRespond({ taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found" }, res);
   if (!scopedTask) return;
-  const { task, projectDb } = scopedTask;
+  const { task, project, projectDb } = scopedTask;
 
   try {
-    await sendTaskRuntimeInput(task.id, req.user.id, parsed.data.text);
+    await sendTaskRuntimeInput(task.id, req.user.id, parsed.data.text, {
+      projectId: project.id,
+      basePath: project.base_path,
+      projectDb
+    });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to send input") });
     return;

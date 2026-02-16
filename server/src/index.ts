@@ -3,7 +3,7 @@ import express from "express";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { ensureLocalUser } from "./db/index.js";
+import { db as appDb, ensureLocalUser, getProjectDb, isProjectDbError } from "./db/index.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { projectsRouter } from "./routes/projects.js";
 import { settingsRouter } from "./routes/settings.js";
@@ -15,7 +15,6 @@ import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { createTerminalGateway } from "./ws/terminalGateway.js";
 import { workspaceRoot } from "./utils/paths.js";
-import { db } from "./db/index.js";
 import { nowIso } from "./utils/time.js";
 
 const app = express();
@@ -70,9 +69,21 @@ startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {
   const now = nowIso();
-  db.prepare(
-    `UPDATE ide_instances
-     SET status = 'failed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?
-     WHERE task_id = ? AND status IN ('starting','running')`
-  ).run(now, now, taskId);
+  const projects = appDb
+    .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
+    .all() as Array<{ id: string; base_path: string }>;
+  for (const project of projects) {
+    try {
+      const projectDb = getProjectDb({ projectId: project.id, basePath: project.base_path });
+      projectDb.prepare(
+        `UPDATE ide_instances
+         SET status = 'failed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?
+         WHERE task_id = ? AND status IN ('starting','running')`
+      ).run(now, now, taskId);
+    } catch (error) {
+      if (!isProjectDbError(error)) {
+        throw error;
+      }
+    }
+  }
 });

@@ -497,7 +497,7 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
 
   const scopedPlan = getPlanAccessOrRespond({ planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found" }, res);
   if (!scopedPlan) return;
-  const { plan, projectDb } = scopedPlan;
+  const { plan, project, projectDb } = scopedPlan;
 
   const feedback = parsed.data.feedback.trim();
   const revisionId = makeId();
@@ -514,7 +514,11 @@ plansRouter.post("/plans/:planId/regenerate", async (req, res) => {
   ].join("\n");
 
   try {
-    await sendTaskRuntimeInput(plan.id, req.user.id, guidance);
+    await sendTaskRuntimeInput(plan.id, req.user.id, guidance, {
+      projectId: project.id,
+      basePath: project.base_path,
+      projectDb
+    });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Plan runtime is not ready for feedback") });
     return;
