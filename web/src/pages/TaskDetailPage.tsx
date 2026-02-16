@@ -13,6 +13,7 @@ import {
   Heading,
   Input,
   Link,
+  Select,
   Stack,
   Tab,
   TabList,
@@ -27,7 +28,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskTransition } from "../api/types";
+import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskTransition, UserSettings } from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -58,11 +59,20 @@ type PlanDetailResponse = {
   approvedTasks: Task[];
 };
 
+type SettingsResponse = {
+  settings: UserSettings;
+};
+
 type PlanItemDraft = {
   title: string;
   description: string;
   prompt: string;
+  aiCommandSelection: string;
+  aiCommandOverride: string;
 };
+
+const AI_COMMAND_OTHER = "__other__";
+const DEFAULT_AI_COMMAND = "codex --yolo {prompt}";
 
 function statusColor(status: Task["status"]) {
   if (status === "queued") return "gray";
@@ -109,6 +119,7 @@ export function TaskDetailPage() {
   const [approvingPlan, setApprovingPlan] = useState(false);
   const [autoMergeItemKeys, setAutoMergeItemKeys] = useState<string[]>([]);
   const [planItemDrafts, setPlanItemDrafts] = useState<Record<string, PlanItemDraft>>({});
+  const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>([DEFAULT_AI_COMMAND]);
 
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
 
@@ -145,6 +156,33 @@ export function TaskDetailPage() {
     setProjectName(projectRes.project.name);
   }
 
+  async function loadAiCommandOptions() {
+    const settingsRes = await api<SettingsResponse>("/api/users/me/settings");
+    const commandOptions = settingsRes.settings.defaultAiCommands?.length
+      ? settingsRes.settings.defaultAiCommands
+      : [settingsRes.settings.defaultAiCommand || DEFAULT_AI_COMMAND];
+    setTaskAiCommandOptions(commandOptions);
+  }
+
+  function updatePlanItemDraft(itemKey: string, updates: Partial<PlanItemDraft>, defaults: Pick<PlanItemDraft, "title" | "description">) {
+    setPlanItemDrafts((current) => {
+      const key = itemKey.toLowerCase();
+      const existing = current[key];
+      const fallbackCommand = taskAiCommandOptions[0] || DEFAULT_AI_COMMAND;
+      return {
+        ...current,
+        [key]: {
+          title: existing?.title ?? defaults.title,
+          description: existing?.description ?? defaults.description,
+          prompt: existing?.prompt ?? "",
+          aiCommandSelection: existing?.aiCommandSelection ?? fallbackCommand,
+          aiCommandOverride: existing?.aiCommandOverride ?? "",
+          ...updates
+        }
+      };
+    });
+  }
+
   useEffect(() => {
     setIdeLaunchUrl(null);
     const tab = searchParams.get("tab");
@@ -164,6 +202,13 @@ export function TaskDetailPage() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task?.projectId]);
+
+  useEffect(() => {
+    loadAiCommandOptions().catch((error: Error) => {
+      toast({ status: "error", title: "Failed to load settings", description: error.message });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -415,12 +460,20 @@ export function TaskDetailPage() {
     if (!entityId) return;
     const proposedItems = latestProposedRevision?.items ?? [];
     const taskEdits = proposedItems.map((item) => {
-      const draft = planItemDrafts[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" };
+      const draft = planItemDrafts[item.itemKey.toLowerCase()] ?? {
+        title: item.title,
+        description: item.prompt,
+        prompt: "",
+        aiCommandSelection: taskAiCommandOptions[0] || DEFAULT_AI_COMMAND,
+        aiCommandOverride: ""
+      };
+      const aiCommand = draft.aiCommandSelection === AI_COMMAND_OTHER ? draft.aiCommandOverride.trim() : draft.aiCommandSelection.trim();
       return {
         itemKey: item.itemKey,
         title: draft.title.trim(),
         description: draft.description.trim(),
-        prompt: draft.prompt.trim()
+        prompt: draft.prompt.trim(),
+        aiCommand
       };
     });
 
@@ -440,6 +493,15 @@ export function TaskDetailPage() {
         status: "warning",
         title: "Description is required",
         description: `Task ${invalidDescription.itemKey} needs a description before approval.`
+      });
+      return;
+    }
+    const invalidAiCommand = taskEdits.find((item) => item.aiCommand.length < 1);
+    if (invalidAiCommand) {
+      toast({
+        status: "warning",
+        title: "AI command is required",
+        description: `Task ${invalidAiCommand.itemKey} needs an AI command before approval.`
       });
       return;
     }
@@ -479,15 +541,18 @@ export function TaskDetailPage() {
       return;
     }
     const next: Record<string, PlanItemDraft> = {};
+    const defaultCommand = taskAiCommandOptions[0] || DEFAULT_AI_COMMAND;
     for (const item of items) {
       next[item.itemKey.toLowerCase()] = {
         title: item.title,
         description: item.prompt,
-        prompt: ""
+        prompt: "",
+        aiCommandSelection: defaultCommand,
+        aiCommandOverride: ""
       };
     }
     setPlanItemDrafts(next);
-  }, [latestProposedRevision?.id]);
+  }, [latestProposedRevision?.id, taskAiCommandOptions]);
 
   useEffect(() => {
     if (!latestProposedItemKeys.length) {
@@ -776,14 +841,11 @@ export function TaskDetailPage() {
                                       <Input
                                         value={getPlanItemDraft(item.itemKey)?.title ?? item.title}
                                         onChange={(e) => {
-                                          const nextTitle = e.target.value;
-                                          setPlanItemDrafts((current) => ({
-                                            ...current,
-                                            [item.itemKey.toLowerCase()]: {
-                                              ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
-                                              title: nextTitle
-                                            }
-                                          }));
+                                          updatePlanItemDraft(
+                                            item.itemKey,
+                                            { title: e.target.value },
+                                            { title: item.title, description: item.prompt }
+                                          );
                                         }}
                                         placeholder="Task title"
                                       />
@@ -796,17 +858,58 @@ export function TaskDetailPage() {
                                         rows={4}
                                         value={getPlanItemDraft(item.itemKey)?.description ?? item.prompt}
                                         onChange={(e) => {
-                                          const nextDescription = e.target.value;
-                                          setPlanItemDrafts((current) => ({
-                                            ...current,
-                                            [item.itemKey.toLowerCase()]: {
-                                              ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
-                                              description: nextDescription
-                                            }
-                                          }));
+                                          updatePlanItemDraft(
+                                            item.itemKey,
+                                            { description: e.target.value },
+                                            { title: item.title, description: item.prompt }
+                                          );
                                         }}
                                         placeholder="Task description"
                                       />
+                                    </Box>
+                                    <Box>
+                                      <Text fontSize="sm" color="gray.700" mb={1}>
+                                        AI Command
+                                      </Text>
+                                      <Stack spacing={2}>
+                                        <Select
+                                          value={getPlanItemDraft(item.itemKey)?.aiCommandSelection ?? (taskAiCommandOptions[0] || DEFAULT_AI_COMMAND)}
+                                          onChange={(e) => {
+                                            const selected = e.target.value;
+                                            updatePlanItemDraft(
+                                              item.itemKey,
+                                              {
+                                                aiCommandSelection: selected,
+                                                aiCommandOverride:
+                                                  selected === AI_COMMAND_OTHER
+                                                    ? getPlanItemDraft(item.itemKey)?.aiCommandOverride ?? ""
+                                                    : ""
+                                              },
+                                              { title: item.title, description: item.prompt }
+                                            );
+                                          }}
+                                        >
+                                          {taskAiCommandOptions.map((option) => (
+                                            <option key={option} value={option}>
+                                              {option}
+                                            </option>
+                                          ))}
+                                          <option value={AI_COMMAND_OTHER}>Other</option>
+                                        </Select>
+                                        {(getPlanItemDraft(item.itemKey)?.aiCommandSelection ?? "") === AI_COMMAND_OTHER && (
+                                          <Input
+                                            placeholder="Enter custom AI command"
+                                            value={getPlanItemDraft(item.itemKey)?.aiCommandOverride ?? ""}
+                                            onChange={(e) => {
+                                              updatePlanItemDraft(
+                                                item.itemKey,
+                                                { aiCommandOverride: e.target.value },
+                                                { title: item.title, description: item.prompt }
+                                              );
+                                            }}
+                                          />
+                                        )}
+                                      </Stack>
                                     </Box>
                                     <Accordion allowToggle>
                                       <AccordionItem border="1px solid" borderColor="blackAlpha.100" borderRadius="md">
@@ -821,14 +924,11 @@ export function TaskDetailPage() {
                                             rows={5}
                                             value={getPlanItemDraft(item.itemKey)?.prompt ?? ""}
                                             onChange={(e) => {
-                                              const nextPrompt = e.target.value;
-                                              setPlanItemDrafts((current) => ({
-                                                ...current,
-                                                [item.itemKey.toLowerCase()]: {
-                                                  ...(current[item.itemKey.toLowerCase()] ?? { title: item.title, description: item.prompt, prompt: "" }),
-                                                  prompt: nextPrompt
-                                                }
-                                              }));
+                                              updatePlanItemDraft(
+                                                item.itemKey,
+                                                { prompt: e.target.value },
+                                                { title: item.title, description: item.prompt }
+                                              );
                                             }}
                                             placeholder="Optional extra implementation prompt"
                                           />
