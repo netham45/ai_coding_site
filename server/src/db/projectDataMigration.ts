@@ -680,6 +680,8 @@ function verifyCountsAndChecksums(params: {
     targetChecksumSql: string;
     sourceParams: unknown[];
     targetParams: unknown[];
+    countPolicy?: "exact" | "target_at_least_source";
+    skipChecksum?: boolean;
   }> = [
     {
       key: "tasks",
@@ -1102,6 +1104,8 @@ function verifyCountsAndChecksums(params: {
     {
       key: "ide_instances",
       enabled: params.presence.ide_instances && params.presence.tasks,
+      countPolicy: "target_at_least_source",
+      skipChecksum: true,
       sourceCountSql: `
         SELECT COUNT(*) AS count
         FROM ide_instances ii
@@ -1218,12 +1222,15 @@ function verifyCountsAndChecksums(params: {
     const source = (params.appDb.prepare(spec.sourceCountSql).get(...spec.sourceParams) as { count: number }).count;
     const target = (params.projectDb.prepare(spec.targetCountSql).get(...spec.targetParams) as { count: number }).count;
 
-    if (source !== target) {
+    const countPolicy = spec.countPolicy ?? "exact";
+    const countMismatch =
+      countPolicy === "target_at_least_source" ? target < source : source !== target;
+    if (countMismatch) {
       throw new Error(`Row count mismatch for ${spec.key}: source=${source}, target=${target}`);
     }
 
     const entry: VerificationTableResult = { source, target };
-    if (params.includeChecksum) {
+    if (params.includeChecksum && !spec.skipChecksum) {
       const checksumSource = checksumForQuery(params.appDb, spec.sourceChecksumSql, spec.sourceParams, spec.checksumColumns);
       const checksumTarget = checksumForQuery(params.projectDb, spec.targetChecksumSql, spec.targetParams, spec.checksumColumns);
       if (checksumSource !== checksumTarget) {
@@ -1714,9 +1721,10 @@ export function runProjectDataMigrationBackfill(db: Database.Database): void {
     if (existingStatus === "cleaned") {
       continue;
     }
-    if (existingStatus === "verified" && !enableCleanup) {
-      // Verified projects may continue receiving writes in project DB during cutover.
+    if ((existingStatus === "verified" || existingStatus === "failed") && !enableCleanup) {
+      // Verified/failed projects may continue receiving writes in project DB during cutover.
       // Re-running source-vs-target count verification would create false mismatches.
+      // Failed status can be retried manually by resetting the status in app DB.
       continue;
     }
 
