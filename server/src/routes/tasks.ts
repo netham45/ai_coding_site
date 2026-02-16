@@ -442,11 +442,7 @@ function setTaskStatus(task: TaskRow, nextStatus: TaskStatus, reason: string, ac
       actorUserId
     });
   })();
-  const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
-  if (updated.auto_merge && ["waiting_input", "merge_ready"].includes(updated.status)) {
-    triggerAutoMergeIfEligible(updated.id);
-  }
-  return updated;
+  return db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
 }
 
 export const tasksRouter = Router();

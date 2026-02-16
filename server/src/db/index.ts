@@ -1,346 +1,84 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
-import path from "node:path";
-import { appBaselineMigration, projectBaselineMigration, PROJECT_DB_SCHEMA_VERSION } from "./migrations.js";
-import type { AppProjectRow, ProjectConfigRow, ProjectRow } from "../types.js";
+import { baselineMigration } from "./migrations.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { dataRoot } from "../utils/paths.js";
 
 const DEFAULT_AI_COMMAND = "codex --yolo {prompt}";
-const PROJECT_DB_DIR = ".ai-coding";
-const PROJECT_DB_NAME = "project.sqlite";
 
 fs.mkdirSync(dataRoot, { recursive: true });
-const appDbPath = path.join(dataRoot, "app.sqlite");
 
-export const appDb = new Database(appDbPath);
-// Backward-compatible alias for call sites still importing `db`.
-export const db = appDb;
+const dbPath = `${dataRoot}/app.sqlite`;
+export const db = new Database(dbPath);
 
-configureSqlite(appDb);
-appDb.exec(appBaselineMigration);
+db.pragma("foreign_keys = ON");
+db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
+db.exec(baselineMigration);
 
-// SQLite ownership invariants for app/project split:
-// 1) Single source of truth per table: global tables live in app DB, project-local tables live in project DB.
-// 2) No cross-file SQLite foreign keys are used between app DB and project DB.
-// 3) Cross-DB linkage is by IDs only, with integrity enforced in application logic.
-
-function configureSqlite(dbHandle: Database.Database): void {
-  dbHandle.pragma("foreign_keys = ON");
-  dbHandle.pragma("journal_mode = WAL");
-  dbHandle.pragma("busy_timeout = 5000");
-}
-
-function tableColumns(dbHandle: Database.Database, table: string): string[] {
-  const cols = dbHandle.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  return cols.map((col) => col.name);
-}
-
-function ensureColumn(dbHandle: Database.Database, table: string, column: string, alterSql: string): void {
-  if (!tableColumns(dbHandle, table).includes(column)) {
-    dbHandle.exec(alterSql);
+function ensureColumn(table: string, column: string, alterSql: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((col) => col.name === column)) {
+    db.exec(alterSql);
   }
 }
 
-function migrateProjectsToGlobalMetadataOnly(dbHandle: Database.Database): void {
-  const columns = tableColumns(dbHandle, "projects");
-  const legacyColumns = ["project_prompt", "project_rules", "coding_standard", "coding_standard_other", "project_other"];
-  if (!legacyColumns.some((column) => columns.includes(column))) {
-    return;
-  }
-
-  dbHandle.exec("PRAGMA foreign_keys = OFF");
-  try {
-    dbHandle.exec("BEGIN IMMEDIATE");
-    dbHandle.exec(`
-      CREATE TABLE projects_new (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        slug TEXT UNIQUE NOT NULL,
-        repo_url TEXT NOT NULL,
-        default_branch TEXT NOT NULL,
-        base_path TEXT NOT NULL,
-        clone_status TEXT NOT NULL CHECK (clone_status IN ('pending','cloning','ready','failed')),
-        clone_error TEXT,
-        created_by_user_id TEXT NOT NULL REFERENCES users(id),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )
-    `);
-    dbHandle.exec(`
-      INSERT INTO projects_new (
-        id, name, slug, repo_url, default_branch, base_path,
-        clone_status, clone_error, created_by_user_id, created_at, updated_at
-      )
-      SELECT
-        id, name, slug, repo_url, default_branch, base_path,
-        clone_status, clone_error, created_by_user_id, created_at, updated_at
-      FROM projects
-    `);
-    dbHandle.exec("DROP TABLE projects");
-    dbHandle.exec("ALTER TABLE projects_new RENAME TO projects");
-    dbHandle.exec("COMMIT");
-  } catch (error) {
-    dbHandle.exec("ROLLBACK");
-    throw error;
-  } finally {
-    dbHandle.exec("PRAGMA foreign_keys = ON");
-  }
-
-  dbHandle.exec("CREATE INDEX IF NOT EXISTS idx_projects_created_by_user_id ON projects(created_by_user_id)");
-  dbHandle.exec("CREATE INDEX IF NOT EXISTS idx_projects_clone_status ON projects(clone_status)");
+function ensureIndex(indexSql: string): void {
+  db.exec(indexSql);
 }
 
-migrateProjectsToGlobalMetadataOnly(appDb);
-
-function ensureProjectDbSchema(dbHandle: Database.Database): void {
-  dbHandle.exec(projectBaselineMigration);
-  ensureColumn(dbHandle, "tasks", "mode", "ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'execution'");
-  ensureColumn(dbHandle, "tasks", "auto_merge", "ALTER TABLE tasks ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 0");
-  ensureColumn(dbHandle, "tasks", "result", "ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT ''");
-  ensureColumn(dbHandle, "tasks", "parent_plan_task_id", "ALTER TABLE tasks ADD COLUMN parent_plan_task_id TEXT");
-  ensureColumn(dbHandle, "tasks", "source_plan_revision_id", "ALTER TABLE tasks ADD COLUMN source_plan_revision_id TEXT");
-  ensureColumn(dbHandle, "tasks", "source_plan_item_key", "ALTER TABLE tasks ADD COLUMN source_plan_item_key TEXT");
-  ensureColumn(dbHandle, "task_sessions", "last_output", "ALTER TABLE task_sessions ADD COLUMN last_output TEXT NOT NULL DEFAULT ''");
-}
-
-function projectDbPath(basePath: string): string {
-  return path.join(basePath, PROJECT_DB_DIR, PROJECT_DB_NAME);
-}
-
-function normalizeError(error: unknown): string {
-  return String((error as Error)?.message ?? error ?? "unknown");
-}
-
-type ProjectDbErrorCode = "PROJECT_DB_UNAVAILABLE" | "PROJECT_DB_CORRUPT";
-
-export class ProjectDbError extends Error {
-  code: ProjectDbErrorCode;
-
-  constructor(code: ProjectDbErrorCode, message: string) {
-    super(message);
-    this.code = code;
-  }
-}
-
-function openProjectDb(params: { projectId: string; basePath: string; allowCreate: boolean }): Database.Database {
-  const dbFile = projectDbPath(params.basePath);
-  const dirPath = path.dirname(dbFile);
-  const existedBefore = fs.existsSync(dbFile);
-
-  if (!params.allowCreate && !existedBefore) {
-    throw new ProjectDbError("PROJECT_DB_UNAVAILABLE", `Missing project DB: ${dbFile}`);
-  }
-
-  if (params.allowCreate) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-
-  let projectDb: Database.Database;
-  try {
-    projectDb = new Database(dbFile);
-  } catch (error) {
-    throw new ProjectDbError("PROJECT_DB_CORRUPT", `Unable to open project DB: ${normalizeError(error)}`);
-  }
-
-  try {
-    configureSqlite(projectDb);
-    ensureProjectDbSchema(projectDb);
-    validateOrSeedMetadata(projectDb, params.projectId, params.allowCreate || !existedBefore);
-    return projectDb;
-  } catch (error) {
-    projectDb.close();
-    const message = normalizeError(error);
-    if (error instanceof ProjectDbError) {
-      throw error;
-    }
-    throw new ProjectDbError("PROJECT_DB_CORRUPT", `Invalid project DB (${dbFile}): ${message}`);
-  }
-}
-
-function validateOrSeedMetadata(projectDb: Database.Database, projectId: string, allowSeed: boolean): void {
-  const meta = projectDb.prepare("SELECT project_id, schema_version FROM project_metadata WHERE id = 1").get() as
-    | { project_id: string; schema_version: number }
-    | undefined;
-  if (!meta) {
-    if (!allowSeed) {
-      throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project DB metadata row is missing");
-    }
-    projectDb.prepare("INSERT INTO project_metadata (id, project_id, schema_version, created_at) VALUES (1, ?, ?, ?)").run(
-      projectId,
-      PROJECT_DB_SCHEMA_VERSION,
-      nowIso()
-    );
-    return;
-  }
-  if (meta.project_id !== projectId) {
-    throw new ProjectDbError(
-      "PROJECT_DB_CORRUPT",
-      `Project DB metadata mismatch. Expected ${projectId}, found ${meta.project_id}`
-    );
-  }
-}
-
-type ProjectConfigInput = {
-  projectPrompt?: string;
-  projectRules?: string;
-  codingStandard?: string;
-  codingStandardOther?: string;
-  projectOther?: string;
-};
-
-function seedProjectConfig(projectDb: Database.Database, projectId: string, seed?: ProjectConfigInput): void {
-  const now = nowIso();
-  const current = projectDb.prepare("SELECT id FROM project_config WHERE id = 1").get() as { id: number } | undefined;
-  if (current) {
-    return;
-  }
-  projectDb.prepare(
-    `INSERT INTO project_config (
-      id, project_id, project_prompt, project_rules, coding_standard, coding_standard_other, project_other, created_at, updated_at
-    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    projectId,
-    seed?.projectPrompt ?? "",
-    seed?.projectRules ?? "",
-    seed?.codingStandard ?? "",
-    seed?.codingStandardOther ?? "",
-    seed?.projectOther ?? "",
-    now,
-    now
-  );
-}
-
-type ProjectDbCacheValue = {
-  projectId: string;
-  db: Database.Database;
-};
-
-const projectDbCache = new Map<string, ProjectDbCacheValue>();
-
-export function projectDbForProject(params: { projectId: string; basePath: string }): Database.Database {
-  const cached = projectDbCache.get(params.basePath);
-  if (cached) {
-    if (cached.projectId !== params.projectId) {
-      cached.db.close();
-      projectDbCache.delete(params.basePath);
-    } else {
-      return cached.db;
-    }
-  }
-
-  const projectDb = openProjectDb({ projectId: params.projectId, basePath: params.basePath, allowCreate: false });
-  projectDbCache.set(params.basePath, { projectId: params.projectId, db: projectDb });
-  return projectDb;
-}
-
-export function initializeProjectDb(params: {
-  projectId: string;
-  basePath: string;
-  config?: ProjectConfigInput;
-}): Database.Database {
-  const projectDb = openProjectDb({ projectId: params.projectId, basePath: params.basePath, allowCreate: true });
-  seedProjectConfig(projectDb, params.projectId, params.config);
-  projectDbCache.set(params.basePath, { projectId: params.projectId, db: projectDb });
-  return projectDb;
-}
-
-function loadProjectConfig(projectDb: Database.Database, projectId: string): ProjectConfigRow {
-  const row = projectDb.prepare("SELECT * FROM project_config WHERE id = 1").get() as ProjectConfigRow | undefined;
-  if (row) {
-    return row;
-  }
-  seedProjectConfig(projectDb, projectId);
-  const seeded = projectDb.prepare("SELECT * FROM project_config WHERE id = 1").get() as ProjectConfigRow | undefined;
-  if (!seeded) {
-    throw new ProjectDbError("PROJECT_DB_CORRUPT", "Project config row is missing");
-  }
-  return seeded;
-}
-
-export function getProjectConfig(params: { projectId: string; basePath: string }): ProjectConfigRow {
-  const projectDb = projectDbForProject(params);
-  return loadProjectConfig(projectDb, params.projectId);
-}
-
-export function updateProjectConfig(
-  params: { projectId: string; basePath: string },
-  patch: ProjectConfigInput
-): ProjectConfigRow {
-  const projectDb = projectDbForProject(params);
-  const current = loadProjectConfig(projectDb, params.projectId);
-  const next = {
-    project_prompt: patch.projectPrompt ?? current.project_prompt,
-    project_rules: patch.projectRules ?? current.project_rules,
-    coding_standard: patch.codingStandard ?? current.coding_standard,
-    coding_standard_other: patch.codingStandardOther ?? current.coding_standard_other,
-    project_other: patch.projectOther ?? current.project_other
-  };
-
-  projectDb.prepare(
-    `UPDATE project_config
-     SET project_prompt = ?, project_rules = ?, coding_standard = ?, coding_standard_other = ?, project_other = ?, updated_at = ?
-     WHERE id = 1`
-  ).run(
-    next.project_prompt,
-    next.project_rules,
-    next.coding_standard,
-    next.coding_standard_other,
-    next.project_other,
-    nowIso()
-  );
-
-  return loadProjectConfig(projectDb, params.projectId);
-}
-
-export function hydrateProjectWithConfig(project: AppProjectRow): ProjectRow {
-  const config = getProjectConfig({ projectId: project.id, basePath: project.base_path });
-  return {
-    ...project,
-    project_prompt: config.project_prompt,
-    project_rules: config.project_rules,
-    coding_standard: config.coding_standard,
-    coding_standard_other: config.coding_standard_other,
-    project_other: config.project_other
-  };
-}
+ensureColumn("task_sessions", "last_output", "ALTER TABLE task_sessions ADD COLUMN last_output TEXT NOT NULL DEFAULT ''");
+ensureColumn("projects", "project_rules", "ALTER TABLE projects ADD COLUMN project_rules TEXT NOT NULL DEFAULT ''");
+ensureColumn("projects", "coding_standard", "ALTER TABLE projects ADD COLUMN coding_standard TEXT NOT NULL DEFAULT ''");
+ensureColumn(
+  "projects",
+  "coding_standard_other",
+  "ALTER TABLE projects ADD COLUMN coding_standard_other TEXT NOT NULL DEFAULT ''"
+);
+ensureColumn("projects", "project_other", "ALTER TABLE projects ADD COLUMN project_other TEXT NOT NULL DEFAULT ''");
+ensureColumn("tasks", "mode", "ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'execution'");
+ensureColumn("tasks", "auto_merge", "ALTER TABLE tasks ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 0");
+ensureColumn("tasks", "result", "ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT ''");
+ensureColumn("tasks", "parent_plan_task_id", "ALTER TABLE tasks ADD COLUMN parent_plan_task_id TEXT");
+ensureColumn("tasks", "source_plan_revision_id", "ALTER TABLE tasks ADD COLUMN source_plan_revision_id TEXT");
+ensureColumn("tasks", "source_plan_item_key", "ALTER TABLE tasks ADD COLUMN source_plan_item_key TEXT");
+ensureIndex("CREATE INDEX IF NOT EXISTS idx_tasks_parent_plan_task_id ON tasks(parent_plan_task_id)");
+ensureIndex("CREATE INDEX IF NOT EXISTS idx_tasks_mode ON tasks(mode)");
 
 export function ensureLocalUser(): string {
-  const row = appDb.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
+  const row = db.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
   if (row?.id) {
-    const settings = appDb.prepare("SELECT user_id FROM user_settings WHERE user_id = ?").get(row.id) as
-      | { user_id: string }
-      | undefined;
+    const settings = db.prepare("SELECT user_id FROM user_settings WHERE user_id = ?").get(row.id) as { user_id: string } | undefined;
     if (!settings) {
       const now = nowIso();
-      appDb.prepare(
+      db.prepare(
         `INSERT INTO user_settings (user_id, default_ai_command, created_at, updated_at)
          VALUES (?, ?, ?, ?)`
       ).run(row.id, DEFAULT_AI_COMMAND, now, now);
     }
-    appDb
-      .prepare(
-        "UPDATE user_settings SET default_ai_command = ?, updated_at = ? WHERE user_id = ? AND default_ai_command IN ('codex --yolo', 'codex --yolo --prompt {prompt}')"
-      )
-      .run(DEFAULT_AI_COMMAND, nowIso(), row.id);
+    db.prepare(
+      "UPDATE user_settings SET default_ai_command = ?, updated_at = ? WHERE user_id = ? AND default_ai_command IN ('codex --yolo', 'codex --yolo --prompt {prompt}')"
+    ).run(
+      DEFAULT_AI_COMMAND,
+      nowIso(),
+      row.id
+    );
     return row.id;
   }
 
   const id = makeId();
   const now = nowIso();
-  appDb.prepare("INSERT INTO users (id, email, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+  db.prepare("INSERT INTO users (id, email, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(
     id,
     "local@example.com",
     "Local User",
     now,
     now
   );
-  appDb
-    .prepare(
-      `INSERT INTO user_settings (user_id, default_ai_command, created_at, updated_at)
-       VALUES (?, ?, ?, ?)`
-    )
-    .run(id, DEFAULT_AI_COMMAND, now, now);
+  db.prepare(
+    `INSERT INTO user_settings (user_id, default_ai_command, created_at, updated_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(id, DEFAULT_AI_COMMAND, now, now);
   return id;
 }

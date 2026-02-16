@@ -64,7 +64,6 @@ type TaskGitTopology = {
   syncMergeTargetFromOrigin: boolean;
   shouldPushTargetBranchToOrigin: boolean;
 };
-
 function getTask(taskId: string): TaskRow | undefined {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
 }
@@ -104,7 +103,6 @@ function resolveTaskGitTopology(task: TaskRow, project: ProjectRow): TaskGitTopo
     shouldPushTargetBranchToOrigin: true
   };
 }
-
 function taskIsBlocked(taskId: string): boolean {
   const row = db
     .prepare(
@@ -800,7 +798,6 @@ async function monitorSession(session: SessionRow): Promise<void> {
 export async function recoverRuntimeSessions(): Promise<void> {
   await ensureTmuxAvailable();
   kickPendingAutoMergeTasks();
-
   const rows = db
     .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
     .all() as SessionRow[];
@@ -828,7 +825,6 @@ export async function startRuntimeHeartbeat(): Promise<void> {
 
   heartbeatTimer = setInterval(async () => {
     kickPendingAutoMergeTasks();
-
     const activeSessions = db
       .prepare("SELECT * FROM task_sessions WHERE status IN ('starting','running','waiting_input') ORDER BY started_at ASC")
       .all() as SessionRow[];
