@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { ensureProjectDb, upsertProjectConfig } from "./projectDb.js";
+import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { isCleanupPhaseEnabled } from "./splitPersistence.js";
 import { nowIso } from "../utils/time.js";
+import { logInfo, logWarn } from "../utils/structuredLog.js";
 
 const PROJECT_DATA_MIGRATION_VERSION = 1;
 const PROJECT_DATA_MIGRATION_STATUS = ["pending", "in_progress", "verified", "cleaned", "failed"] as const;
@@ -1644,6 +1646,51 @@ function shouldEnableCleanup(): boolean {
   return process.env.PROJECT_DATA_MIGRATION_CLEANUP_LEGACY === "1" || isCleanupPhaseEnabled();
 }
 
+export function collectProjectMigrationHealth(db: Database.Database): {
+  counts: Record<ProjectDataMigrationStatus, number>;
+  byProject: Array<{ projectId: string; status: ProjectDataMigrationStatus; lastError: string | null; updatedAt: string }>;
+} {
+  if (!tableExists(db, "project_data_migrations")) {
+    return {
+      counts: {
+        pending: 0,
+        in_progress: 0,
+        verified: 0,
+        cleaned: 0,
+        failed: 0
+      },
+      byProject: []
+    };
+  }
+  const rows = db
+    .prepare(
+      `SELECT project_id, status, last_error, updated_at
+       FROM project_data_migrations
+       ORDER BY updated_at DESC, project_id ASC`
+    )
+    .all() as Array<{ project_id: string; status: ProjectDataMigrationStatus; last_error: string | null; updated_at: string }>;
+
+  const counts: Record<ProjectDataMigrationStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    verified: 0,
+    cleaned: 0,
+    failed: 0
+  };
+  for (const row of rows) {
+    counts[row.status] += 1;
+  }
+  return {
+    counts,
+    byProject: rows.slice(0, 20).map((row) => ({
+      projectId: row.project_id,
+      status: row.status,
+      lastError: row.last_error,
+      updatedAt: row.updated_at
+    }))
+  };
+}
+
 export function runProjectDataMigrationBackfill(db: Database.Database): void {
   db.exec(migrationTableSql);
 
@@ -1761,14 +1808,25 @@ export function runProjectDataMigrationBackfill(db: Database.Database): void {
         error: message,
         startedAt
       });
-      console.warn(`[project-data-migration] ${project.id} failed: ${message}`);
+      const diagnostic = recordProjectDbFailure({
+        stage: "migration",
+        code: "PROJECT_DATA_MIGRATION_FAILED",
+        projectId: project.id,
+        basePath: project.base_path,
+        message
+      });
+      logWarn("project_data_migration.failed", diagnostic);
     }
   }
 
   if (enableCleanup) {
-    console.info("[project-data-migration] cleanup mode enabled via PROJECT_DATA_MIGRATION_CLEANUP_LEGACY=1");
+    logInfo("project_data_migration.cleanup_enabled", {
+      reason: "PROJECT_DATA_MIGRATION_CLEANUP_LEGACY=1 or SPLIT_PERSISTENCE_PHASE=cleanup"
+    });
   }
   if (includeChecksum) {
-    console.info("[project-data-migration] checksum verification enabled via PROJECT_DATA_MIGRATION_VERIFY_CHECKSUMS=1");
+    logInfo("project_data_migration.checksum_enabled", {
+      reason: "PROJECT_DATA_MIGRATION_VERIFY_CHECKSUMS=1"
+    });
   }
 }

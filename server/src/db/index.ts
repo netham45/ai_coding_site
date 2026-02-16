@@ -6,6 +6,7 @@ export {
   ProjectDbError,
   closeAllProjectDbs,
   closeProjectDb,
+  detectProjectDbMetadata,
   ensureProjectDb,
   getProjectConfig,
   getProjectDb,
