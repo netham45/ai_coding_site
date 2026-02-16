@@ -272,7 +272,7 @@ export function ProjectDetailPage() {
       setForm(initialForm);
       await loadData();
       toast({ status: "success", title: "Task created" });
-      navigate(`/tasks/${created.task.id}?tab=terminal`);
+      navigate(`/tasks/${created.task.id}?tab=ide`);
     } catch (error: any) {
       toast({ status: "error", title: "Task create failed", description: error.message });
     } finally {
