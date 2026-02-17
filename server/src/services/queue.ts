@@ -1,7 +1,7 @@
 import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { startTaskRuntimeWorker } from "./runtimeWorker.js";
 
-const QUEUE_INTERVAL_MS = 1500;
+const QUEUE_INTERVAL_MS = 10_000;
 const MAX_TASKS_PER_PASS = 8;
 const startingTaskIds = new Set<string>();
 

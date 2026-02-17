@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { ensureProjectDb, upsertProjectConfig } from "./projectDb.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
-import { isCleanupPhaseEnabled } from "./splitPersistence.js";
+import { invalidateMigrationStatusCache, isCleanupPhaseEnabled } from "./splitPersistence.js";
 import { nowIso } from "../utils/time.js";
 import { logInfo, logWarn } from "../utils/structuredLog.js";
 
@@ -196,6 +196,7 @@ function upsertMigrationStatus(params: {
     createdAt,
     now
   );
+  invalidateMigrationStatusCache(params.projectId);
 }
 
 function buildUpsertSql(table: string, columns: string[], conflictColumns: string[]): string {

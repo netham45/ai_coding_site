@@ -422,5 +422,5 @@ export function startIdeHeartbeat(onDown: (taskId: string) => void): void {
         onDown(taskId);
       }
     }
-  }, 3000).unref();
+  }, 30_000).unref();
 }

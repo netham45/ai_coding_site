@@ -58,10 +58,13 @@ type CachedProjectDb = {
   basePath: string;
   dbPath: string;
   db: Database.Database;
+  metadata: ProjectDbMetadata;
+  lastValidatedAtMs: number;
 };
 
 const cacheByPath = new Map<string, CachedProjectDb>();
 const projectPathById = new Map<string, string>();
+const CACHED_HANDLE_VALIDATION_INTERVAL_MS = 60_000;
 
 type EnsureProjectDbParams = {
   projectId: string;
@@ -283,19 +286,35 @@ function validateCachedHandle(params: {
   allowCreate: boolean;
   configDefaults?: Partial<Omit<ProjectConfigRow, "project_id" | "created_at" | "updated_at">>;
 }): ProjectDbHandle {
+  if (params.cached.projectId !== params.projectId) {
+    closeProjectDb({ dbPath: params.dbPath });
+    throw new ProjectDbError(
+      "PROJECT_DB_CORRUPT",
+      `Project database cache mismatch: expected project_id=${params.projectId}, found project_id=${params.cached.projectId}`
+    );
+  }
+
   try {
-    const metadata = readValidatedProjectMetadata(params.cached.db, params.projectId, { allowCreate: params.allowCreate });
-    ensureProjectConfigRow(params.cached.db, params.projectId, {
-      allowCreate: params.allowCreate,
-      defaults: params.configDefaults
-    });
+    const shouldRevalidate =
+      params.allowCreate ||
+      Date.now() - params.cached.lastValidatedAtMs >= CACHED_HANDLE_VALIDATION_INTERVAL_MS;
+    if (shouldRevalidate) {
+      const metadata = readValidatedProjectMetadata(params.cached.db, params.projectId, { allowCreate: params.allowCreate });
+      ensureProjectConfigRow(params.cached.db, params.projectId, {
+        allowCreate: params.allowCreate,
+        defaults: params.configDefaults
+      });
+      params.cached.metadata = metadata;
+      params.cached.lastValidatedAtMs = Date.now();
+    }
+
     projectPathById.set(params.projectId, params.dbPath);
     return {
       projectId: params.projectId,
       basePath: params.cached.basePath,
       dbPath: params.dbPath,
       db: params.cached.db,
-      metadata
+      metadata: params.cached.metadata
     };
   } catch (error) {
     const message = isProjectDbError(error)
@@ -400,7 +419,7 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
       allowCreate,
       defaults: params.configDefaults
     });
-    cacheByPath.set(dbPath, { projectId, basePath, dbPath, db });
+    cacheByPath.set(dbPath, { projectId, basePath, dbPath, db, metadata, lastValidatedAtMs: Date.now() });
     projectPathById.set(projectId, dbPath);
     return {
       projectId,

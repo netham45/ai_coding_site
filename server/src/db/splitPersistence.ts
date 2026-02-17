@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
-import { getProjectDb, isProjectDbError } from "./projectDb.js";
+import fs from "node:fs";
+import path from "node:path";
+import { PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME, getProjectDb, isProjectDbError } from "./projectDb.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { logWarn } from "../utils/structuredLog.js";
 
@@ -39,6 +41,8 @@ const REQUIRED_MONOLITH_TABLES = [
 
 let monolithTableSupportCache: boolean | undefined;
 let migrationTableSupportCache: boolean | undefined;
+const MIGRATION_STATUS_CACHE_TTL_MS = 5000;
+const migrationStatusByProjectId = new Map<string, { status: MigrationStatus | undefined; expiresAtMs: number }>();
 
 function tableExists(db: Database.Database, table: string): boolean {
   const row = db
@@ -79,10 +83,28 @@ function migrationStatusForProject(db: Database.Database, projectId: string): Mi
   if (!hasMigrationTable(db)) {
     return undefined;
   }
+  const now = Date.now();
+  const cached = migrationStatusByProjectId.get(projectId);
+  if (cached && cached.expiresAtMs > now) {
+    return cached.status;
+  }
   const row = db
     .prepare("SELECT status FROM project_data_migrations WHERE project_id = ?")
     .get(projectId) as { status: MigrationStatus } | undefined;
-  return row?.status;
+  const status = row?.status;
+  migrationStatusByProjectId.set(projectId, {
+    status,
+    expiresAtMs: now + MIGRATION_STATUS_CACHE_TTL_MS
+  });
+  return status;
+}
+
+export function invalidateMigrationStatusCache(projectId?: string): void {
+  if (projectId) {
+    migrationStatusByProjectId.delete(projectId);
+    return;
+  }
+  migrationStatusByProjectId.clear();
 }
 
 function shouldPreferProjectBackend(phase: SplitPersistencePhase, intent: SplitPersistenceIntent): boolean {
@@ -100,13 +122,20 @@ function isProjectBackendAllowedByMigration(status: MigrationStatus | undefined)
   return status === "verified" || status === "cleaned";
 }
 
+function hasProjectDbFile(basePath: string): boolean {
+  const dbPath = path.join(path.resolve(basePath), PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME);
+  return fs.existsSync(dbPath);
+}
+
 export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): ResolveProjectDatabaseResult {
   const phase = getSplitPersistencePhase();
   const monolithSupported = hasRequiredMonolithTables(params.appDb);
   const preferProject = shouldPreferProjectBackend(phase, params.intent) || !monolithSupported;
   const migrationStatus = migrationStatusForProject(params.appDb, params.projectId);
+  const canAttemptProjectDb =
+    !monolithSupported || migrationStatus !== undefined || hasProjectDbFile(params.basePath);
 
-  if (preferProject && isProjectBackendAllowedByMigration(migrationStatus)) {
+  if (preferProject && canAttemptProjectDb && isProjectBackendAllowedByMigration(migrationStatus)) {
     try {
       return {
         backend: "project",
@@ -144,4 +173,5 @@ export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): Re
 export function resetSplitPersistenceCachesForTests(): void {
   monolithTableSupportCache = undefined;
   migrationTableSupportCache = undefined;
+  migrationStatusByProjectId.clear();
 }

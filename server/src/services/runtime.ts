@@ -62,8 +62,8 @@ type RuntimeProjectContext = {
 };
 
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
-const WAITING_INPUT_IDLE_MS = 3000;
-const HEARTBEAT_INTERVAL_MS = 1500;
+const WAITING_INPUT_IDLE_MS = 65_000;
+const HEARTBEAT_INTERVAL_MS = 10_000;
 const OUTPUT_PERSIST_INTERVAL_MS = 15000;
 const AUTO_MERGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTO_MERGE_POLL_INTERVAL_MS = 1250;
@@ -468,6 +468,27 @@ function saveTaskResult(projectDb: Database.Database, taskId: string, result: st
   projectDb.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(result, nowIso(), taskId);
 }
 
+function ensureWorkspaceGitignoreRule(workspacePath: string, rule: string): void {
+  const gitignorePath = path.join(workspacePath, ".gitignore");
+  let existing = "";
+  try {
+    existing = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, "utf8") : "";
+  } catch {
+    existing = "";
+  }
+
+  const hasRule = existing
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .includes(rule);
+  if (hasRule) {
+    return;
+  }
+
+  const next = existing.length === 0 ? `${rule}\n` : `${existing.replace(/\s*$/, "\n")}${rule}\n`;
+  fs.writeFileSync(gitignorePath, next, "utf8");
+}
+
 async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string, context: RuntimeTaskContext): Promise<string> {
   const taskContext = resolveTaskProjectContext(taskId, context);
   const task = getTask(taskContext.projectDb, taskId);
@@ -628,7 +649,7 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
   const taskContext = resolveTaskProjectContext(taskId, context);
   const scopeHint = contextHintFromProjectContext(taskContext);
   const task = getTask(taskContext.projectDb, taskId);
-  if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
+  if (!task || !task.auto_merge || !["waiting_input", "merge_ready", "merge_conflict"].includes(task.status)) {
     return;
   }
 
@@ -636,6 +657,39 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
   const topology = resolveTaskGitTopology(taskContext.projectDb, task, project);
 
   const actorUserId = task.created_by_user_id;
+  if (task.status === "merge_conflict") {
+    const latestConflict = taskContext.projectDb
+      .prepare("SELECT conflict_summary FROM merge_records WHERE task_id = ? AND status = 'conflict' ORDER BY created_at DESC LIMIT 1")
+      .get(task.id) as { conflict_summary?: string | null } | undefined;
+    const conflictSummary = String(latestConflict?.conflict_summary ?? "").trim();
+    ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-coding-site*.code-workspace");
+    ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-task-summary.md");
+    await sendTaskRuntimeInput(
+      task.id,
+      actorUserId,
+      [
+        "Auto-merge hit merge conflicts. Resolve them now in this task branch.",
+        "",
+        conflictSummary ? "Conflict details:" : "Conflict details unavailable in merge record.",
+        conflictSummary || "(none recorded)",
+        "",
+        "Required next steps:",
+        "1) Pull/rebase as needed and resolve conflicts in this task workspace.",
+        "2) Stage and commit ALL workspace changes (`git add -A`).",
+        "3) Leave no modified, deleted, or untracked files.",
+        "4) Stay in the runtime and wait for further input when done."
+      ].join("\n"),
+      scopeHint
+    );
+    updateTaskStatus(taskContext.projectDb, {
+      taskId: task.id,
+      toStatus: "waiting_input",
+      reason: "auto_merge_conflict_retry_requested",
+      actorUserId
+    });
+    return;
+  }
+
   const sourceCommitSha = await getHeadCommitSha(task.workspace_path);
   const targetBaseCommitSha = await getHeadCommitSha(topology.mergeTargetPath);
   const mergeRecordId = makeId();
@@ -657,13 +711,38 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
   });
 
   try {
-    await ensureTaskSummaryCaptured(task.id, actorUserId, scopeHint);
+    let mergeReadyTask: TaskRow;
+    if (task.status === "merge_ready") {
+      mergeReadyTask = task;
+    } else {
+      await ensureTaskSummaryCaptured(task.id, actorUserId, scopeHint);
+      ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-coding-site*.code-workspace");
+      ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-task-summary.md");
+
+      await sendTaskRuntimeInput(
+        task.id,
+        actorUserId,
+        [
+          "Auto-merge requested.",
+          "Please do all of the following now:",
+          "1) Pull in any latest changes if needed.",
+          "2) Resolve any issues.",
+          "3) Stage and commit ALL workspace changes to this task branch (use `git add -A`). Include .gitignore updates and do not leave modified, deleted, or untracked files.",
+          "4) Do not exit the runtime. Leave it running and wait for further input when done."
+        ].join("\n"),
+        scopeHint
+      );
+
+      mergeReadyTask = await awaitAutoMergeReady(taskContext.projectDb, task.id);
+    }
 
     const pullResult = await pullRemoteRefIntoTaskWorkspace({
-      workspacePath: task.workspace_path,
+      workspacePath: mergeReadyTask.workspace_path,
       remoteRef: topology.pullRemoteRef
     });
-    taskContext.projectDb.prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?").run(pullResult.headCommitSha, nowIso(), task.id);
+    taskContext.projectDb
+      .prepare("UPDATE tasks SET head_commit_sha = ?, updated_at = ? WHERE id = ?")
+      .run(pullResult.headCommitSha, nowIso(), task.id);
     if (pullResult.conflicted) {
       throw new Error(
         pullResult.conflictFiles.length
@@ -672,21 +751,6 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
       );
     }
 
-    await sendTaskRuntimeInput(
-      task.id,
-      actorUserId,
-      [
-        "Auto-merge requested.",
-        "Please do all of the following now:",
-        "1) Pull in any latest changes if needed.",
-        "2) Resolve any issues.",
-        "3) Commit all required code changes to this task branch.",
-        "4) Do not exit the runtime. Leave it running and wait for further input when done."
-      ].join("\n"),
-      scopeHint
-    );
-
-    const mergeReadyTask = await awaitAutoMergeReady(taskContext.projectDb, task.id);
     const mergeResult = await mergeTaskWorkspaceIntoTarget({
       targetPath: topology.mergeTargetPath,
       targetBranch: topology.mergeTargetBranch,
@@ -736,9 +800,34 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
       database: taskContext.projectDb
     });
   } catch (error: any) {
+    const failureMessage = String(error?.message ?? "auto-merge failed");
+    try {
+      ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-coding-site*.code-workspace");
+      ensureWorkspaceGitignoreRule(task.workspace_path, ".ai-task-summary.md");
+      await sendTaskRuntimeInput(
+        task.id,
+        actorUserId,
+        [
+          "Auto-merge failed. Fix this now before waiting again.",
+          "",
+          "Exact error:",
+          failureMessage,
+          "",
+          "Required next steps:",
+          "1) Resolve the issue that caused this failure.",
+          "2) Stage and commit ALL workspace changes (`git add -A`).",
+          "3) Leave no modified, deleted, or untracked files.",
+          "4) Stay in the runtime and wait for further input when done."
+        ].join("\n"),
+        scopeHint
+      );
+    } catch {
+      // best effort: failure notification to runtime should not block status/error persistence
+    }
+
     const completedAt = nowIso();
     taskContext.projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
-      String(error?.message ?? "auto-merge failed"),
+      failureMessage,
       completedAt,
       mergeRecordId
     );
@@ -747,7 +836,7 @@ async function runAutoMerge(taskId: string, context?: RuntimeTaskContext): Promi
       projectId: task.project_id,
       taskId: task.id,
       eventType: "task.auto_merge.failed",
-      payload: { error: String(error?.message ?? "auto-merge failed") },
+      payload: { error: failureMessage },
       database: taskContext.projectDb
     });
   }
@@ -767,7 +856,7 @@ function maybeStartAutoMerge(taskId: string, context?: RuntimeTaskContext): void
     return;
   }
 
-  if (!task || !task.auto_merge || !["waiting_input", "merge_ready"].includes(task.status)) {
+  if (!task || !task.auto_merge || !["waiting_input", "merge_ready", "merge_conflict"].includes(task.status)) {
     return;
   }
 
@@ -781,10 +870,11 @@ export function triggerAutoMergeIfEligible(taskId: string, context?: RuntimeTask
   maybeStartAutoMerge(taskId, context);
 }
 
-function kickPendingAutoMergeTasks(): void {
-  for (const context of listAvailableProjectContexts()) {
+function kickPendingAutoMergeTasks(contexts?: RuntimeProjectContext[]): void {
+  const activeContexts = contexts ?? listAvailableProjectContexts();
+  for (const context of activeContexts) {
     const pendingAutoMergeTasks = context.projectDb
-      .prepare("SELECT id FROM tasks WHERE auto_merge = 1 AND status IN ('waiting_input', 'merge_ready')")
+      .prepare("SELECT id FROM tasks WHERE auto_merge = 1 AND status IN ('waiting_input', 'merge_ready', 'merge_conflict')")
       .all() as Array<{ id: string }>;
     for (const task of pendingAutoMergeTasks) {
       maybeStartAutoMerge(task.id, contextHintFromProjectContext(context));
@@ -1106,9 +1196,10 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
 
 export async function recoverRuntimeSessions(): Promise<void> {
   await ensureTmuxAvailable();
-  kickPendingAutoMergeTasks();
+  const contexts = listAvailableProjectContexts();
+  kickPendingAutoMergeTasks(contexts);
 
-  for (const context of listAvailableProjectContexts()) {
+  for (const context of contexts) {
     const rows = listSessionsForHeartbeat(context.projectDb);
 
     for (const row of rows) {
@@ -1134,9 +1225,9 @@ export async function startRuntimeHeartbeat(): Promise<void> {
   }
 
   heartbeatTimer = setInterval(async () => {
-    kickPendingAutoMergeTasks();
-
-    for (const context of listAvailableProjectContexts()) {
+    const contexts = listAvailableProjectContexts();
+    kickPendingAutoMergeTasks(contexts);
+    for (const context of contexts) {
       const activeSessions = listSessionsForHeartbeat(context.projectDb);
 
       for (const session of activeSessions) {

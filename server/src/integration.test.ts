@@ -307,6 +307,28 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.ok(health.json?.diagnostics?.projectDb?.failureCounts?.["open:PROJECT_DB_CORRUPT"] >= 1);
   });
 
+  test("write_cutover falls back to monolith without open failures when project DB file is absent", async () => {
+    const userId = createUser();
+    const missingBasePath = randomPath("missing-fallback");
+    const projectId = createProject({ userId, basePath: missingBasePath, cloneStatus: "ready" });
+    const previousPhase = process.env.SPLIT_PERSISTENCE_PHASE;
+    process.env.SPLIT_PERSISTENCE_PHASE = "write_cutover";
+    resetSplitPersistenceCachesForTests();
+
+    try {
+      const response = await callApi(`/api/projects/${projectId}/tasks`, { userId });
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.json?.tasks, []);
+
+      const health = await callApi("/api/health", { userId });
+      assert.equal(health.status, 200);
+      assert.equal(health.json?.diagnostics?.projectDb?.failureCounts?.["open:PROJECT_DB_UNAVAILABLE"] ?? 0, 0);
+    } finally {
+      process.env.SPLIT_PERSISTENCE_PHASE = previousPhase;
+      resetSplitPersistenceCachesForTests();
+    }
+  });
+
   test("portability metadata detection reads cloned project DB metadata and catches project-id mismatch", () => {
     const sourceProjectId = randomUUID();
     const sourceBasePath = randomPath("portable-source");
