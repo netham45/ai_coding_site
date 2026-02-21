@@ -1,7 +1,7 @@
 import net from "node:net";
 import type { Server as HttpServer, IncomingMessage } from "node:http";
 import { URL } from "node:url";
-import { db } from "../db/index.js";
+import { db, isProjectDbError, resolveProjectDatabase } from "../db/index.js";
 import { ideSessionTarget } from "../services/ide.js";
 
 function resolveUserIdFromUpgrade(req: IncomingMessage): string | null {
@@ -17,15 +17,36 @@ function resolveUserIdFromUpgrade(req: IncomingMessage): string | null {
 }
 
 function canAccessTask(taskId: string, userId: string): boolean {
-  const row = db
+  const projects = db
     .prepare(
-      `SELECT t.id
-       FROM tasks t
-       JOIN project_members pm ON pm.project_id = t.project_id
-       WHERE t.id = ? AND pm.user_id = ?`
+      `SELECT p.id, p.base_path
+       FROM projects p
+       JOIN project_members pm ON pm.project_id = p.id
+       WHERE pm.user_id = ?`
     )
-    .get(taskId, userId) as { id: string } | undefined;
-  return Boolean(row?.id);
+    .all(userId) as Array<{ id: string; base_path: string }>;
+
+  for (const project of projects) {
+    try {
+      const projectDb = resolveProjectDatabase({
+        appDb: db,
+        projectId: project.id,
+        basePath: project.base_path,
+        intent: "read"
+      }).database;
+      const row = projectDb
+        .prepare("SELECT id FROM tasks WHERE id = ? AND project_id = ?")
+        .get(taskId, project.id) as { id: string } | undefined;
+      if (row?.id) {
+        return true;
+      }
+    } catch (error) {
+      if (!isProjectDbError(error)) {
+        throw error;
+      }
+    }
+  }
+  return false;
 }
 
 function canAccessProject(projectId: string, userId: string): boolean {

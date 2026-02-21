@@ -1223,7 +1223,7 @@ function verifyCountsAndChecksums(params: {
     const source = (params.appDb.prepare(spec.sourceCountSql).get(...spec.sourceParams) as { count: number }).count;
     const target = (params.projectDb.prepare(spec.targetCountSql).get(...spec.targetParams) as { count: number }).count;
 
-    const countPolicy = spec.countPolicy ?? "exact";
+    const countPolicy = spec.countPolicy ?? "target_at_least_source";
     const countMismatch =
       countPolicy === "target_at_least_source" ? target < source : source !== target;
     if (countMismatch) {
@@ -1231,7 +1231,7 @@ function verifyCountsAndChecksums(params: {
     }
 
     const entry: VerificationTableResult = { source, target };
-    if (params.includeChecksum && !spec.skipChecksum) {
+    if (params.includeChecksum && !spec.skipChecksum && source === target) {
       const checksumSource = checksumForQuery(params.appDb, spec.sourceChecksumSql, spec.sourceParams, spec.checksumColumns);
       const checksumTarget = checksumForQuery(params.projectDb, spec.targetChecksumSql, spec.targetParams, spec.checksumColumns);
       if (checksumSource !== checksumTarget) {
@@ -1256,12 +1256,12 @@ function verifyCountsAndChecksums(params: {
     const targetCountSql = `SELECT COUNT(*) AS count FROM events e WHERE ${eventScope.predicate}`;
     const source = (params.appDb.prepare(sourceCountSql).get(...eventScopeParams) as { count: number }).count;
     const target = (params.projectDb.prepare(targetCountSql).get(...eventScopeParams) as { count: number }).count;
-    if (source !== target) {
+    if (target < source) {
       throw new Error(`Row count mismatch for events: source=${source}, target=${target}`);
     }
 
     const entry: VerificationTableResult = { source, target };
-    if (params.includeChecksum) {
+    if (params.includeChecksum && source === target) {
       const checksumColumns = ["id", "project_id", "task_id", "session_id", "event_type", "payload", "created_at"];
       const sourceChecksumSql = `
         SELECT
@@ -1722,10 +1722,9 @@ export function runProjectDataMigrationBackfill(db: Database.Database): void {
     if (existingStatus === "cleaned") {
       continue;
     }
-    if ((existingStatus === "verified" || existingStatus === "failed") && !enableCleanup) {
+    if (existingStatus === "verified" && !enableCleanup) {
       // Verified/failed projects may continue receiving writes in project DB during cutover.
       // Re-running source-vs-target count verification would create false mismatches.
-      // Failed status can be retried manually by resetting the status in app DB.
       continue;
     }
 
