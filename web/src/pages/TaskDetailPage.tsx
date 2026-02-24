@@ -304,13 +304,23 @@ export function TaskDetailPage() {
       }
       if (response.sync.conflicted) {
         const count = response.sync.conflictFiles.length;
+        const conflictTitle = task?.mode === "plan"
+          ? "Pulled from base with conflicts"
+          : isPlanOwnedExecutionTask
+            ? "Pulled from plan branch with conflicts"
+            : "Pulled from main with conflicts";
         toast({
           status: "warning",
-          title: isPlanOwnedExecutionTask ? "Pulled from plan branch with conflicts" : "Pulled from main with conflicts",
+          title: conflictTitle,
           description: count ? `${count} conflict file(s) detected.` : "Conflicts detected."
         });
       } else {
-        toast({ status: "success", title: isPlanOwnedExecutionTask ? "Pulled latest plan branch into task workspace" : "Pulled latest main into task workspace" });
+        const successTitle = task?.mode === "plan"
+          ? "Pulled latest base into plan workspace"
+          : isPlanOwnedExecutionTask
+            ? "Pulled latest plan branch into task workspace"
+            : "Pulled latest main into task workspace";
+        toast({ status: "success", title: successTitle });
       }
     } catch (error: any) {
       toast({ status: "error", title: "Pull from main failed", description: error.message });
@@ -658,6 +668,9 @@ export function TaskDetailPage() {
                 <Flex justify="flex-end">
                   {task.mode === "plan" ? (
                     <Stack direction={{ base: "column", md: "row" }} spacing={2}>
+                      <Button colorScheme="teal" variant="outline" size="sm" onClick={pullFromMain} isLoading={syncingMain} isDisabled={task.isBlocked}>
+                        Pull From Base Repo
+                      </Button>
                       <Button colorScheme="purple" variant="outline" size="sm" onClick={extractPlanTasks} isLoading={extractingPlan}>
                         Extract Proposed Tasks
                       </Button>
