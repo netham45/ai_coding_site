@@ -136,6 +136,13 @@ function printResult(result: unknown, asJson: boolean): void {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
+  if (result && typeof result === "object" && "summary" in result) {
+    const summary = (result as { summary?: unknown }).summary;
+    if (typeof summary === "string" && summary.trim().length > 0) {
+      console.log(summary);
+      return;
+    }
+  }
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -171,8 +178,12 @@ function helpText(): string {
     "  ide status <taskId>",
     "  ide start <taskId>",
     "  ide stop <taskId>",
-    "  ready_merge <taskId>",
-    "  merge <taskId>",
+    "  ready_merge <taskId> (task alias)",
+    "  ready_merge task <taskId>",
+    "  ready_merge plan <planId>",
+    "  merge <taskId> (task alias)",
+    "  merge task <taskId>",
+    "  merge plan <planId>",
     "",
     "Global options:",
     "  --json     Output machine-readable JSON",
@@ -360,6 +371,23 @@ async function handleIde(args: string[], userId: string, services: Services): Pr
   argError(`Unknown ide subcommand: ${subcommand}`);
 }
 
+function parseEntityId(
+  args: string[],
+  fallbackEntity: "task" | "plan" = "task"
+): { entity: "task" | "plan"; id: string } {
+  const [first, second] = args;
+  if (!first) {
+    argError("Missing target id");
+  }
+  if (!second) {
+    return { entity: fallbackEntity, id: first };
+  }
+  if (first !== "task" && first !== "plan") {
+    argError(`Unknown target entity: ${first}`);
+  }
+  return { entity: first, id: second };
+}
+
 async function run(): Promise<void> {
   const argv = process.argv.slice(2);
   const parsed = parseArgv(argv);
@@ -400,13 +428,19 @@ async function run(): Promise<void> {
   } else if (command === "ide") {
     result = await handleIde(rest, userId, services);
   } else if (command === "ready_merge") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.markTaskMergeReady({ userId, taskId });
+    const parsedTarget = parseEntityId(parsed.positionals.slice(1), "task");
+    if (parsedTarget.entity === "task") {
+      result = await services.markTaskMergeReady({ userId, taskId: parsedTarget.id });
+    } else {
+      result = await services.markPlanMergeReady({ userId, planId: parsedTarget.id });
+    }
   } else if (command === "merge") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.mergeTask({ userId, taskId });
+    const parsedTarget = parseEntityId(parsed.positionals.slice(1), "task");
+    if (parsedTarget.entity === "task") {
+      result = await services.mergeTask({ userId, taskId: parsedTarget.id });
+    } else {
+      result = await services.mergePlan({ userId, planId: parsedTarget.id });
+    }
   } else {
     argError(`Unknown command: ${command}`);
   }
