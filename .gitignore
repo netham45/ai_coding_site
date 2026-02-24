@@ -11,3 +11,4 @@ repos/*
 .ai-task-summary.md
 .ai-coding/
 .ai-plan/
+server/.tmp/
