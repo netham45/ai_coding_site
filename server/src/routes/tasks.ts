@@ -14,6 +14,7 @@ import {
   getWorkspaceGitStatus,
   mergeTaskWorkspaceIntoTarget,
   pullRemoteRefIntoTaskWorkspace,
+  refreshBaseFromOrigin,
   taskBranchName
 } from "../services/git.js";
 import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
@@ -851,6 +852,18 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to resolve task repository topology") });
     return;
+  }
+
+  if (!task.parent_plan_task_id) {
+    try {
+      await refreshBaseFromOrigin({
+        basePath: project.base_path,
+        defaultBranch: project.default_branch
+      });
+    } catch (error: any) {
+      res.status(409).json({ error: String(error?.message ?? "Failed to refresh base repository") });
+      return;
+    }
   }
 
   let pullResult: Awaited<ReturnType<typeof pullRemoteRefIntoTaskWorkspace>>;
