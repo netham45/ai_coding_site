@@ -81,6 +81,11 @@ function memberProjectsForUser(userId: string): ProjectRow[] {
     .all(userId) as ProjectRow[];
 }
 
+type UserProjectContext = {
+  project: ProjectRow;
+  projectDb: Database.Database;
+};
+
 function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Database.Database {
   try {
     return resolveProjectDatabase({
@@ -92,6 +97,21 @@ function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Data
   } catch (error) {
     throwIfProjectDbError(error);
   }
+}
+
+function contextsForUser(params: { userId: string; intent: "read" | "write"; projectId?: string }): UserProjectContext[] {
+  if (params.projectId) {
+    const project = projectForUser(params.projectId, params.userId);
+    if (!project) {
+      throw new CliServiceError("NOT_FOUND", "Project not found");
+    }
+    return [{ project, projectDb: projectDatabaseFor(project, params.intent) }];
+  }
+
+  return memberProjectsForUser(params.userId).map((project) => ({
+    project,
+    projectDb: projectDatabaseFor(project, params.intent)
+  }));
 }
 
 function taskForUser(
@@ -107,6 +127,28 @@ function taskForUser(
       .get(taskId, project.id) as TaskRow | undefined;
     if (task) {
       return { task, project, projectDb };
+    }
+  }
+  return undefined;
+}
+
+function taskForUserWithFilters(
+  params: { taskId: string; userId: string; intent: "read" | "write"; projectId?: string; planId?: string }
+): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
+  const contexts = contextsForUser({ userId: params.userId, intent: params.intent, projectId: params.projectId });
+  for (const context of contexts) {
+    const task = context.projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE id = ?
+           AND project_id = ?
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         LIMIT 1`
+      )
+      .get(params.taskId, context.project.id, params.planId ?? null, params.planId ?? null) as TaskRow | undefined;
+    if (task) {
+      return { task, project: context.project, projectDb: context.projectDb };
     }
   }
   return undefined;
@@ -502,15 +544,44 @@ async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, id
 }
 
 export async function listTasks(params: { userId: string; projectId: string }) {
-  const project = projectForUser(params.projectId, params.userId);
-  if (!project) {
-    throw new CliServiceError("NOT_FOUND", "Project not found");
-  }
-  const projectDb = projectDatabaseFor(project, "read");
-  const tasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
-  return { tasks: tasks.map((task) => serializeTask(projectDb, task)) };
+  return listAllTasks({ userId: params.userId, projectId: params.projectId });
+}
+
+export async function listAllTasks(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const tasks = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'execution'
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((task) => serializeTask(projectDb, task));
+  });
+  return { tasks };
+}
+
+export async function listActiveTasks(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const tasks = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'execution'
+           AND status IN ('queued', 'in_progress', 'waiting_input', 'merge_ready', 'merge_conflict')
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((task) => serializeTask(projectDb, task));
+  });
+  return { tasks };
 }
 
 export async function createTask(params: {
@@ -629,6 +700,72 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord)
+  };
+}
+
+export async function getTaskDetails(params: { userId: string; taskId: string; projectId?: string; planId?: string }) {
+  const scopedTask = taskForUserWithFilters({
+    taskId: params.taskId,
+    userId: params.userId,
+    intent: "read",
+    projectId: params.projectId,
+    planId: params.planId
+  });
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Task not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const transitions = projectDb
+    .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as TaskTransitionRow[];
+  const mergeRecords = projectDb
+    .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
+    .all(task.id) as MergeRecordRow[];
+
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
+  try {
+    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+  } catch {
+    gitStatus = null;
+  }
+
+  return {
+    task: serializeTask(projectDb, task),
+    transitions: transitions.map(serializeTransition),
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id)),
+    gitStatus,
+    mergeRecords: mergeRecords.map(serializeMergeRecord)
+  };
+}
+
+export async function getTaskSummary(params: { userId: string; taskId: string; projectId?: string; planId?: string }) {
+  const scopedTask = taskForUserWithFilters({
+    taskId: params.taskId,
+    userId: params.userId,
+    intent: "read",
+    projectId: params.projectId,
+    planId: params.planId
+  });
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Task not found");
+  }
+  const { task, projectDb } = scopedTask;
+  return {
+    task: {
+      id: task.id,
+      projectId: task.project_id,
+      parentPlanTaskId: task.parent_plan_task_id,
+      title: task.title,
+      mode: task.mode,
+      status: task.status,
+      isBlocked: taskIsBlocked(projectDb, task.id),
+      result: task.result,
+      createdAt: task.created_at,
+      updatedAt: task.updated_at
+    },
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id))
   };
 }
 
@@ -1109,16 +1246,22 @@ export async function ideStop(params: { userId: string; taskId: string }) {
   return { ide: serializeIde(updated) };
 }
 
-export async function listPlans(params: { userId: string; projectId: string }) {
-  const project = projectForUser(params.projectId, params.userId);
-  if (!project) {
-    throw new CliServiceError("NOT_FOUND", "Project not found");
-  }
-  const projectDb = projectDatabaseFor(project, "read");
-  const plans = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND mode = 'plan' ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
-  return { plans: plans.map((plan) => serializeTask(projectDb, plan)) };
+export async function listPlans(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const plans = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'plan'
+           AND (? IS NULL OR id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((plan) => serializeTask(projectDb, plan));
+  });
+  return { plans };
 }
 
 export async function createPlan(params: { userId: string; projectId: string; title: string; taskPrompt: string; aiCommand?: string }) {
