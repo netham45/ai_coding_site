@@ -25,6 +25,7 @@ type TaskEdit = {
 };
 
 type Services = typeof import("../application/cliServices.js");
+type OutputHint = "taskCreate" | "planCreate" | "planReview" | "default";
 
 class CliArgError extends Error {}
 
@@ -87,6 +88,14 @@ function booleanFlag(parsed: ParsedArgv, name: string): boolean {
   argError(`Invalid boolean for --${name}: ${String(value)}`);
 }
 
+function optionalProjectId(parsed: ParsedArgv): string | undefined {
+  return optionalFlag(parsed, "project-id") ?? optionalFlag(parsed, "project");
+}
+
+function optionalPlanId(parsed: ParsedArgv): string | undefined {
+  return optionalFlag(parsed, "plan-id");
+}
+
 function csvFlag(parsed: ParsedArgv, name: string): string[] {
   const raw = optionalFlag(parsed, name);
   if (!raw) return [];
@@ -123,10 +132,77 @@ function isJsonOutput(parsed: ParsedArgv): boolean {
   return booleanFlag(parsed, "json");
 }
 
-function printResult(result: unknown, asJson: boolean): void {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function asNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function printResult(result: unknown, asJson: boolean, hint: OutputHint): void {
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
     return;
+  }
+
+  if (hint === "taskCreate") {
+    const root = asRecord(result);
+    const task = asRecord(root?.task);
+    if (task) {
+      const blockedBy = Array.isArray(task.blockedByTaskIds) ? task.blockedByTaskIds.length : 0;
+      console.log(`Created task ${asString(task.id)} (${asString(task.status)})`);
+      console.log(`Project: ${asString(task.projectId)}`);
+      console.log(`Title: ${asString(task.title)}`);
+      console.log(`Blocked by dependencies: ${blockedBy > 0 ? "yes" : "no"}`);
+      return;
+    }
+  }
+
+  if (hint === "planCreate") {
+    const root = asRecord(result);
+    const plan = asRecord(root?.plan);
+    if (plan) {
+      console.log(`Created plan ${asString(plan.id)} (${asString(plan.status)})`);
+      console.log(`Project: ${asString(plan.projectId)}`);
+      console.log(`Title: ${asString(plan.title)}`);
+      return;
+    }
+  }
+
+  if (hint === "planReview") {
+    const root = asRecord(result);
+    const plan = asRecord(root?.plan);
+    const revisions = Array.isArray(root?.revisions) ? root.revisions : [];
+    const approvedTasks = Array.isArray(root?.approvedTasks) ? root.approvedTasks : [];
+    if (plan) {
+      const latest = asRecord(revisions[0]);
+      const latestItems = latest && Array.isArray(latest.items) ? latest.items.length : 0;
+      console.log(`Plan ${asString(plan.id)} (${asString(plan.status)}): ${asString(plan.title)}`);
+      console.log(`Revisions: ${revisions.length}`);
+      console.log(`Approved tasks: ${approvedTasks.length}`);
+      if (latest) {
+        console.log(
+          `Latest revision: #${asNumber(latest.revisionNumber)} ${asString(latest.status)} (${latestItems} item${latestItems === 1 ? "" : "s"})`
+        );
+      }
+      return;
+    }
+  }
+
+  if (result && typeof result === "object" && "summary" in result) {
+    const summary = (result as { summary?: unknown }).summary;
+    if (typeof summary === "string" && summary.trim().length > 0) {
+      console.log(summary);
+      return;
+    }
   }
   console.log(JSON.stringify(result, null, 2));
 }
@@ -136,31 +212,42 @@ function helpText(): string {
     "Usage: acs <command> [subcommand] [options]",
     "",
     "Commands:",
-    "  tasks list --project <projectId>",
-    "  tasks get <taskId>",
+    "  tasks list [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks all [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks active [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks get <taskId> [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks summary <taskId> [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks details <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  tasks create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>] [--depends-on a,b] [--auto-merge]",
     "  tasks start <taskId>",
     "  tasks input <taskId> --text <text>",
     "  tasks pull-main <taskId>",
     "",
-    "  plans list --project <projectId>",
+    "  plans list [--project-id <projectId>] [--plan-id <planId>]",
     "  plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>]",
     "  plans get <planId>",
+    "  plans review <planId>",
     "  plans extract <planId>",
     "  plans regenerate <planId> --feedback <text>",
     "  plans approve <planId> [--auto-merge-item-keys a,b] [--task-edits-file path.json]",
     "",
-    "  info <taskId>",
+    "  info <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  session start <taskId>",
     "  session input <taskId> --text <text>",
     "  create task ... (alias for tasks create)",
     "  create plan ... (alias for plans create)",
-    "  review <taskId>",
+    "  review task <taskId>",
+    "  review plan <planId>",
+    "  review <taskId> (legacy alias for `review task <taskId>`)",
     "  ide status <taskId>",
     "  ide start <taskId>",
     "  ide stop <taskId>",
-    "  ready_merge <taskId>",
-    "  merge <taskId>",
+    "  ready_merge <taskId> (task alias)",
+    "  ready_merge task <taskId>",
+    "  ready_merge plan <planId>",
+    "  merge <taskId> (task alias)",
+    "  merge task <taskId>",
+    "  merge plan <planId>",
     "",
     "Global options:",
     "  --json     Output machine-readable JSON",
@@ -189,12 +276,37 @@ async function handleTasks(args: string[], userId: string, services: Services): 
     argError("Missing tasks subcommand");
   }
 
-  if (subcommand === "list") {
-    return await services.listTasks({ userId, projectId: requireFlag(parsed, "project") });
+  if (subcommand === "list" || subcommand === "all") {
+    return await services.listAllTasks({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
-  if (subcommand === "get") {
+  if (subcommand === "active") {
+    return await services.listActiveTasks({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
+  }
+  if (subcommand === "get" || subcommand === "details") {
     if (!maybeId) argError("Missing taskId");
-    return await services.getTaskInfo({ userId, taskId: maybeId });
+    return await services.getTaskDetails({
+      userId,
+      taskId: maybeId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
+  }
+  if (subcommand === "summary") {
+    if (!maybeId) argError("Missing taskId");
+    return await services.getTaskSummary({
+      userId,
+      taskId: maybeId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
   if (subcommand === "create") {
     return await services.createTask({
@@ -231,7 +343,11 @@ async function handlePlans(args: string[], userId: string, services: Services): 
   }
 
   if (subcommand === "list") {
-    return await services.listPlans({ userId, projectId: requireFlag(parsed, "project") });
+    return await services.listPlans({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
   if (subcommand === "create") {
     return await services.createPlan({
@@ -245,6 +361,10 @@ async function handlePlans(args: string[], userId: string, services: Services): 
   if (subcommand === "get") {
     if (!maybeId) argError("Missing planId");
     return await services.getPlan({ userId, planId: maybeId });
+  }
+  if (subcommand === "review") {
+    if (!maybeId) argError("Missing planId");
+    return await services.reviewPlan({ userId, planId: maybeId });
   }
   if (subcommand === "extract") {
     if (!maybeId) argError("Missing planId");
@@ -319,6 +439,23 @@ async function handleIde(args: string[], userId: string, services: Services): Pr
   argError(`Unknown ide subcommand: ${subcommand}`);
 }
 
+function parseEntityId(
+  args: string[],
+  fallbackEntity: "task" | "plan" = "task"
+): { entity: "task" | "plan"; id: string } {
+  const [first, second] = args;
+  if (!first) {
+    argError("Missing target id");
+  }
+  if (!second) {
+    return { entity: fallbackEntity, id: first };
+  }
+  if (first !== "task" && first !== "plan") {
+    argError(`Unknown target entity: ${first}`);
+  }
+  return { entity: first, id: second };
+}
+
 async function run(): Promise<void> {
   const argv = process.argv.slice(2);
   const parsed = parseArgv(argv);
@@ -334,38 +471,75 @@ async function run(): Promise<void> {
 
   const [command, ...rest] = argv;
   let result: unknown;
+  let outputHint: OutputHint = "default";
 
   if (command === "tasks") {
     result = await handleTasks(rest, userId, services);
+    if (rest[0] === "create") {
+      outputHint = "taskCreate";
+    }
   } else if (command === "plans") {
     result = await handlePlans(rest, userId, services);
+    if (rest[0] === "create") {
+      outputHint = "planCreate";
+    } else if (rest[0] === "review") {
+      outputHint = "planReview";
+    }
   } else if (command === "info") {
     const [taskId] = parsed.positionals.slice(1);
     if (!taskId) argError("Missing taskId");
-    result = await services.getTaskInfo({ userId, taskId });
+    result = await services.getTaskDetails({
+      userId,
+      taskId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   } else if (command === "session") {
     result = await handleSession(rest, userId, services);
   } else if (command === "create") {
     result = await handleCreate(rest, userId, services);
+    if (rest[0] === "task") {
+      outputHint = "taskCreate";
+    } else if (rest[0] === "plan") {
+      outputHint = "planCreate";
+    }
   } else if (command === "review") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.reviewTaskMergeRecords({ userId, taskId });
+    const [subject, id] = parsed.positionals.slice(1);
+    if (!subject) {
+      argError("Missing review target. Use `review task <taskId>` or `review plan <planId>`.");
+    }
+    if (subject === "task") {
+      if (!id) argError("Missing taskId");
+      result = await services.reviewTaskMergeRecords({ userId, taskId: id });
+    } else if (subject === "plan") {
+      if (!id) argError("Missing planId");
+      result = await services.reviewPlan({ userId, planId: id });
+      outputHint = "planReview";
+    } else {
+      // Backward compatible form: `review <taskId>`
+      result = await services.reviewTaskMergeRecords({ userId, taskId: subject });
+    }
   } else if (command === "ide") {
     result = await handleIde(rest, userId, services);
   } else if (command === "ready_merge") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.markTaskMergeReady({ userId, taskId });
+    const parsedTarget = parseEntityId(parsed.positionals.slice(1), "task");
+    if (parsedTarget.entity === "task") {
+      result = await services.markTaskMergeReady({ userId, taskId: parsedTarget.id });
+    } else {
+      result = await services.markPlanMergeReady({ userId, planId: parsedTarget.id });
+    }
   } else if (command === "merge") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.mergeTask({ userId, taskId });
+    const parsedTarget = parseEntityId(parsed.positionals.slice(1), "task");
+    if (parsedTarget.entity === "task") {
+      result = await services.mergeTask({ userId, taskId: parsedTarget.id });
+    } else {
+      result = await services.mergePlan({ userId, planId: parsedTarget.id });
+    }
   } else {
     argError(`Unknown command: ${command}`);
   }
 
-  printResult(result, isJsonOutput(parsed));
+  printResult(result, isJsonOutput(parsed), outputHint);
   process.exitCode = ExitCode.Success;
 }
 

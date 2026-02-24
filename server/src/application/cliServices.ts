@@ -35,6 +35,7 @@ import { nowIso } from "../utils/time.js";
 
 const mergeLocks = new Set<string>();
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
+const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "merge_conflict", "merge_ready"]);
 
 export type CliServiceErrorCode = "VALIDATION" | "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE";
 
@@ -80,6 +81,11 @@ function memberProjectsForUser(userId: string): ProjectRow[] {
     .all(userId) as ProjectRow[];
 }
 
+type UserProjectContext = {
+  project: ProjectRow;
+  projectDb: Database.Database;
+};
+
 function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Database.Database {
   try {
     return resolveProjectDatabase({
@@ -91,6 +97,21 @@ function projectDatabaseFor(project: ProjectRow, intent: "read" | "write"): Data
   } catch (error) {
     throwIfProjectDbError(error);
   }
+}
+
+function contextsForUser(params: { userId: string; intent: "read" | "write"; projectId?: string }): UserProjectContext[] {
+  if (params.projectId) {
+    const project = projectForUser(params.projectId, params.userId);
+    if (!project) {
+      throw new CliServiceError("NOT_FOUND", "Project not found");
+    }
+    return [{ project, projectDb: projectDatabaseFor(project, params.intent) }];
+  }
+
+  return memberProjectsForUser(params.userId).map((project) => ({
+    project,
+    projectDb: projectDatabaseFor(project, params.intent)
+  }));
 }
 
 function taskForUser(
@@ -106,6 +127,28 @@ function taskForUser(
       .get(taskId, project.id) as TaskRow | undefined;
     if (task) {
       return { task, project, projectDb };
+    }
+  }
+  return undefined;
+}
+
+function taskForUserWithFilters(
+  params: { taskId: string; userId: string; intent: "read" | "write"; projectId?: string; planId?: string }
+): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
+  const contexts = contextsForUser({ userId: params.userId, intent: params.intent, projectId: params.projectId });
+  for (const context of contexts) {
+    const task = context.projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE id = ?
+           AND project_id = ?
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         LIMIT 1`
+      )
+      .get(params.taskId, context.project.id, params.planId ?? null, params.planId ?? null) as TaskRow | undefined;
+    if (task) {
+      return { task, project: context.project, projectDb: context.projectDb };
     }
   }
   return undefined;
@@ -362,6 +405,13 @@ function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
   return Boolean(row?.task_id);
 }
 
+function hasUnmergedPlanChildren(projectDb: Database.Database, planTaskId: string): boolean {
+  const row = projectDb
+    .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' LIMIT 1")
+    .get(planTaskId) as { id: string } | undefined;
+  return Boolean(row?.id);
+}
+
 type TaskGitTopology = {
   pullRemoteRef: string;
   mergeTargetPath: string;
@@ -494,15 +544,44 @@ async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, id
 }
 
 export async function listTasks(params: { userId: string; projectId: string }) {
-  const project = projectForUser(params.projectId, params.userId);
-  if (!project) {
-    throw new CliServiceError("NOT_FOUND", "Project not found");
-  }
-  const projectDb = projectDatabaseFor(project, "read");
-  const tasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
-  return { tasks: tasks.map((task) => serializeTask(projectDb, task)) };
+  return listAllTasks({ userId: params.userId, projectId: params.projectId });
+}
+
+export async function listAllTasks(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const tasks = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'execution'
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((task) => serializeTask(projectDb, task));
+  });
+  return { tasks };
+}
+
+export async function listActiveTasks(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const tasks = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'execution'
+           AND status IN ('queued', 'in_progress', 'waiting_input', 'merge_ready', 'merge_conflict')
+           AND (? IS NULL OR parent_plan_task_id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((task) => serializeTask(projectDb, task));
+  });
+  return { tasks };
 }
 
 export async function createTask(params: {
@@ -624,6 +703,72 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
   };
 }
 
+export async function getTaskDetails(params: { userId: string; taskId: string; projectId?: string; planId?: string }) {
+  const scopedTask = taskForUserWithFilters({
+    taskId: params.taskId,
+    userId: params.userId,
+    intent: "read",
+    projectId: params.projectId,
+    planId: params.planId
+  });
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Task not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const transitions = projectDb
+    .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as TaskTransitionRow[];
+  const mergeRecords = projectDb
+    .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
+    .all(task.id) as MergeRecordRow[];
+
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
+  try {
+    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+  } catch {
+    gitStatus = null;
+  }
+
+  return {
+    task: serializeTask(projectDb, task),
+    transitions: transitions.map(serializeTransition),
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id)),
+    gitStatus,
+    mergeRecords: mergeRecords.map(serializeMergeRecord)
+  };
+}
+
+export async function getTaskSummary(params: { userId: string; taskId: string; projectId?: string; planId?: string }) {
+  const scopedTask = taskForUserWithFilters({
+    taskId: params.taskId,
+    userId: params.userId,
+    intent: "read",
+    projectId: params.projectId,
+    planId: params.planId
+  });
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Task not found");
+  }
+  const { task, projectDb } = scopedTask;
+  return {
+    task: {
+      id: task.id,
+      projectId: task.project_id,
+      parentPlanTaskId: task.parent_plan_task_id,
+      title: task.title,
+      mode: task.mode,
+      status: task.status,
+      isBlocked: taskIsBlocked(projectDb, task.id),
+      result: task.result,
+      createdAt: task.created_at,
+      updatedAt: task.updated_at
+    },
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id))
+  };
+}
+
 export async function startTaskSession(params: { userId: string; taskId: string }) {
   const scopedTask = taskForUser(params.taskId, params.userId, "write");
   if (!scopedTask) {
@@ -674,6 +819,9 @@ export async function markTaskMergeReady(params: { userId: string; taskId: strin
     throw new CliServiceError("NOT_FOUND", "Task not found");
   }
   const { task, projectDb } = scopedTask;
+  if (!MERGE_READY_ALLOWED_FROM.has(task.status)) {
+    throw new CliServiceError("CONFLICT", `Task cannot be marked merge-ready from status ${task.status}`);
+  }
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
     status = await getWorkspaceGitStatus(task.workspace_path);
@@ -697,11 +845,14 @@ export async function markTaskMergeReady(params: { userId: string; taskId: strin
     payload: {},
     database: projectDb
   });
-  return { task: serializeTask(projectDb, updated) };
+  return {
+    task: serializeTask(projectDb, updated),
+    summary: `task ${updated.id} status=${updated.status}`
+  };
 }
 
 export async function mergeTask(params: { userId: string; taskId: string }) {
-  const scopedTask = taskForUser(params.taskId, params.userId, "read");
+  const scopedTask = taskForUser(params.taskId, params.userId, "write");
   if (!scopedTask) {
     throw new CliServiceError("NOT_FOUND", "Task not found");
   }
@@ -814,10 +965,187 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
     const mergeRecords = projectDb
       .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
       .all(task.id) as MergeRecordRow[];
+    const latestMergeRecord = mergeRecords[0];
     if (queueKickNeeded) {
       kickTaskQueueProcessing();
     }
-    return { task: serializeTask(projectDb, updatedTask), mergeRecords: mergeRecords.map(serializeMergeRecord) };
+    return {
+      task: serializeTask(projectDb, updatedTask),
+      mergeRecords: mergeRecords.map(serializeMergeRecord),
+      summary: `task ${updatedTask.id} status=${updatedTask.status} merge_record=${latestMergeRecord?.status ?? "unknown"}`
+    };
+  } finally {
+    mergeLocks.delete(lockKey);
+  }
+}
+
+export async function markPlanMergeReady(params: { userId: string; planId: string }) {
+  const scopedPlan = planForUser(params.planId, params.userId, "write");
+  if (!scopedPlan) {
+    throw new CliServiceError("NOT_FOUND", "Plan not found");
+  }
+  const { plan, projectDb } = scopedPlan;
+  if (!MERGE_READY_ALLOWED_FROM.has(plan.status)) {
+    throw new CliServiceError("CONFLICT", `Plan cannot be marked merge-ready from status ${plan.status}`);
+  }
+  if (hasUnmergedPlanChildren(projectDb, plan.id)) {
+    throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
+  }
+
+  let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
+  try {
+    status = await getWorkspaceGitStatus(plan.workspace_path);
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to read plan git status"));
+  }
+  const hasUncommitted =
+    status.untracked > 0 ||
+    status.staged > 0 ||
+    status.unstaged > 0 ||
+    status.conflicted > 0;
+  if (hasUncommitted) {
+    throw new CliServiceError("CONFLICT", "Plan has uncommitted or untracked changes. Commit or clean workspace before marking merge-ready.");
+  }
+
+  const updated = setTaskStatus(projectDb, plan, "merge_ready", "user_marked_merge_ready", params.userId);
+  recordEvent({
+    projectId: updated.project_id,
+    taskId: updated.id,
+    eventType: "plan.mark_merge_ready",
+    payload: {},
+    database: projectDb
+  });
+  return {
+    plan: serializeTask(projectDb, updated),
+    summary: `plan ${updated.id} status=${updated.status}`
+  };
+}
+
+export async function mergePlan(params: { userId: string; planId: string }) {
+  const scopedPlan = planForUser(params.planId, params.userId, "write");
+  if (!scopedPlan) {
+    throw new CliServiceError("NOT_FOUND", "Plan not found");
+  }
+  const { plan, project, projectDb } = scopedPlan;
+  if (plan.status !== "merge_ready") {
+    throw new CliServiceError("CONFLICT", "Plan must be merge_ready before merge");
+  }
+  if (hasUnmergedPlanChildren(projectDb, plan.id)) {
+    throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
+  }
+
+  const topology = resolveTaskGitTopology({ task: plan, project });
+  const lockKey = topology.mergeLockKey;
+  if (mergeLocks.has(lockKey)) {
+    throw new CliServiceError("CONFLICT", "Another merge is currently running for this merge target");
+  }
+  mergeLocks.add(lockKey);
+
+  try {
+    let queueKickNeeded = false;
+    const sourceCommitSha = await getHeadCommitSha(plan.workspace_path);
+    const targetBaseCommitSha = await getHeadCommitSha(topology.mergeTargetPath);
+    const mergeRecordId = makeId();
+    const createdAt = nowIso();
+    projectDb.prepare(
+      `INSERT INTO merge_records (
+        id, task_id, project_id, source_commit_sha, target_base_commit_sha, merge_commit_sha, status,
+        conflict_summary, error_message, created_by_user_id, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, ?, ?, NULL)`
+    ).run(mergeRecordId, plan.id, project.id, sourceCommitSha, targetBaseCommitSha, params.userId, createdAt);
+
+    try {
+      const mergeResult = await mergeTaskWorkspaceIntoTarget({
+        targetPath: topology.mergeTargetPath,
+        targetBranch: topology.mergeTargetBranch,
+        syncTargetBranchFromOrigin: topology.syncMergeTargetFromOrigin,
+        workspacePath: plan.workspace_path,
+        taskId: plan.id
+      });
+      const completedAt = nowIso();
+
+      if (mergeResult.conflicted) {
+        const conflictSummary = mergeResult.conflictFiles.join("\n");
+        projectDb.transaction(() => {
+          projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
+            conflictSummary || "conflicts detected",
+            completedAt,
+            mergeRecordId
+          );
+          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, plan.id);
+          recordTaskTransition({
+            projectDb,
+            taskId: plan.id,
+            fromStatus: "merge_ready",
+            toStatus: "merge_conflict",
+            reason: "merge_conflict",
+            actorUserId: params.userId
+          });
+        })();
+        recordEvent({
+          projectId: project.id,
+          taskId: plan.id,
+          eventType: "plan.merge_conflict",
+          database: projectDb,
+          payload: {
+            conflictFiles: mergeResult.conflictFiles
+          }
+        });
+      } else {
+        projectDb.transaction(() => {
+          projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+            mergeResult.mergeCommitSha,
+            completedAt,
+            mergeRecordId
+          );
+          projectDb.prepare(
+            "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
+          ).run(completedAt, params.userId, mergeResult.mergeCommitSha, completedAt, plan.id);
+          recordTaskTransition({
+            projectDb,
+            taskId: plan.id,
+            fromStatus: "merge_ready",
+            toStatus: "merged",
+            reason: "merge_success",
+            actorUserId: params.userId
+          });
+        })();
+        recordEvent({
+          projectId: project.id,
+          taskId: plan.id,
+          eventType: "plan.merged",
+          database: projectDb,
+          payload: {
+            mergeCommitSha: mergeResult.mergeCommitSha,
+            sourceBranch: `task/${plan.id}`,
+            targetBranch: topology.mergeTargetBranch
+          }
+        });
+        queueKickNeeded = true;
+      }
+    } catch (error: any) {
+      const completedAt = nowIso();
+      projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
+        String(error?.message ?? "merge failed"),
+        completedAt,
+        mergeRecordId
+      );
+      throw new CliServiceError("CONFLICT", String(error?.message ?? "Merge failed"));
+    }
+
+    const updatedPlan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(plan.id) as TaskRow;
+    const mergeRecords = projectDb
+      .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
+      .all(plan.id) as MergeRecordRow[];
+    const latestMergeRecord = mergeRecords[0];
+    if (queueKickNeeded) {
+      kickTaskQueueProcessing();
+    }
+    return {
+      plan: serializeTask(projectDb, updatedPlan),
+      mergeRecords: mergeRecords.map(serializeMergeRecord),
+      summary: `plan ${updatedPlan.id} status=${updatedPlan.status} merge_record=${latestMergeRecord?.status ?? "unknown"}`
+    };
   } finally {
     mergeLocks.delete(lockKey);
   }
@@ -918,16 +1246,22 @@ export async function ideStop(params: { userId: string; taskId: string }) {
   return { ide: serializeIde(updated) };
 }
 
-export async function listPlans(params: { userId: string; projectId: string }) {
-  const project = projectForUser(params.projectId, params.userId);
-  if (!project) {
-    throw new CliServiceError("NOT_FOUND", "Project not found");
-  }
-  const projectDb = projectDatabaseFor(project, "read");
-  const plans = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND mode = 'plan' ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
-  return { plans: plans.map((plan) => serializeTask(projectDb, plan)) };
+export async function listPlans(params: { userId: string; projectId?: string; planId?: string }) {
+  const contexts = contextsForUser({ userId: params.userId, intent: "read", projectId: params.projectId });
+  const plans = contexts.flatMap(({ project, projectDb }) => {
+    const rows = projectDb
+      .prepare(
+        `SELECT *
+         FROM tasks
+         WHERE project_id = ?
+           AND mode = 'plan'
+           AND (? IS NULL OR id = ?)
+         ORDER BY created_at DESC`
+      )
+      .all(project.id, params.planId ?? null, params.planId ?? null) as TaskRow[];
+    return rows.map((plan) => serializeTask(projectDb, plan));
+  });
+  return { plans };
 }
 
 export async function createPlan(params: { userId: string; projectId: string; title: string; taskPrompt: string; aiCommand?: string }) {
@@ -1079,6 +1413,10 @@ export async function getPlan(params: { userId: string; planId: string }) {
     })),
     approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task))
   };
+}
+
+export async function reviewPlan(params: { userId: string; planId: string }) {
+  return getPlan(params);
 }
 
 export async function extractPlan(params: { userId: string; planId: string }) {
