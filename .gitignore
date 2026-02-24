@@ -8,6 +8,5 @@ repos/*
 !repos/.gitkeep
 **/*.code-workspace
 .ai-coding-site*.code-workspace
-.ai-task-summary.md
-
 .ai-coding/
+.ai-task-summary.md
