@@ -25,6 +25,7 @@ type TaskEdit = {
 };
 
 type Services = typeof import("../application/cliServices.js");
+type OutputHint = "taskCreate" | "planCreate" | "planReview" | "default";
 
 class CliArgError extends Error {}
 
@@ -123,11 +124,71 @@ function isJsonOutput(parsed: ParsedArgv): boolean {
   return booleanFlag(parsed, "json");
 }
 
-function printResult(result: unknown, asJson: boolean): void {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function asNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function printResult(result: unknown, asJson: boolean, hint: OutputHint): void {
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
+
+  if (hint === "taskCreate") {
+    const root = asRecord(result);
+    const task = asRecord(root?.task);
+    if (task) {
+      const blockedBy = Array.isArray(task.blockedByTaskIds) ? task.blockedByTaskIds.length : 0;
+      console.log(`Created task ${asString(task.id)} (${asString(task.status)})`);
+      console.log(`Project: ${asString(task.projectId)}`);
+      console.log(`Title: ${asString(task.title)}`);
+      console.log(`Blocked by dependencies: ${blockedBy > 0 ? "yes" : "no"}`);
+      return;
+    }
+  }
+
+  if (hint === "planCreate") {
+    const root = asRecord(result);
+    const plan = asRecord(root?.plan);
+    if (plan) {
+      console.log(`Created plan ${asString(plan.id)} (${asString(plan.status)})`);
+      console.log(`Project: ${asString(plan.projectId)}`);
+      console.log(`Title: ${asString(plan.title)}`);
+      return;
+    }
+  }
+
+  if (hint === "planReview") {
+    const root = asRecord(result);
+    const plan = asRecord(root?.plan);
+    const revisions = Array.isArray(root?.revisions) ? root.revisions : [];
+    const approvedTasks = Array.isArray(root?.approvedTasks) ? root.approvedTasks : [];
+    if (plan) {
+      const latest = asRecord(revisions[0]);
+      const latestItems = latest && Array.isArray(latest.items) ? latest.items.length : 0;
+      console.log(`Plan ${asString(plan.id)} (${asString(plan.status)}): ${asString(plan.title)}`);
+      console.log(`Revisions: ${revisions.length}`);
+      console.log(`Approved tasks: ${approvedTasks.length}`);
+      if (latest) {
+        console.log(
+          `Latest revision: #${asNumber(latest.revisionNumber)} ${asString(latest.status)} (${latestItems} item${latestItems === 1 ? "" : "s"})`
+        );
+      }
+      return;
+    }
+  }
+
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -146,6 +207,7 @@ function helpText(): string {
     "  plans list --project <projectId>",
     "  plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>]",
     "  plans get <planId>",
+    "  plans review <planId>",
     "  plans extract <planId>",
     "  plans regenerate <planId> --feedback <text>",
     "  plans approve <planId> [--auto-merge-item-keys a,b] [--task-edits-file path.json]",
@@ -155,7 +217,9 @@ function helpText(): string {
     "  session input <taskId> --text <text>",
     "  create task ... (alias for tasks create)",
     "  create plan ... (alias for plans create)",
-    "  review <taskId>",
+    "  review task <taskId>",
+    "  review plan <planId>",
+    "  review <taskId> (legacy alias for `review task <taskId>`)",
     "  ide status <taskId>",
     "  ide start <taskId>",
     "  ide stop <taskId>",
@@ -246,6 +310,10 @@ async function handlePlans(args: string[], userId: string, services: Services): 
     if (!maybeId) argError("Missing planId");
     return await services.getPlan({ userId, planId: maybeId });
   }
+  if (subcommand === "review") {
+    if (!maybeId) argError("Missing planId");
+    return await services.reviewPlan({ userId, planId: maybeId });
+  }
   if (subcommand === "extract") {
     if (!maybeId) argError("Missing planId");
     return await services.extractPlan({ userId, planId: maybeId });
@@ -334,11 +402,20 @@ async function run(): Promise<void> {
 
   const [command, ...rest] = argv;
   let result: unknown;
+  let outputHint: OutputHint = "default";
 
   if (command === "tasks") {
     result = await handleTasks(rest, userId, services);
+    if (rest[0] === "create") {
+      outputHint = "taskCreate";
+    }
   } else if (command === "plans") {
     result = await handlePlans(rest, userId, services);
+    if (rest[0] === "create") {
+      outputHint = "planCreate";
+    } else if (rest[0] === "review") {
+      outputHint = "planReview";
+    }
   } else if (command === "info") {
     const [taskId] = parsed.positionals.slice(1);
     if (!taskId) argError("Missing taskId");
@@ -347,10 +424,27 @@ async function run(): Promise<void> {
     result = await handleSession(rest, userId, services);
   } else if (command === "create") {
     result = await handleCreate(rest, userId, services);
+    if (rest[0] === "task") {
+      outputHint = "taskCreate";
+    } else if (rest[0] === "plan") {
+      outputHint = "planCreate";
+    }
   } else if (command === "review") {
-    const [taskId] = parsed.positionals.slice(1);
-    if (!taskId) argError("Missing taskId");
-    result = await services.reviewTaskMergeRecords({ userId, taskId });
+    const [subject, id] = parsed.positionals.slice(1);
+    if (!subject) {
+      argError("Missing review target. Use `review task <taskId>` or `review plan <planId>`.");
+    }
+    if (subject === "task") {
+      if (!id) argError("Missing taskId");
+      result = await services.reviewTaskMergeRecords({ userId, taskId: id });
+    } else if (subject === "plan") {
+      if (!id) argError("Missing planId");
+      result = await services.reviewPlan({ userId, planId: id });
+      outputHint = "planReview";
+    } else {
+      // Backward compatible form: `review <taskId>`
+      result = await services.reviewTaskMergeRecords({ userId, taskId: subject });
+    }
   } else if (command === "ide") {
     result = await handleIde(rest, userId, services);
   } else if (command === "ready_merge") {
@@ -365,7 +459,7 @@ async function run(): Promise<void> {
     argError(`Unknown command: ${command}`);
   }
 
-  printResult(result, isJsonOutput(parsed));
+  printResult(result, isJsonOutput(parsed), outputHint);
   process.exitCode = ExitCode.Success;
 }
 
