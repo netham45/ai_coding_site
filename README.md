@@ -17,6 +17,7 @@ AI Coding Site is a local-first web app for running AI coding tasks against Git 
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
+- [CLI usage](#cli-usage)
 - [Usage flow](#usage-flow)
 - [API overview](#api-overview)
 - [Repository layout](#repository-layout)
@@ -199,6 +200,46 @@ npm run start -w server
 ```
 
 When `web/dist` exists, the server also serves the frontend for non-API routes.
+
+## CLI usage
+
+Run CLI commands from the repository root:
+
+```bash
+npm run cli -w server -- <command>
+```
+
+Common commands:
+
+```bash
+# List execution tasks (all projects)
+npm run cli -w server -- tasks all --json
+
+# List active execution tasks scoped to a project/plan
+npm run cli -w server -- tasks active --project-id <projectId> --plan-id <planId> --json
+
+# Task summary/details with optional scope filters
+npm run cli -w server -- tasks summary <taskId> --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- tasks details <taskId> --project-id <projectId> --json
+npm run cli -w server -- info <taskId> --project-id <projectId> --plan-id <planId> --json
+
+# Plan listing/review
+npm run cli -w server -- plans list --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- plans review <planId> --json
+npm run cli -w server -- review plan <planId> --json
+
+# Merge workflows (task + plan)
+npm run cli -w server -- ready_merge task <taskId> --json
+npm run cli -w server -- ready_merge plan <planId> --json
+npm run cli -w server -- merge task <taskId> --json
+npm run cli -w server -- merge plan <planId> --json
+```
+
+For the complete command list, run:
+
+```bash
+npm run cli -w server -- --help
+```
 
 ## Usage flow
 

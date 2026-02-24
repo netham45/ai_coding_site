@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { after, before, beforeEach, describe, test } from "node:test";
 import type Database from "better-sqlite3";
 import { createApp } from "./app.js";
@@ -32,6 +34,7 @@ type ApiResponse = {
 
 let server: http.Server;
 let apiBaseUrl = "";
+const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function randomPath(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ai-coding-site-${prefix}-`));
@@ -60,6 +63,36 @@ function resetAppDatabaseState(): void {
     appDb.prepare(`DELETE FROM ${table.name}`).run();
   }
   appDb.pragma("foreign_keys = ON");
+}
+
+type CliRunResult = {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  json: any;
+};
+
+function runCli(args: string[]): CliRunResult {
+  const result = spawnSync("npm", ["run", "-s", "cli", "--", ...args], {
+    cwd: serverRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+
+  const stdout = result.stdout ?? "";
+  let json: any = null;
+  try {
+    json = stdout.trim().length ? JSON.parse(stdout) : null;
+  } catch {
+    json = null;
+  }
+
+  return {
+    code: result.status,
+    stdout,
+    stderr: result.stderr ?? "",
+    json
+  };
 }
 
 function createUser(userId = randomUUID()): string {
@@ -107,6 +140,49 @@ function createProject(params: {
     .prepare("INSERT INTO project_members (project_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)")
     .run(projectId, params.userId, now);
   return projectId;
+}
+
+function insertTask(params: {
+  projectDb: Database.Database;
+  projectId: string;
+  userId: string;
+  taskId?: string;
+  title: string;
+  mode?: "execution" | "plan";
+  status: string;
+  parentPlanTaskId?: string | null;
+}): string {
+  const taskId = params.taskId ?? randomUUID();
+  const now = nowIso();
+  const workspacePath = randomPath("cli-workspace");
+  params.projectDb
+    .prepare(
+      `INSERT INTO tasks (
+         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+         auto_merge, mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+         status, workspace_path, base_commit_sha_at_create, head_commit_sha, cancel_reason,
+         merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+    )
+    .run(
+      taskId,
+      params.projectId,
+      params.title,
+      "test prompt",
+      "",
+      "effective prompt",
+      "codex --yolo {prompt}",
+      0,
+      params.mode ?? "execution",
+      params.parentPlanTaskId ?? null,
+      params.status,
+      workspacePath,
+      "abc123",
+      params.userId,
+      now,
+      now
+    );
+  return taskId;
 }
 
 async function callApi(pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
@@ -417,6 +493,7 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.equal(tableExists(handle.db, "project_metadata"), true);
     handle.db.exec("DROP TABLE project_metadata");
     assert.equal(tableExists(handle.db, "project_metadata"), false);
+    closeAllProjectDbs();
 
     assert.throws(
       () =>
@@ -427,5 +504,215 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
         }),
       (error: unknown) => error instanceof ProjectDbError && error.code === "PROJECT_DB_CORRUPT"
     );
+  });
+});
+
+describe("integration: CLI subcommands", () => {
+  beforeEach(() => {
+    resetAppDatabaseState();
+  });
+
+  test("list/info commands support project and plan filters", () => {
+    const userId = ensureLocalUser();
+    const projectABasePath = randomPath("cli-project-a");
+    const projectBBasePath = randomPath("cli-project-b");
+    const projectA = createProject({ userId, basePath: projectABasePath, cloneStatus: "ready" });
+    const projectB = createProject({ userId, basePath: projectBBasePath, cloneStatus: "ready" });
+    const projectADb = ensureProjectDb({ projectId: projectA, basePath: projectABasePath, initializeIfMissing: true }).db;
+    const projectBDb = ensureProjectDb({ projectId: projectB, basePath: projectBBasePath, initializeIfMissing: true }).db;
+
+    const planA = insertTask({
+      projectDb: projectADb,
+      projectId: projectA,
+      userId,
+      title: "Plan A",
+      mode: "plan",
+      status: "in_progress"
+    });
+    const taskAChildQueued = insertTask({
+      projectDb: projectADb,
+      projectId: projectA,
+      userId,
+      title: "Task A Child Queued",
+      status: "queued",
+      parentPlanTaskId: planA
+    });
+    insertTask({
+      projectDb: projectADb,
+      projectId: projectA,
+      userId,
+      title: "Task A Child Merged",
+      status: "merged",
+      parentPlanTaskId: planA
+    });
+    const taskAStandalone = insertTask({
+      projectDb: projectADb,
+      projectId: projectA,
+      userId,
+      title: "Task A Standalone",
+      status: "waiting_input"
+    });
+    const taskB = insertTask({
+      projectDb: projectBDb,
+      projectId: projectB,
+      userId,
+      title: "Task B",
+      status: "queued"
+    });
+
+    const allTasks = runCli(["tasks", "all", "--json"]);
+    assert.equal(allTasks.code, 0);
+    assert.equal(Array.isArray(allTasks.json?.tasks), true);
+    assert.equal(allTasks.json.tasks.length, 4);
+
+    const listed = runCli(["tasks", "list", "--project-id", projectA, "--json"]);
+    assert.equal(listed.code, 0);
+    assert.equal(listed.json.tasks.length, 3);
+    assert.equal(listed.json.tasks.every((task: { projectId: string }) => task.projectId === projectA), true);
+
+    const activeFiltered = runCli(["tasks", "active", "--project-id", projectA, "--plan-id", planA, "--json"]);
+    assert.equal(activeFiltered.code, 0);
+    assert.equal(activeFiltered.json.tasks.length, 1);
+    assert.equal(activeFiltered.json.tasks[0].id, taskAChildQueued);
+
+    const plansFiltered = runCli(["plans", "list", "--project-id", projectA, "--plan-id", planA, "--json"]);
+    assert.equal(plansFiltered.code, 0);
+    assert.equal(plansFiltered.json.plans.length, 1);
+    assert.equal(plansFiltered.json.plans[0].id, planA);
+
+    const summaryOk = runCli(["tasks", "summary", taskAStandalone, "--project-id", projectA, "--json"]);
+    assert.equal(summaryOk.code, 0);
+    assert.equal(summaryOk.json?.task?.id, taskAStandalone);
+
+    const detailsWrongPlan = runCli(["tasks", "details", taskAStandalone, "--plan-id", planA, "--json"]);
+    assert.equal(detailsWrongPlan.code, 3);
+    assert.match(detailsWrongPlan.stderr, /Task not found/);
+
+    const getWrongProject = runCli(["tasks", "get", taskAStandalone, "--project-id", projectB, "--json"]);
+    assert.equal(getWrongProject.code, 3);
+    assert.match(getWrongProject.stderr, /Task not found/);
+
+    const infoWrongProject = runCli(["info", taskB, "--project-id", projectA, "--json"]);
+    assert.equal(infoWrongProject.code, 3);
+    assert.match(infoWrongProject.stderr, /Task not found/);
+
+    const infoWithFilters = runCli(["info", taskAChildQueued, "--project-id", projectA, "--plan-id", planA, "--json"]);
+    assert.equal(infoWithFilters.code, 0);
+    assert.equal(infoWithFilters.json?.task?.id, taskAChildQueued);
+  });
+
+  test("review command variants return expected task and plan payloads", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-review-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Review",
+      mode: "plan",
+      status: "queued"
+    });
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Task Review",
+      status: "queued",
+      parentPlanTaskId: planId
+    });
+
+    const plansReview = runCli(["plans", "review", planId, "--json"]);
+    assert.equal(plansReview.code, 0);
+    assert.equal(plansReview.json?.plan?.id, planId);
+
+    const reviewPlan = runCli(["review", "plan", planId, "--json"]);
+    assert.equal(reviewPlan.code, 0);
+    assert.equal(reviewPlan.json?.plan?.id, planId);
+
+    const reviewTask = runCli(["review", "task", taskId, "--json"]);
+    assert.equal(reviewTask.code, 0);
+    assert.equal(Array.isArray(reviewTask.json?.mergeRecords), true);
+
+    const reviewLegacy = runCli(["review", taskId, "--json"]);
+    assert.equal(reviewLegacy.code, 0);
+    assert.equal(Array.isArray(reviewLegacy.json?.mergeRecords), true);
+  });
+
+  test("ready_merge and merge commands enforce precondition edge cases for tasks and plans", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-merge-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const taskQueued = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Task Queued",
+      status: "queued"
+    });
+    const planInProgressBlocked = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Blocked",
+      mode: "plan",
+      status: "in_progress"
+    });
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Blocked Child",
+      status: "queued",
+      parentPlanTaskId: planInProgressBlocked
+    });
+
+    const planMergeReadyBlocked = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Merge Ready With Unmerged Child",
+      mode: "plan",
+      status: "merge_ready"
+    });
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Merge Ready Child",
+      status: "waiting_input",
+      parentPlanTaskId: planMergeReadyBlocked
+    });
+
+    const readyTaskAlias = runCli(["ready_merge", taskQueued, "--json"]);
+    assert.equal(readyTaskAlias.code, 4);
+    assert.match(readyTaskAlias.stderr, /Task cannot be marked merge-ready from status queued/);
+
+    const mergeTaskEntity = runCli(["merge", "task", taskQueued, "--json"]);
+    assert.equal(mergeTaskEntity.code, 4);
+    assert.match(mergeTaskEntity.stderr, /Task must be merge_ready before merge/);
+
+    const readyPlan = runCli(["ready_merge", "plan", planInProgressBlocked, "--json"]);
+    assert.equal(readyPlan.code, 4);
+    assert.match(readyPlan.stderr, /Plan has child tasks that are not merged/);
+
+    const mergePlan = runCli(["merge", "plan", planMergeReadyBlocked, "--json"]);
+    assert.equal(mergePlan.code, 4);
+    assert.match(mergePlan.stderr, /Plan has child tasks that are not merged/);
+  });
+
+  test("help output includes command examples for new subcommands", () => {
+    const help = runCli(["--help"]);
+    assert.equal(help.code, 0);
+    assert.match(help.stdout, /tasks all \[--project-id <projectId>] \[--plan-id <planId>]/);
+    assert.match(help.stdout, /tasks summary <taskId> \[--project-id <projectId>] \[--plan-id <planId>]/);
+    assert.match(help.stdout, /plans review <planId>/);
+    assert.match(help.stdout, /ready_merge plan <planId>/);
+    assert.match(help.stdout, /merge plan <planId>/);
+    assert.match(help.stdout, /Examples:/);
+    assert.match(help.stdout, /acs tasks active --project-id <projectId> --json/);
   });
 });
