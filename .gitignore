@@ -7,3 +7,5 @@ data_sav/
 repos/*
 !repos/.gitkeep
 **/*.code-workspace
+.ai-coding-site*.code-workspace
+.ai-task-summary.md
