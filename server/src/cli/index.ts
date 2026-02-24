@@ -87,6 +87,14 @@ function booleanFlag(parsed: ParsedArgv, name: string): boolean {
   argError(`Invalid boolean for --${name}: ${String(value)}`);
 }
 
+function optionalProjectId(parsed: ParsedArgv): string | undefined {
+  return optionalFlag(parsed, "project-id") ?? optionalFlag(parsed, "project");
+}
+
+function optionalPlanId(parsed: ParsedArgv): string | undefined {
+  return optionalFlag(parsed, "plan-id");
+}
+
 function csvFlag(parsed: ParsedArgv, name: string): string[] {
   const raw = optionalFlag(parsed, name);
   if (!raw) return [];
@@ -136,21 +144,25 @@ function helpText(): string {
     "Usage: acs <command> [subcommand] [options]",
     "",
     "Commands:",
-    "  tasks list --project <projectId>",
-    "  tasks get <taskId>",
+    "  tasks list [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks all [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks active [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks get <taskId> [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks summary <taskId> [--project-id <projectId>] [--plan-id <planId>]",
+    "  tasks details <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  tasks create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>] [--depends-on a,b] [--auto-merge]",
     "  tasks start <taskId>",
     "  tasks input <taskId> --text <text>",
     "  tasks pull-main <taskId>",
     "",
-    "  plans list --project <projectId>",
+    "  plans list [--project-id <projectId>] [--plan-id <planId>]",
     "  plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>]",
     "  plans get <planId>",
     "  plans extract <planId>",
     "  plans regenerate <planId> --feedback <text>",
     "  plans approve <planId> [--auto-merge-item-keys a,b] [--task-edits-file path.json]",
     "",
-    "  info <taskId>",
+    "  info <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  session start <taskId>",
     "  session input <taskId> --text <text>",
     "  create task ... (alias for tasks create)",
@@ -189,12 +201,37 @@ async function handleTasks(args: string[], userId: string, services: Services): 
     argError("Missing tasks subcommand");
   }
 
-  if (subcommand === "list") {
-    return await services.listTasks({ userId, projectId: requireFlag(parsed, "project") });
+  if (subcommand === "list" || subcommand === "all") {
+    return await services.listAllTasks({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
-  if (subcommand === "get") {
+  if (subcommand === "active") {
+    return await services.listActiveTasks({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
+  }
+  if (subcommand === "get" || subcommand === "details") {
     if (!maybeId) argError("Missing taskId");
-    return await services.getTaskInfo({ userId, taskId: maybeId });
+    return await services.getTaskDetails({
+      userId,
+      taskId: maybeId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
+  }
+  if (subcommand === "summary") {
+    if (!maybeId) argError("Missing taskId");
+    return await services.getTaskSummary({
+      userId,
+      taskId: maybeId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
   if (subcommand === "create") {
     return await services.createTask({
@@ -231,7 +268,11 @@ async function handlePlans(args: string[], userId: string, services: Services): 
   }
 
   if (subcommand === "list") {
-    return await services.listPlans({ userId, projectId: requireFlag(parsed, "project") });
+    return await services.listPlans({
+      userId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   }
   if (subcommand === "create") {
     return await services.createPlan({
@@ -342,7 +383,12 @@ async function run(): Promise<void> {
   } else if (command === "info") {
     const [taskId] = parsed.positionals.slice(1);
     if (!taskId) argError("Missing taskId");
-    result = await services.getTaskInfo({ userId, taskId });
+    result = await services.getTaskDetails({
+      userId,
+      taskId,
+      projectId: optionalProjectId(parsed),
+      planId: optionalPlanId(parsed)
+    });
   } else if (command === "session") {
     result = await handleSession(rest, userId, services);
   } else if (command === "create") {
