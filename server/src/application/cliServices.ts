@@ -1415,6 +1415,10 @@ export async function getPlan(params: { userId: string; planId: string }) {
   };
 }
 
+export async function reviewPlan(params: { userId: string; planId: string }) {
+  return getPlan(params);
+}
+
 export async function extractPlan(params: { userId: string; planId: string }) {
   const scopedPlan = planForUser(params.planId, params.userId, "write");
   if (!scopedPlan) {

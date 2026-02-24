@@ -11,3 +11,4 @@ repos/*
 .ai-coding/
 .ai-plan/
 .ai-task-summary.md
+.ai-coding-site*.code-workspace
