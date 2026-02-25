@@ -183,7 +183,7 @@ export async function getHeadCommitSha(repoPath: string): Promise<string> {
 export async function createTaskBranch(workspacePath: string, taskId: string): Promise<void> {
   const branch = taskBranchName(taskId);
   try {
-    await execGit(["-C", workspacePath, "checkout", "-b", branch], {
+    await execGit(["-C", workspacePath, "switch", "-c", branch], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
@@ -200,16 +200,12 @@ export async function refreshBaseFromOrigin(params: { basePath: string; defaultB
       timeout: 45000,
       env: nonInteractiveGitEnv()
     });
-    await execGit(["-C", params.basePath, "checkout", params.defaultBranch], {
+    await execGit(["-C", params.basePath, "switch", params.defaultBranch], {
       timeout: 15000,
       env: nonInteractiveGitEnv()
     });
-    await execGit(["-C", params.basePath, "reset", "--hard", `origin/${params.defaultBranch}`], {
+    await execGit(["-C", params.basePath, "merge", "--ff-only", `origin/${params.defaultBranch}`], {
       timeout: 30000,
-      env: nonInteractiveGitEnv()
-    });
-    await execGit(["-C", params.basePath, "clean", "-fd"], {
-      timeout: 20000,
       env: nonInteractiveGitEnv()
     });
   } catch (error: any) {
@@ -414,7 +410,7 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
         timeout: 45000,
         env: nonInteractiveGitEnv()
       });
-      await execGit(["-C", params.targetPath, "checkout", params.targetBranch], {
+      await execGit(["-C", params.targetPath, "switch", params.targetBranch], {
         timeout: 15000,
         env: nonInteractiveGitEnv()
       });
@@ -429,13 +425,13 @@ export async function mergeTaskWorkspaceIntoTarget(params: {
     }
   } else {
     try {
-      await execGit(["-C", params.targetPath, "checkout", params.targetBranch], {
+      await execGit(["-C", params.targetPath, "switch", params.targetBranch], {
         timeout: 15000,
         env: nonInteractiveGitEnv()
       });
     } catch (error: any) {
       const stderr = error?.stderr ? String(error.stderr) : "";
-      const message = stderr.trim() || error?.message || "failed to checkout target branch";
+      const message = stderr.trim() || error?.message || "failed to switch target branch";
       throw new Error(message);
     }
   }

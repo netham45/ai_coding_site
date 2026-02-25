@@ -1754,9 +1754,6 @@ export async function pullTaskMain(params: { userId: string; taskId: string }) {
     throw new CliServiceError("NOT_FOUND", "Task not found");
   }
   const { task, project, projectDb } = scopedTask;
-  if (["merged", "cancelled", "failed"].includes(task.status)) {
-    throw new CliServiceError("CONFLICT", "Cannot pull main into a terminal task state");
-  }
   if (taskIsBlocked(projectDb, task.id)) {
     throw new CliServiceError("CONFLICT", "Task is blocked by unmerged dependencies");
   }

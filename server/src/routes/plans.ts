@@ -178,7 +178,15 @@ function planForUser(
 ): { plan: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
   const projects = memberProjectsForUser(userId);
   for (const project of projects) {
-    const projectDb = projectDatabaseFor(project, intent);
+    let projectDb: Database.Database;
+    try {
+      projectDb = projectDatabaseFor(project, intent);
+    } catch (error) {
+      if (isProjectDbError(error)) {
+        continue;
+      }
+      throw error;
+    }
     const plan = projectDb
       .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ? AND mode = 'plan'")
       .get(planTaskId, project.id) as TaskRow | undefined;

@@ -63,34 +63,48 @@ function serializeProject(project: ProjectRow) {
   };
 }
 
-function projectConfigFor(project: Pick<AppProjectRow, "id" | "base_path" | "clone_status">): ProjectConfigFields {
-  if (project.clone_status !== "ready") {
-    return {
-      project_prompt: "",
-      project_rules: "",
-      coding_standard: "",
-      coding_standard_other: "",
-      project_other: ""
-    };
-  }
-
-  const config = getProjectConfig({
-    projectId: project.id,
-    basePath: project.base_path
-  });
+function emptyProjectConfig(): ProjectConfigFields {
   return {
-    project_prompt: config.project_prompt,
-    project_rules: config.project_rules,
-    coding_standard: config.coding_standard,
-    coding_standard_other: config.coding_standard_other,
-    project_other: config.project_other
+    project_prompt: "",
+    project_rules: "",
+    coding_standard: "",
+    coding_standard_other: "",
+    project_other: ""
   };
 }
 
-function hydrateProject(project: AppProjectRow): ProjectRow {
+function projectConfigFor(
+  project: Pick<AppProjectRow, "id" | "base_path" | "clone_status">,
+  options?: { allowUnavailable?: boolean }
+): ProjectConfigFields {
+  if (project.clone_status !== "ready") {
+    return emptyProjectConfig();
+  }
+
+  try {
+    const config = getProjectConfig({
+      projectId: project.id,
+      basePath: project.base_path
+    });
+    return {
+      project_prompt: config.project_prompt,
+      project_rules: config.project_rules,
+      coding_standard: config.coding_standard,
+      coding_standard_other: config.coding_standard_other,
+      project_other: config.project_other
+    };
+  } catch (error) {
+    if (options?.allowUnavailable && isProjectDbError(error)) {
+      return emptyProjectConfig();
+    }
+    throw error;
+  }
+}
+
+function hydrateProject(project: AppProjectRow, options?: { allowUnavailable?: boolean }): ProjectRow {
   return {
     ...project,
-    ...projectConfigFor(project)
+    ...projectConfigFor(project, options)
   };
 }
 
@@ -223,7 +237,7 @@ projectsRouter.get("/", (req, res) => {
     )
     .all(req.user.id) as AppProjectRow[];
   try {
-    res.json({ projects: rows.map((row) => serializeProject(hydrateProject(row))) });
+    res.json({ projects: rows.map((row) => serializeProject(hydrateProject(row, { allowUnavailable: true }))) });
   } catch (error) {
     if (respondProjectDbError(res, error)) {
       return;

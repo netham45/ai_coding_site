@@ -105,7 +105,15 @@ function taskForUser(
 ): { task: TaskRow; project: ProjectRow; projectDb: Database.Database } | undefined {
   const projects = memberProjectsForUser(userId);
   for (const project of projects) {
-    const projectDb = projectDatabaseFor(project, intent);
+    let projectDb: Database.Database;
+    try {
+      projectDb = projectDatabaseFor(project, intent);
+    } catch (error) {
+      if (isProjectDbError(error)) {
+        continue;
+      }
+      throw error;
+    }
     const task = projectDb
       .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?")
       .get(taskId, project.id) as TaskRow | undefined;
@@ -836,10 +844,6 @@ tasksRouter.post("/tasks/:taskId/pull-main", async (req, res) => {
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
 
-  if (["merged", "cancelled", "failed"].includes(task.status)) {
-    res.status(409).json({ error: "Cannot pull main into a terminal task state" });
-    return;
-  }
   if (taskIsBlocked(projectDb, task.id)) {
     res.status(409).json({ error: "Task is blocked by unmerged dependencies" });
     return;
