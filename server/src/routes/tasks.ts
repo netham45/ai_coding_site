@@ -1027,18 +1027,6 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
   );
   if (!scopedTask) return;
   const { task, project, projectDb } = scopedTask;
-  if (project.clone_status !== "ready") {
-    res.status(409).json({ error: "Project base repository is not ready" });
-    return;
-  }
-  const parentPlanTask = parentPlanTaskForUser(projectDb, task);
-  let topology: TaskGitTopology;
-  try {
-    topology = resolveTaskGitTopology({ task, project, parentPlanTask });
-  } catch (error: any) {
-    res.status(409).json({ error: String(error?.message ?? "Failed to resolve task repository topology") });
-    return;
-  }
 
   const now = nowIso();
   try {
@@ -1061,13 +1049,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     }
 
     await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
-    const baseCommitSha = await getHeadCommitSha(topology.sourceRepoPath);
-    await cloneLocalBaseToWorkspace({
-      basePath: topology.sourceRepoPath,
-      baseBranch: topology.sourceBranch,
-      workspacePath: task.workspace_path
-    });
-    await createTaskBranch(task.workspace_path, task.id);
+    await fs.promises.mkdir(task.workspace_path, { recursive: true });
 
     const latestTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
     const updatedAt = nowIso();
@@ -1077,14 +1059,14 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
          SET status = 'queued',
              result = '',
              workspace_path = ?,
-             base_commit_sha_at_create = ?,
+             base_commit_sha_at_create = NULL,
              head_commit_sha = NULL,
              cancel_reason = NULL,
              merged_at = NULL,
              merged_by_user_id = NULL,
              updated_at = ?
          WHERE id = ?`
-      ).run(task.workspace_path, baseCommitSha, updatedAt, task.id);
+      ).run(task.workspace_path, updatedAt, task.id);
       recordTaskTransition({
         projectDb,
         taskId: task.id,
@@ -1102,8 +1084,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       eventType: "task.rerun",
       database: projectDb,
       payload: {
-        previousStatus: latestTask.status,
-        baseCommitShaAtCreate: baseCommitSha
+        previousStatus: latestTask.status
       }
     });
     res.json({ task: serializeTask(projectDb, updated) });

@@ -402,7 +402,7 @@ export function TaskDetailPage() {
   async function rerunTask() {
     if (!entityId) return;
     const confirmed = window.confirm(
-      "Re-run this task?\n\nThis will reset only this task workspace repo to the current local base snapshot and restart the task.\nAll unpushed task progress will be permanently lost."
+      "Re-run this task?\n\nThis will clear this task workspace and reset the task state to queued.\nAll unpushed task progress will be permanently lost."
     );
     if (!confirmed) return;
 
@@ -410,23 +410,11 @@ export function TaskDetailPage() {
     try {
       await api<{ task: Task }>(`/api/tasks/${entityId}/rerun`, { method: "POST" });
       setIdeLaunchUrl(null);
-      try {
-        await api(`/api/tasks/${entityId}/start`, { method: "POST" });
-      } catch {
-        // best-effort restart
-      }
-      try {
-        const ideResponse = await api<IdeStartResponse>(`/api/tasks/${entityId}/ide/start`, { method: "POST" });
-        setIde(ideResponse.ide);
-        setIdeLaunchUrl(ideResponse.launchUrl);
-      } catch {
-        // best-effort restart
-      }
       await loadTask();
       if (task?.projectId) {
         await loadProjectContext(task.projectId);
       }
-      toast({ status: "success", title: "Task re-run started" });
+      toast({ status: "success", title: "Task reset to queued" });
     } catch (error: any) {
       toast({ status: "error", title: "Re-run failed", description: error.message });
     } finally {
