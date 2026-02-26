@@ -22,6 +22,11 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `exec-task-runner.md` - exec-tier safe execution runtime template with evidence and merge-readiness reporting.
 - `readiness-evaluation.md` - deterministic readiness state/transition template.
 - `synthesis.md` - parent synthesis template for requirement-to-evidence coverage aggregation.
+- `plan-to-subplans-and-tasks.md` - plan decomposition template for sub-plans and execution tasks.
+- `delta-planning.md` - parent delta-planning template for net-new gap-closing children.
+- `synthesis.md` - parent synthesis template for requirement-to-evidence coverage aggregation.
+- `re-review-unblock.md` - re-review decision template for unblock vs delta-work.
+- `task-execution.md` - execution-task runtime template.
 
 ## Usage
 
