@@ -712,6 +712,7 @@ async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, id
     const openPath = await prepareIdeWorkspace({
       taskId: task.id,
       workspacePath: task.workspace_path,
+      hasSessionHistory: Boolean(session),
       tmuxSocketPath: attachableSession?.tmux_socket_path,
       tmuxSessionName: attachableSession?.tmux_session_name
     });
