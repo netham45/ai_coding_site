@@ -25,10 +25,11 @@ import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js"
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
+import { assertTaskStatusTransition, canTransitionLifecycle, evaluateParentCompletionGuards } from "./services/orchestration/stateMachine.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
-import type { TaskRow } from "./types.js";
+import type { TaskRow, TaskStatus } from "./types.js";
 import { nowIso } from "./utils/time.js";
 
 type ApiResponse = {
@@ -856,7 +857,7 @@ describe("integration: CLI subcommands", () => {
 
     const readyTaskAlias = runCli(["ready_merge", taskQueued, "--json"]);
     assert.equal(readyTaskAlias.code, 4);
-    assert.match(readyTaskAlias.stderr, /Task cannot be marked merge-ready from status queued/);
+    assert.match(readyTaskAlias.stderr, /invalid_transition|Illegal transition|merge-ready/);
 
     const mergeTaskEntity = runCli(["merge", "task", taskQueued, "--json"]);
     assert.equal(mergeTaskEntity.code, 4);
@@ -869,6 +870,110 @@ describe("integration: CLI subcommands", () => {
     const mergePlan = runCli(["merge", "plan", planMergeReadyBlocked, "--json"]);
     assert.equal(mergePlan.code, 4);
     assert.match(mergePlan.stderr, /Plan has child tasks that are not merged/);
+  });
+
+  test("state machine transition matrix enforces legal lifecycle edges", () => {
+    const lifecycleStates = ["draft", "ready", "blocked", "running", "complete", "failed", "canceled"] as const;
+    for (const from of lifecycleStates) {
+      for (const to of lifecycleStates) {
+        const allowed = canTransitionLifecycle(from, to);
+        if (from === "complete" && to === "running") {
+          assert.equal(allowed, false);
+        }
+      }
+    }
+
+    const allowedTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "in_progress",
+        toStatus: "merge_ready",
+        hasBlockingDependencies: false,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.doesNotThrow(allowedTransition);
+
+    const illegalTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "queued",
+        toStatus: "merge_ready",
+        hasBlockingDependencies: false,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.throws(illegalTransition, /invalid_transition|Illegal transition/);
+
+    const blockedTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "queued",
+        toStatus: "in_progress",
+        hasBlockingDependencies: true,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.throws(blockedTransition, /blocked_dependencies/);
+  });
+
+  test("plan completion requires synthesis and verification passes", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-completion-guards");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Guarded Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const planWorkspace = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string }).workspace_path;
+    runGit(["clone", "--branch", "main", basePath, planWorkspace], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], planWorkspace);
+    runGit(["config", "user.name", "Tests"], planWorkspace);
+    runGit(["switch", "-c", `task/${planId}`], planWorkspace);
+
+    const noPasses = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(noPasses.code, 4);
+    assert.match(noPasses.stderr, /parent_synthesis_required/);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: false } }),
+      planId
+    );
+    const missingVerify = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(missingVerify.code, 4);
+    assert.match(missingVerify.stderr, /parent_verification_required/);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      planId
+    );
+    const ready = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(ready.code, 0);
+    assert.equal(ready.json?.plan?.status, "merge_ready");
+
+    const guardState = evaluateParentCompletionGuards(
+      projectDb,
+      projectDb.prepare("SELECT id, mode, metadata_json FROM tasks WHERE id = ?").get(planId) as {
+        id: string;
+        mode: "plan" | "execution";
+        metadata_json: string | null;
+      }
+    );
+    assert.equal(guardState.synthesisPassed, true);
+    assert.equal(guardState.verificationPassed, true);
   });
 
   test("merging the last child auto-marks parent plan merge-ready and auto-merges when enabled", () => {
@@ -922,6 +1027,14 @@ describe("integration: CLI subcommands", () => {
       parentPlanTaskId: parentPlanId
     });
     projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      parentPlanId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      grandPlanId
+    );
 
     const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
     const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;
@@ -1020,6 +1133,10 @@ describe("integration: CLI subcommands", () => {
       parentPlanTaskId: parentPlanId
     });
     projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      parentPlanId
+    );
 
     const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
     const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;

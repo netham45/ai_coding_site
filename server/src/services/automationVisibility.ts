@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { PlanOrchestrationStateRow, TaskMode, TaskRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { buildDependencyDiagnostics } from "./orchestration/dependencyGraph.js";
+import { evaluateParentCompletionGuards, legacyStatusToLifecycle } from "./orchestration/stateMachine.js";
 
 type EventRow = {
   id: string;
@@ -75,6 +76,7 @@ function latestTransition(projectDb: Database.Database, taskId: string): TaskTra
 }
 
 function waitingDiagnostics(
+  projectDb: Database.Database,
   task: TaskLike,
   deps: BlockingTask[],
   children: BlockingTask[],
@@ -82,6 +84,15 @@ function waitingDiagnostics(
   lastAutomationAction: unknown,
   dependencyDiagnostics: ReturnType<typeof buildDependencyDiagnostics>
 ) {
+  const lifecycleState = legacyStatusToLifecycle(task.status, {
+    hasBlockingDependencies: deps.length > 0,
+    hasPendingChildren: children.length > 0
+  });
+  const parentGuards = evaluateParentCompletionGuards(projectDb, {
+    id: task.id,
+    mode: task.mode,
+    metadata_json: (task as { metadata_json?: string | null }).metadata_json ?? null
+  });
   const unresolved = dependencyDiagnostics.unresolved;
   const unresolvedIds = unresolved.map((dep) => dep.id);
   const unresolvedWithReasons = unresolved.map((dep) => ({
@@ -100,6 +111,8 @@ function waitingDiagnostics(
       unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
+      lifecycleState,
+      parentCompletion: parentGuards,
       latestTransition: latest,
       lastAutomationAction
     };
@@ -114,6 +127,8 @@ function waitingDiagnostics(
       unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
+      lifecycleState,
+      parentCompletion: parentGuards,
       latestTransition: latest,
       lastAutomationAction
     };
@@ -128,6 +143,8 @@ function waitingDiagnostics(
       unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
+      lifecycleState,
+      parentCompletion: parentGuards,
       latestTransition: latest,
       lastAutomationAction
     };
@@ -142,6 +159,8 @@ function waitingDiagnostics(
       unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
+      lifecycleState,
+      parentCompletion: parentGuards,
       latestTransition: latest,
       lastAutomationAction
     };
@@ -155,6 +174,8 @@ function waitingDiagnostics(
     unresolvedDependencyDetails: unresolvedWithReasons,
     blockingDependencies: deps,
     pendingChildren: children,
+    lifecycleState,
+    parentCompletion: parentGuards,
     latestTransition: latest,
     lastAutomationAction
   };
@@ -224,7 +245,7 @@ export function buildAutomationVisibility(projectDb: Database.Database, task: Ta
       lastAction: actions[0] ?? null,
       recentActions: actions
     },
-    waiting: waitingDiagnostics(task, deps, children, latest, actions[0] ?? null, dependencyDiagnostics),
+    waiting: waitingDiagnostics(projectDb, task, deps, children, latest, actions[0] ?? null, dependencyDiagnostics),
     dependencyDiagnostics,
     orchestration: orchestrationState(projectDb, task)
   };
