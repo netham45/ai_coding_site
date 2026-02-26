@@ -31,6 +31,7 @@ import {
 } from "../services/orchestration/dependencyGraph.js";
 import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
+import { orchestrationActionsApiEnabled, orchestrationHierarchyApiEnabled } from "../config/featureFlags.js";
 import type {
   IdeInstanceRow,
   MergeRecordRow,
@@ -104,6 +105,10 @@ const approveBudgetOverrideSchema = z.object({
   reason: z.string().min(1).max(1000).optional(),
   enabled: z.boolean().optional()
 });
+
+function respondFeatureDisabled(res: any, feature: string): void {
+  res.status(404).json({ error: `Feature disabled: ${feature}`, code: "FEATURE_DISABLED" });
+}
 
 const mergeLocks = new Set<string>();
 
@@ -992,6 +997,10 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
 });
 
 tasksRouter.get("/projects/:projectId/hierarchy", (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
   const scopedProject = getProjectAccessOrRespond(
     { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
     res
@@ -1001,6 +1010,10 @@ tasksRouter.get("/projects/:projectId/hierarchy", (req, res) => {
 });
 
 tasksRouter.get("/projects/:projectId/dependency-graph", (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
   const scopedProject = getProjectAccessOrRespond(
     { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
     res
@@ -1048,6 +1061,10 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
 });
 
 tasksRouter.get("/nodes/:nodeId", async (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
   const scopedTask = getTaskAccessOrRespond(
     { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "read" },
     res
@@ -1091,6 +1108,10 @@ tasksRouter.get("/tasks/:taskId/dependency-diagnostics", (req, res) => {
 });
 
 tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
   const parsed = startNodeSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
@@ -1169,6 +1190,10 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
 });
 
 tasksRouter.post("/nodes/:nodeId/auto-mode", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
   const parsed = autoModeSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
@@ -1220,6 +1245,10 @@ tasksRouter.post("/nodes/:nodeId/auto-mode", (req, res) => {
 });
 
 tasksRouter.post("/nodes/:nodeId/auto-merge", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
   const parsed = autoMergeSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
@@ -1279,6 +1308,10 @@ tasksRouter.post("/nodes/:nodeId/auto-merge", (req, res) => {
 });
 
 tasksRouter.post("/nodes/:nodeId/force-re-review", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
   const parsed = forceReReviewSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
@@ -1320,6 +1353,10 @@ tasksRouter.post("/nodes/:nodeId/force-re-review", (req, res) => {
 });
 
 tasksRouter.post("/nodes/:nodeId/approve-budget-override", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
   const parsed = approveBudgetOverrideSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
