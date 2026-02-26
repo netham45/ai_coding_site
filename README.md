@@ -18,6 +18,7 @@ AI Coding Site is a local-first web app for running AI coding tasks against Git 
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
 - [CLI usage](#cli-usage)
+- [Plan automation](#plan-automation)
 - [Usage flow](#usage-flow)
 - [API overview](#api-overview)
 - [Repository layout](#repository-layout)
@@ -58,6 +59,7 @@ Runtime model:
   - Extract and validate plan revisions
   - Regenerate with feedback
   - Approve plan revisions to create execution tasks
+  - Auto-orchestrate extract + approve when `auto_start` is enabled and plan is `waiting_input`
 - Terminal and IDE
   - xterm.js terminal with reconnect behavior
   - Tokenized terminal and IDE access URLs
@@ -233,6 +235,10 @@ npm run cli -w server -- ready_merge task <taskId> --json
 npm run cli -w server -- ready_merge plan <planId> --json
 npm run cli -w server -- merge task <taskId> --json
 npm run cli -w server -- merge plan <planId> --json
+
+# Plan automation options
+npm run cli -w server -- plans create --project <projectId> --title "Plan" --prompt "..." --auto-start --auto-merge-on-complete
+npm run cli -w server -- plans approve <planId> --auto-merge-item-keys task_a,task_b --auto-start --auto-merge-on-complete
 ```
 
 For the complete command list, run:
@@ -240,6 +246,34 @@ For the complete command list, run:
 ```bash
 npm run cli -w server -- --help
 ```
+
+## Plan automation
+
+Automation uses the plan output file at `.ai-plan/latest-plan.yaml` and runs in passes.
+
+- A plan is auto-processed only when:
+  - `mode = plan`
+  - `auto_start = true`
+  - `status = waiting_input`
+  - plan YAML file exists and is non-empty
+- Auto-processing runs extract then approve, deduped by output hash.
+- If extraction/approval fails, it retries only after plan output changes.
+- Approving from an auto-start plan defaults execution child tasks to `auto_merge=true`.
+
+YAML contract highlights:
+
+- Top-level `tasks:` list is required (`items:` is accepted for compatibility).
+- Optional top-level defaults:
+  - `auto_start`
+  - `auto_merge_on_complete`
+  - `auto_merge_item_keys`
+- Item types:
+  - `execution_task` supports `auto_merge`
+  - `sub_plan` supports `auto_start` and `auto_merge_on_complete`
+
+Full operational details, migration notes, state machine, and rollout checklist:
+
+- `docs/plan-automation-model.md`
 
 ## Usage flow
 
