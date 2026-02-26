@@ -32,6 +32,8 @@ import {
   resetOrchestrationJobQueueForTests,
   runOrchestrationJobQueuePassForTests
 } from "./services/orchestration/jobQueue.js";
+import { observeNodeOutputMaterialChange } from "./services/orchestration/outputMonitor.js";
+import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { recordEvent } from "./services/events.js";
@@ -2019,5 +2021,140 @@ describe("integration: orchestration hooks and job queue", () => {
     });
     await runOrchestrationJobQueuePassForTests();
     assert.equal(handledCount, 1);
+  });
+
+  test("non-material output updates do not thrash orchestration hooks", async () => {
+    const userId = createUser();
+    const basePath = randomPath("output-monitor");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Output Monitor Task",
+      status: "in_progress"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
+      handledCount += 1;
+    });
+
+    const first = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started\nWorking..."
+    });
+    assert.equal(first.materialChanged, true);
+    if (first.materialChanged) {
+      recordEvent({
+        projectId,
+        taskId,
+        eventType: "task.output.material_changed",
+        payload: {
+          source: first.source,
+          outputHash: first.outputHash,
+          previousOutputHash: first.previousOutputHash
+        },
+        database: projectDb
+      });
+    }
+
+    const nonMaterial = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started  \r\nWorking...\n"
+    });
+    assert.equal(nonMaterial.materialChanged, false);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("watchdog enqueues stale-node readiness and re-review actions with event audit trail", async () => {
+    const userId = createUser();
+    const basePath = randomPath("watchdog");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Blocker",
+      status: "in_progress"
+    });
+    const blockedTaskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Blocked",
+      status: "queued"
+    });
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      blockedTaskId,
+      blockerId,
+      nowIso()
+    );
+
+    const staleRunningTaskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Running",
+      status: "in_progress"
+    });
+
+    const staleIso = new Date(Date.now() - 8 * 60_000).toISOString();
+    projectDb.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?, ?)").run(staleIso, blockerId, blockedTaskId, staleRunningTaskId);
+
+    let queueDispatchCount = 0;
+    let planPassCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      queueDispatchCount += 1;
+    });
+    registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
+      planPassCount += 1;
+    });
+
+    const watchdogResult = runOrchestrationWatchdog({
+      projectId,
+      projectDb,
+      trigger: "integration_test"
+    });
+    assert.equal(watchdogResult.readinessCount > 0, true);
+    assert.equal(watchdogResult.reviewCount > 0, true);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(queueDispatchCount > 0, true);
+    assert.equal(planPassCount > 0, true);
+
+    const watchdogEvents = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE event_type = 'orchestration.watchdog.action.enqueued'
+         ORDER BY created_at ASC`
+      )
+      .all() as Array<{ payload: string }>;
+    assert.equal(watchdogEvents.length >= 2, true);
+    const actions = watchdogEvents
+      .map((row) => {
+        try {
+          return (JSON.parse(row.payload) as { action?: string }).action ?? "";
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
+    assert.equal(actions.includes("evaluate_readiness"), true);
+    assert.equal(actions.includes("re_review"), true);
   });
 });
