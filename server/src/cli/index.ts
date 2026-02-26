@@ -18,10 +18,14 @@ type ParsedArgv = {
 
 type TaskEdit = {
   itemKey: string;
+  itemType?: "execution_task" | "sub_plan";
   title: string;
   description: string;
   prompt?: string;
   aiCommand?: string;
+  parentPlanTaskId?: string | null;
+  autoStart?: boolean;
+  autoMergeOnComplete?: boolean;
 };
 
 type Services = typeof import("../application/cliServices.js");
@@ -224,12 +228,12 @@ function helpText(): string {
     "  tasks pull-main <taskId>",
     "",
     "  plans list [--project-id <projectId>] [--plan-id <planId>]",
-    "  plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>]",
+    "  plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>] [--auto-start] [--auto-merge-on-complete] [--parent-plan-id <planId>]",
     "  plans get <planId>",
     "  plans review <planId>",
     "  plans extract <planId>",
     "  plans regenerate <planId> --feedback <text>",
-    "  plans approve <planId> [--auto-merge-item-keys a,b] [--task-edits-file path.json]",
+    "  plans approve <planId> [--auto-merge-item-keys a,b] [--auto-start] [--auto-merge-on-complete] [--parent-plan-id <planId>] [--task-edits-file path.json]",
     "",
     "  info <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  session start <taskId>",
@@ -370,7 +374,10 @@ async function handlePlans(args: string[], userId: string, services: Services): 
       projectId: requireFlag(parsed, "project"),
       title: requireFlag(parsed, "title"),
       taskPrompt: requireFlag(parsed, "prompt"),
-      aiCommand: optionalFlag(parsed, "ai-command")
+      aiCommand: optionalFlag(parsed, "ai-command"),
+      autoStart: booleanFlag(parsed, "auto-start"),
+      autoMergeOnComplete: booleanFlag(parsed, "auto-merge-on-complete"),
+      parentPlanTaskId: optionalFlag(parsed, "parent-plan-id")
     });
   }
   if (subcommand === "get") {
@@ -394,6 +401,9 @@ async function handlePlans(args: string[], userId: string, services: Services): 
     return await services.approvePlan({
       userId,
       planId: maybeId,
+      autoStart: booleanFlag(parsed, "auto-start"),
+      autoMergeOnComplete: booleanFlag(parsed, "auto-merge-on-complete"),
+      parentPlanTaskId: optionalFlag(parsed, "parent-plan-id"),
       autoMergeItemKeys: csvFlag(parsed, "auto-merge-item-keys"),
       taskEdits: maybeTaskEdits(parsed)
     });

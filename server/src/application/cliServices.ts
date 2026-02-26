@@ -228,6 +228,8 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
     autoMerge: Boolean(task.auto_merge),
+    autoStart: Boolean(task.auto_start),
+    autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
@@ -449,6 +451,12 @@ function planOutputFilePath(workspacePath: string): string {
   return path.join(workspacePath, PLAN_OUTPUT_RELATIVE_PATH);
 }
 
+function planTaskInProject(projectDb: Database.Database, projectId: string, planTaskId: string): TaskRow | undefined {
+  return projectDb
+    .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ? AND mode = 'plan'")
+    .get(planTaskId, projectId) as TaskRow | undefined;
+}
+
 function getLatestSessionOutput(projectDb: Database.Database, taskId: string): string {
   const row = projectDb
     .prepare("SELECT last_output FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
@@ -496,12 +504,12 @@ function planningFormatInstructions(): string {
     "  - tasks input <taskId> --text <text>",
     "  - tasks pull-main <taskId>",
     "  - plans list [--project-id <projectId>] [--plan-id <planId>]",
-    "  - plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>]",
+    "  - plans create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>] [--auto-start] [--auto-merge-on-complete] [--parent-plan-id <planId>]",
     "  - plans get <planId>",
     "  - plans review <planId>",
     "  - plans extract <planId>",
     "  - plans regenerate <planId> --feedback <text>",
-    "  - plans approve <planId> [--auto-merge-item-keys a,b] [--task-edits-file path.json]",
+    "  - plans approve <planId> [--auto-merge-item-keys a,b] [--auto-start] [--auto-merge-on-complete] [--parent-plan-id <planId>] [--task-edits-file path.json]",
     "  - info <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  - session start <taskId>",
     "  - session input <taskId> --text <text>",
@@ -1304,7 +1312,16 @@ export async function listPlans(params: { userId: string; projectId?: string; pl
   return { plans };
 }
 
-export async function createPlan(params: { userId: string; projectId: string; title: string; taskPrompt: string; aiCommand?: string }) {
+export async function createPlan(params: {
+  userId: string;
+  projectId: string;
+  title: string;
+  taskPrompt: string;
+  aiCommand?: string;
+  autoStart?: boolean;
+  autoMergeOnComplete?: boolean;
+  parentPlanTaskId?: string;
+}) {
   const project = projectForUser(params.projectId, params.userId);
   if (!project) {
     throw new CliServiceError("NOT_FOUND", "Project not found");
@@ -1326,11 +1343,23 @@ export async function createPlan(params: { userId: string; projectId: string; ti
   const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
   const aiCommand = resolveAiCommand(params.aiCommand, params.userId);
   const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
+  const autoStart = Boolean(params.autoStart);
+  const autoMergeOnComplete = Boolean(params.autoMergeOnComplete);
+
+  let parentPlanTask: TaskRow | undefined;
+  if (params.parentPlanTaskId) {
+    parentPlanTask = planTaskInProject(projectDb, project.id, params.parentPlanTaskId);
+    if (!parentPlanTask) {
+      throw new CliServiceError("VALIDATION", "parentPlanTaskId must reference an existing plan in this project");
+    }
+  }
 
   let baseCommitSha: string;
   try {
-    baseCommitSha = await getHeadCommitSha(project.base_path);
-    await cloneLocalBaseToWorkspace({ basePath: project.base_path, baseBranch: project.default_branch, workspacePath });
+    const sourcePath = parentPlanTask ? parentPlanTask.workspace_path : project.base_path;
+    const sourceBranch = parentPlanTask ? taskBranchName(parentPlanTask.id) : project.default_branch;
+    baseCommitSha = await getHeadCommitSha(sourcePath);
+    await cloneLocalBaseToWorkspace({ basePath: sourcePath, baseBranch: sourceBranch, workspacePath });
     await createTaskBranch(workspacePath, id);
     await fs.promises.mkdir(path.join(workspacePath, ".ai-plan"), { recursive: true });
   } catch (error: any) {
@@ -1341,12 +1370,27 @@ export async function createPlan(params: { userId: string; projectId: string; ti
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge,
+        auto_merge, auto_start, auto_merge_on_complete,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, 'plan', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-    ).run(id, project.id, params.title, plannerPrompt, effectivePrompt, aiCommand, workspacePath, baseCommitSha, params.userId, now, now);
+      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+    ).run(
+      id,
+      project.id,
+      params.title,
+      plannerPrompt,
+      effectivePrompt,
+      aiCommand,
+      autoStart ? 1 : 0,
+      autoMergeOnComplete ? 1 : 0,
+      parentPlanTask?.id ?? null,
+      workspacePath,
+      baseCommitSha,
+      params.userId,
+      now,
+      now
+    );
 
     projectDb.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
@@ -1362,6 +1406,9 @@ export async function createPlan(params: { userId: string; projectId: string; ti
     payload: {
       title: params.title,
       aiCommand,
+      autoStart,
+      autoMergeOnComplete,
+      parentPlanTaskId: parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha
     }
@@ -1411,6 +1458,7 @@ export async function getPlan(params: { userId: string; planId: string }) {
   const itemsByRevision = new Map<string, Array<{
     id: string;
     itemKey: string;
+    itemType: string;
     title: string;
     prompt: string;
     ordinal: number;
@@ -1424,6 +1472,7 @@ export async function getPlan(params: { userId: string; planId: string }) {
     itemsByRevision.get(item.revision_id)?.push({
       id: item.id,
       itemKey: item.item_key,
+      itemType: item.item_type,
       title: item.title,
       prompt: item.prompt,
       ordinal: item.ordinal,
@@ -1572,8 +1621,21 @@ export async function regeneratePlan(params: { userId: string; planId: string; f
 export async function approvePlan(params: {
   userId: string;
   planId: string;
+  autoStart?: boolean;
+  autoMergeOnComplete?: boolean;
+  parentPlanTaskId?: string | null;
   autoMergeItemKeys?: string[];
-  taskEdits?: Array<{ itemKey: string; title: string; description: string; prompt?: string; aiCommand?: string }>;
+  taskEdits?: Array<{
+    itemKey: string;
+    itemType?: "execution_task" | "sub_plan";
+    title: string;
+    description: string;
+    prompt?: string;
+    aiCommand?: string;
+    parentPlanTaskId?: string | null;
+    autoStart?: boolean;
+    autoMergeOnComplete?: boolean;
+  }>;
 }) {
   const scopedPlan = planForUser(params.planId, params.userId, "write");
   if (!scopedPlan) {
@@ -1622,6 +1684,9 @@ export async function approvePlan(params: {
   const itemIdToDeps = new Map<string, string[]>();
   const autoMergeItemKeys = new Set((params.autoMergeItemKeys ?? []).map((key) => key.toLowerCase()));
   const taskEditsByItemKey = new Map((params.taskEdits ?? []).map((edit) => [edit.itemKey.toLowerCase(), edit]));
+  const defaultSubPlanAutoStart = Boolean(params.autoStart);
+  const defaultSubPlanAutoMergeOnComplete = Boolean(params.autoMergeOnComplete);
+  const defaultSubPlanParentPlanTaskId = params.parentPlanTaskId === undefined ? plan.id : params.parentPlanTaskId;
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
       itemIdToDeps.set(row.revision_item_id, []);
@@ -1630,15 +1695,60 @@ export async function approvePlan(params: {
   }
 
   const itemKeyToTaskId = new Map<string, string>();
-  const taskRows: Array<{ item: PlanRevisionItemRow; taskId: string; workspacePath: string; dependencyTaskIds: string[] }> = [];
+  const taskRows: Array<{
+    item: PlanRevisionItemRow;
+    taskId: string;
+    workspacePath: string;
+    dependencyTaskIds: string[];
+    mode: "execution" | "plan";
+    parentPlanTaskId: string | null;
+    autoStart: boolean;
+    autoMergeOnComplete: boolean;
+    autoMerge: boolean;
+    sourcePath: string;
+    sourceBranch: string;
+    baseCommitShaAtCreate: string;
+  }> = [];
   for (const item of items) {
     const taskId = makeId();
+    const edit = taskEditsByItemKey.get(item.item_key.toLowerCase());
+    const itemType = edit?.itemType ?? item.item_type;
+    const mode = itemType === "sub_plan" ? "plan" : "execution";
+    const autoMerge = mode === "execution" && autoMergeItemKeys.has(item.item_key.toLowerCase());
+    const autoStart = mode === "plan" ? (edit?.autoStart ?? defaultSubPlanAutoStart) : false;
+    const autoMergeOnComplete = mode === "plan" ? (edit?.autoMergeOnComplete ?? defaultSubPlanAutoMergeOnComplete) : false;
+    const parentPlanTaskId =
+      mode === "plan"
+        ? (edit?.parentPlanTaskId === undefined ? defaultSubPlanParentPlanTaskId : edit.parentPlanTaskId)
+        : plan.id;
+    let sourcePath = plan.workspace_path;
+    let sourceBranch = taskBranchName(plan.id);
+    if (parentPlanTaskId && parentPlanTaskId !== plan.id) {
+      const targetParentPlan = planTaskInProject(projectDb, project.id, parentPlanTaskId);
+      if (!targetParentPlan) {
+        throw new CliServiceError("VALIDATION", `Invalid parent plan target for item ${item.item_key}`);
+      }
+      sourcePath = targetParentPlan.workspace_path;
+      sourceBranch = taskBranchName(targetParentPlan.id);
+    } else if (!parentPlanTaskId) {
+      sourcePath = project.base_path;
+      sourceBranch = project.default_branch;
+    }
+
     itemKeyToTaskId.set(item.item_key.toLowerCase(), taskId);
     taskRows.push({
       item,
       taskId,
       workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
-      dependencyTaskIds: []
+      dependencyTaskIds: [],
+      mode,
+      parentPlanTaskId,
+      autoStart,
+      autoMergeOnComplete,
+      autoMerge,
+      sourcePath,
+      sourceBranch,
+      baseCommitShaAtCreate: ""
     });
   }
 
@@ -1653,18 +1763,19 @@ export async function approvePlan(params: {
     });
   }
 
-  let baseCommitSha: string;
   try {
-    const planBranch = taskBranchName(plan.id);
-    baseCommitSha = await getHeadCommitSha(plan.workspace_path);
     for (const row of taskRows) {
+      row.baseCommitShaAtCreate = await getHeadCommitSha(row.sourcePath);
       if (row.dependencyTaskIds.length > 0) continue;
       await cloneLocalBaseToWorkspace({
-        basePath: plan.workspace_path,
-        baseBranch: planBranch,
+        basePath: row.sourcePath,
+        baseBranch: row.sourceBranch,
         workspacePath: row.workspacePath
       });
       await createTaskBranch(row.workspacePath, row.taskId);
+      if (row.mode === "plan") {
+        await fs.promises.mkdir(path.join(row.workspacePath, ".ai-plan"), { recursive: true });
+      }
     }
   } catch (error: any) {
     throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to initialize plan task workspaces"));
@@ -1678,17 +1789,18 @@ export async function approvePlan(params: {
       const title = edit?.title.trim() || row.item.title;
       const description = edit?.description.trim() || row.item.prompt;
       const prompt = edit?.prompt?.trim() ?? "";
-      const taskPrompt = [description, prompt].filter(Boolean).join("\n\n");
+      const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
+      const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, params.userId);
 
       projectDb.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-          auto_merge,
+          auto_merge, auto_start, auto_merge_on_complete,
           mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
           status, workspace_path, base_commit_sha_at_create, head_commit_sha,
           cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'execution', ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
       ).run(
         row.taskId,
         project.id,
@@ -1696,12 +1808,15 @@ export async function approvePlan(params: {
         taskPrompt,
         buildEffectivePrompt(project, taskPrompt),
         aiCommand,
-        autoMergeItemKeys.has(row.item.item_key.toLowerCase()) ? 1 : 0,
-        plan.id,
+        row.autoMerge ? 1 : 0,
+        row.autoStart ? 1 : 0,
+        row.autoMergeOnComplete ? 1 : 0,
+        row.mode,
+        row.parentPlanTaskId,
         latestRevision.id,
         row.item.item_key,
         row.workspacePath,
-        baseCommitSha,
+        row.baseCommitShaAtCreate,
         params.userId,
         createdAt,
         createdAt
