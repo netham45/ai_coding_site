@@ -24,6 +24,7 @@ import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
+import { legacyProjectTaskWorkspacesRoot, projectTaskWorkspacesRoot, taskWorkspacePath } from "../utils/paths.js";
 import { nowIso } from "../utils/time.js";
 
 const createTaskSchema = z.object({
@@ -48,11 +49,15 @@ const cancelTaskSchema = z.object({
 
 const mergeLocks = new Set<string>();
 
-function isSafeTaskWorkspacePath(workspacePath: string, projectBasePath: string): boolean {
+function isSafeTaskWorkspacePath(workspacePath: string, project: Pick<ProjectRow, "id" | "base_path">): boolean {
   const resolvedWorkspacePath = path.resolve(workspacePath);
-  const projectTasksRoot = path.resolve(path.dirname(projectBasePath), "tasks");
-  const relative = path.relative(projectTasksRoot, resolvedWorkspacePath);
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  const roots = [projectTaskWorkspacesRoot(project.id), legacyProjectTaskWorkspacesRoot(project.base_path)].map((root) =>
+    path.resolve(root)
+  );
+  return roots.some((root) => {
+    const relative = path.relative(root, resolvedWorkspacePath);
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  });
 }
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
@@ -591,7 +596,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const input = parsed.data;
   const id = makeId();
   const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
+  const workspacePath = taskWorkspacePath(project.id, id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
@@ -687,9 +692,16 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
   if (!scopedProject) return;
   const { project, projectDb } = scopedProject;
 
-  const tasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
+  const includeChildren =
+    req.query.includeChildren === "true" ||
+    req.query.includeChildren === "1" ||
+    req.query["include-children"] === "true" ||
+    req.query["include-children"] === "1";
+  const tasks = (
+    includeChildren
+      ? projectDb.prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC").all(project.id)
+      : projectDb.prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC").all(project.id)
+  ) as TaskRow[];
 
   res.json({ tasks: tasks.map((task) => serializeTask(projectDb, task)) });
 });
@@ -1044,7 +1056,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       return;
     }
 
-    if (!isSafeTaskWorkspacePath(task.workspace_path, project.base_path)) {
+    if (!isSafeTaskWorkspacePath(task.workspace_path, project)) {
       throw new Error("Unsafe task workspace path; refusing to reset outside task workspace directory");
     }
 

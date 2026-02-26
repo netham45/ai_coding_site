@@ -9,4 +9,17 @@ function resolveRootFromEnv(envValue: string | undefined, fallback: string): str
 }
 
 export const dataRoot = resolveRootFromEnv(process.env.AI_CODING_DATA_ROOT, path.join(workspaceRoot, "data"));
-export const reposRoot = resolveRootFromEnv(process.env.AI_CODING_REPOS_ROOT, path.join(workspaceRoot, "repos"));
+export const reposRoot = resolveRootFromEnv(process.env.AI_CODING_REPOS_ROOT, path.join(dataRoot, "repos"));
+const tasksRoot = resolveRootFromEnv(process.env.AI_CODING_TASKS_ROOT, path.join(dataRoot, "tasks"));
+
+export function projectTaskWorkspacesRoot(projectId: string): string {
+  return path.join(tasksRoot, projectId);
+}
+
+export function taskWorkspacePath(projectId: string, taskId: string): string {
+  return path.join(projectTaskWorkspacesRoot(projectId), taskId);
+}
+
+export function legacyProjectTaskWorkspacesRoot(projectBasePath: string): string {
+  return path.resolve(path.dirname(projectBasePath), "tasks");
+}
