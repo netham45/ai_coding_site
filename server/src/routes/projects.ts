@@ -5,7 +5,6 @@ import http from "node:http";
 import path from "node:path";
 import { z } from "zod";
 import {
-  PROJECT_DB_DIRNAME,
   db,
   ensureProjectDb,
   getProjectConfig,
@@ -311,7 +310,6 @@ projectsRouter.post("/", async (req, res) => {
       destination: basePath,
       branch: input.defaultBranch
     });
-    fs.mkdirSync(path.join(basePath, PROJECT_DB_DIRNAME), { recursive: true });
     ensureProjectDb({
       projectId: id,
       basePath,
