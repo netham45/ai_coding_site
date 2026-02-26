@@ -1731,6 +1731,7 @@ export async function approvePlan(params: {
   const defaultSubPlanAutoStart = params.autoStart ?? parsedRevisionDefaults?.autoStart ?? false;
   const defaultSubPlanAutoMergeOnComplete = params.autoMergeOnComplete ?? parsedRevisionDefaults?.autoMergeOnComplete ?? false;
   const defaultSubPlanParentPlanTaskId = params.parentPlanTaskId === undefined ? plan.id : params.parentPlanTaskId;
+  const defaultExecutionAutoMerge = Boolean(plan.auto_start);
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
       itemIdToDeps.set(row.revision_item_id, []);
@@ -1759,8 +1760,12 @@ export async function approvePlan(params: {
     const parsedRevisionItem = parsedRevisionDefaults?.tasksByItemKey.get(item.item_key.toLowerCase());
     const itemType = edit?.itemType ?? parsedRevisionItem?.itemType ?? item.item_type;
     const mode = itemType === "sub_plan" ? "plan" : "execution";
-    const autoMerge =
-      mode === "execution" && (autoMergeItemKeys.has(item.item_key.toLowerCase()) || Boolean(parsedRevisionItem?.autoMerge));
+    const autoMerge = mode === "execution"
+      && (
+        autoMergeItemKeys.has(item.item_key.toLowerCase())
+        || Boolean(parsedRevisionItem?.autoMerge)
+        || defaultExecutionAutoMerge
+      );
     const autoStart = mode === "plan" ? (edit?.autoStart ?? parsedRevisionItem?.autoStart ?? defaultSubPlanAutoStart) : false;
     const autoMergeOnComplete =
       mode === "plan"

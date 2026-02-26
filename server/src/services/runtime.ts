@@ -934,6 +934,9 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
       workspacePath: task.workspace_path
     });
     await createTaskBranch(task.workspace_path, task.id);
+    if (task.mode === "plan") {
+      await fs.promises.mkdir(path.join(task.workspace_path, ".ai-plan"), { recursive: true });
+    }
     projectDb.prepare("UPDATE tasks SET base_commit_sha_at_create = ?, updated_at = ? WHERE id = ?").run(baseCommitSha, nowIso(), task.id);
   }
 
