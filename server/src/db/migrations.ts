@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
   auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
   auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
+  metadata_json TEXT NOT NULL DEFAULT '{}',
   mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
   parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
   source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
@@ -222,4 +223,8 @@ CREATE TABLE IF NOT EXISTS ide_instances (
 );
 CREATE INDEX IF NOT EXISTS idx_ide_instances_task_id ON ide_instances(task_id);
 CREATE INDEX IF NOT EXISTS idx_ide_instances_status ON ide_instances(status);
+`;
+
+export const projectTaskMetadataMigration = `
+ALTER TABLE tasks ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
 `;

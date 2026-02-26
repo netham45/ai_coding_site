@@ -3,13 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "../utils/time.js";
 import { logWarn } from "../utils/structuredLog.js";
-import { projectBaselineMigration } from "./migrations.js";
+import { projectBaselineMigration, projectTaskMetadataMigration } from "./migrations.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
 export const PROJECT_DB_FILENAME = "project.sqlite";
-export const PROJECT_DB_SCHEMA_VERSION = 1;
+export const PROJECT_DB_SCHEMA_VERSION = 2;
 
 export type ProjectDbErrorCode = "PROJECT_DB_UNAVAILABLE" | "PROJECT_DB_CORRUPT";
 
@@ -105,16 +105,31 @@ function tableExists(db: Database.Database, table: string): boolean {
   return Boolean(row?.ok);
 }
 
+function tableHasColumn(db: Database.Database, table: string, column: string): boolean {
+  if (!tableExists(db, table)) return false;
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
 function getUserVersion(db: Database.Database): number {
   return Number(db.pragma("user_version", { simple: true }) ?? 0);
 }
 
 function runProjectMigrationsIfNeeded(db: Database.Database): void {
-  if (getUserVersion(db) >= PROJECT_DB_SCHEMA_VERSION) {
+  const currentVersion = getUserVersion(db);
+  if (currentVersion >= PROJECT_DB_SCHEMA_VERSION) {
     return;
   }
-  db.exec(projectBaselineMigration);
-  db.pragma(`user_version = ${PROJECT_DB_SCHEMA_VERSION}`);
+  db.transaction(() => {
+    db.exec(projectBaselineMigration);
+    if (!tableHasColumn(db, "tasks", "metadata_json")) {
+      db.exec(projectTaskMetadataMigration);
+    }
+    db.pragma(`user_version = ${PROJECT_DB_SCHEMA_VERSION}`);
+    if (tableExists(db, "project_metadata")) {
+      db.prepare("UPDATE project_metadata SET schema_version = ?, updated_at = ?").run(PROJECT_DB_SCHEMA_VERSION, nowIso());
+    }
+  })();
 }
 
 function ensureProjectMetadataTable(db: Database.Database): void {

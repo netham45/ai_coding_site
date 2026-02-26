@@ -239,6 +239,9 @@ function copyLegacyDataForProject(params: {
   projectId: string;
   presence: TablePresence;
 }): void {
+  const sourceTaskMetadataSelect = tableHasColumn(params.appDb, "tasks", "metadata_json")
+    ? "metadata_json"
+    : "'{}' AS metadata_json";
   const tx = params.projectDb.transaction(() => {
     if (params.presence.tasks) {
       runCopySelectIntoProjectDb({
@@ -257,6 +260,7 @@ function copyLegacyDataForProject(params: {
           "auto_merge",
           "auto_start",
           "auto_merge_on_complete",
+          "metadata_json",
           "mode",
           "parent_plan_task_id",
           "source_plan_revision_id",
@@ -284,6 +288,7 @@ function copyLegacyDataForProject(params: {
             auto_merge,
             0 AS auto_start,
             0 AS auto_merge_on_complete,
+            ${sourceTaskMetadataSelect},
             mode,
             parent_plan_task_id,
             source_plan_revision_id,
@@ -675,6 +680,9 @@ function verifyCountsAndChecksums(params: {
 }): { result: VerificationResult; checksums?: Record<string, { source: string; target: string }> } {
   const counts: Record<string, VerificationTableResult> = {};
   const checksums: Record<string, { source: string; target: string }> = {};
+  const sourceTaskMetadataSelect = tableHasColumn(params.appDb, "tasks", "metadata_json")
+    ? "metadata_json"
+    : "'{}' AS metadata_json";
 
   const specs: Array<{
     key: string;
@@ -705,6 +713,7 @@ function verifyCountsAndChecksums(params: {
         "auto_merge",
         "auto_start",
         "auto_merge_on_complete",
+        "metadata_json",
         "mode",
         "parent_plan_task_id",
         "source_plan_revision_id",
@@ -732,6 +741,7 @@ function verifyCountsAndChecksums(params: {
           auto_merge,
           0 AS auto_start,
           0 AS auto_merge_on_complete,
+          ${sourceTaskMetadataSelect},
           mode,
           parent_plan_task_id,
           source_plan_revision_id,
@@ -762,6 +772,7 @@ function verifyCountsAndChecksums(params: {
           auto_merge,
           auto_start,
           auto_merge_on_complete,
+          metadata_json,
           mode,
           parent_plan_task_id,
           source_plan_revision_id,
