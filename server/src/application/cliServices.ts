@@ -31,6 +31,7 @@ import type {
   TaskTransitionRow
 } from "../types.js";
 import { makeId } from "../utils/id.js";
+import { taskWorkspacePath } from "../utils/paths.js";
 import { nowIso } from "../utils/time.js";
 
 const mergeLocks = new Set<string>();
@@ -650,7 +651,7 @@ export async function createTask(params: {
 
   const id = makeId();
   const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
+  const workspacePath = taskWorkspacePath(project.id, id);
   const aiCommand = resolveAiCommand(params.aiCommand, params.userId);
   const effectivePrompt = buildEffectivePrompt(project, params.taskPrompt);
   const dependencyTaskIds = params.dependencyTaskIds ?? [];
@@ -1323,7 +1324,7 @@ export async function createPlan(params: { userId: string; projectId: string; ti
   const plannerPrompt = buildPlanTaskPrompt(params.taskPrompt);
   const id = makeId();
   const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
+  const workspacePath = taskWorkspacePath(project.id, id);
   const aiCommand = resolveAiCommand(params.aiCommand, params.userId);
   const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
 
@@ -1637,7 +1638,7 @@ export async function approvePlan(params: {
     taskRows.push({
       item,
       taskId,
-      workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
+      workspacePath: taskWorkspacePath(project.id, taskId),
       dependencyTaskIds: []
     });
   }

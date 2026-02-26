@@ -19,6 +19,7 @@ import type {
   TaskTransitionRow
 } from "../types.js";
 import { makeId } from "../utils/id.js";
+import { taskWorkspacePath } from "../utils/paths.js";
 import { nowIso } from "../utils/time.js";
 
 const createPlanSchema = z.object({
@@ -358,7 +359,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   const plannerPrompt = buildPlanTaskPrompt(input.taskPrompt);
   const id = makeId();
   const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
+  const workspacePath = taskWorkspacePath(project.id, id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
   const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
 
@@ -705,7 +706,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     taskRows.push({
       item,
       taskId,
-      workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
+      workspacePath: taskWorkspacePath(project.id, taskId),
       dependencyTaskIds: []
     });
   }
