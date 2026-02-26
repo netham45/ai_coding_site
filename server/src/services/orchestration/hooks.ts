@@ -31,6 +31,8 @@ const DEFAULT_DEBOUNCE_MS = 600;
 const DEFAULT_DEDUPE_WINDOW_MS = 3_000;
 const TIMER_TICK_DEBOUNCE_MS = 1_000;
 const TIMER_TICK_DEDUPE_MS = 8_000;
+const OUTPUT_UPDATE_DEBOUNCE_MS = 1_500;
+const OUTPUT_UPDATE_DEDUPE_MS = 6_000;
 
 function digest(input: string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -110,6 +112,32 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
     ];
   }
 
+  if (hookName === "on_node_output_updated") {
+    const payloadObj = (context.payload && typeof context.payload === "object" ? (context.payload as Record<string, unknown>) : null) ?? {};
+    const outputHash = typeof payloadObj.outputHash === "string" ? payloadObj.outputHash : stableValue(context.payload);
+    const source = typeof payloadObj.source === "string" ? payloadObj.source : "unknown";
+    return [
+      {
+        jobType: "task_queue_dispatch",
+        idempotencyKey: buildKey(`hook:${hookName}:task:${source}:${outputHash}`, context),
+        debounceMs: OUTPUT_UPDATE_DEBOUNCE_MS,
+        dedupeWindowMs: OUTPUT_UPDATE_DEDUPE_MS,
+        projectId: context.projectId ?? null,
+        taskId: context.taskId ?? null,
+        payload: { hookName, eventType: context.eventType, outputHash, source }
+      },
+      {
+        jobType: "plan_orchestration_pass",
+        idempotencyKey: buildKey(`hook:${hookName}:plan:${source}:${outputHash}`, context),
+        debounceMs: OUTPUT_UPDATE_DEBOUNCE_MS,
+        dedupeWindowMs: OUTPUT_UPDATE_DEDUPE_MS,
+        projectId: context.projectId ?? null,
+        taskId: context.taskId ?? null,
+        payload: { hookName, eventType: context.eventType, outputHash, source }
+      }
+    ];
+  }
+
   return [
     {
       jobType: "task_queue_dispatch",
@@ -139,7 +167,13 @@ function mapEventToHooks(eventType: string): OrchestrationHookName[] {
   if (eventType === "task.created" || eventType === "plan.created") return ["on_node_created"];
   if (eventType === "plan.approved") return ["on_child_attached", "on_dependency_added"];
   if (eventType === "task.status_changed") return ["on_status_changed"];
-  if (eventType === "task.summary.captured" || eventType === "plan.revision.extracted") return ["on_node_output_updated"];
+  if (
+    eventType === "task.summary.captured" ||
+    eventType === "plan.revision.extracted" ||
+    eventType === "task.output.material_changed"
+  ) {
+    return ["on_node_output_updated"];
+  }
   if (eventType === "task.merged" || eventType === "plan.merged" || eventType === "task.auto_merge.merged") {
     return ["on_merge_completed"];
   }
