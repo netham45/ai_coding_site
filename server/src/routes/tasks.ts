@@ -1056,6 +1056,16 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       throw new Error("Unsafe task workspace path; refusing to reset outside task workspace directory");
     }
 
+    let sourcePath = project.base_path;
+    if (task.parent_plan_task_id) {
+      const parentPlanTask = parentPlanTaskForUser(projectDb, task);
+      if (!parentPlanTask) {
+        throw new Error("Parent plan task not found");
+      }
+      sourcePath = parentPlanTask.workspace_path;
+    }
+    const baseCommitSha = await getHeadCommitSha(sourcePath);
+
     await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
     await fs.promises.mkdir(task.workspace_path, { recursive: true });
 
@@ -1067,14 +1077,14 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
          SET status = 'queued',
              result = '',
              workspace_path = ?,
-             base_commit_sha_at_create = NULL,
+             base_commit_sha_at_create = ?,
              head_commit_sha = NULL,
              cancel_reason = NULL,
              merged_at = NULL,
              merged_by_user_id = NULL,
              updated_at = ?
          WHERE id = ?`
-      ).run(task.workspace_path, updatedAt, task.id);
+      ).run(task.workspace_path, baseCommitSha, updatedAt, task.id);
       recordTaskTransition({
         projectDb,
         taskId: task.id,

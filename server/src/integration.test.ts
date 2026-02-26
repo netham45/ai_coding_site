@@ -105,6 +105,14 @@ function runGit(args: string[], cwd: string): void {
   }
 }
 
+function gitHead(cwd: string): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git rev-parse HEAD failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
 function createUser(userId = randomUUID()): string {
   const now = nowIso();
   appDb
@@ -468,6 +476,66 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.ok((migration?.last_error ?? "").length > 0);
 
     assert.ok(tableExists(appDb, "project_data_migrations"));
+  });
+
+  test("task rerun resets task without violating base commit NOT NULL constraint", async () => {
+    const userId = createUser();
+    const basePath = randomPath("rerun-base-commit");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "one\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+    const initialSha = gitHead(basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "two\n", "utf8");
+    runGit(["commit", "-am", "second"], basePath);
+    const latestSha = gitHead(basePath);
+
+    const taskId = randomUUID();
+    const workspacePath = path.join(path.dirname(basePath), "tasks", taskId);
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO tasks (
+           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+           auto_merge, mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+           status, workspace_path, base_commit_sha_at_create, head_commit_sha, cancel_reason,
+           merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      )
+      .run(
+        taskId,
+        projectId,
+        "Rerun Task",
+        "prompt",
+        "done",
+        "effective",
+        "codex --yolo {prompt}",
+        0,
+        "execution",
+        "failed",
+        workspacePath,
+        initialSha,
+        userId,
+        now,
+        now
+      );
+
+    const rerun = await callApi(`/api/tasks/${taskId}/rerun`, { method: "POST", userId });
+    assert.equal(rerun.status, 200);
+    assert.equal(rerun.json?.task?.baseCommitShaAtCreate, latestSha);
+
+    const updated = projectDb
+      .prepare("SELECT status, base_commit_sha_at_create FROM tasks WHERE id = ?")
+      .get(taskId) as { status: string; base_commit_sha_at_create: string };
+    assert.equal(updated.status, "queued");
+    assert.equal(updated.base_commit_sha_at_create, latestSha);
   });
 
   test("cached project DB handle reuse does not rerun baseline migrations", () => {
