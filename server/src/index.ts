@@ -9,6 +9,7 @@ import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { nowIso } from "./utils/time.js";
 import { createApp } from "./app.js";
+import { orchestrationWorkersEnabled } from "./config/featureFlags.js";
 
 const app = createApp();
 const port = Number(process.env.PORT ?? 3001);
@@ -26,9 +27,13 @@ server.listen(port, host, () => {
 startRuntimeHeartbeat().catch((error) => {
   console.warn(`Runtime heartbeat disabled: ${String((error as Error).message || error)}`);
 });
-startOrchestrationJobQueueWorker();
-startHierarchicalOrchestrationJobs();
-startPlanOrchestrationWorker();
+if (orchestrationWorkersEnabled()) {
+  startOrchestrationJobQueueWorker();
+  startHierarchicalOrchestrationJobs();
+  startPlanOrchestrationWorker();
+} else {
+  console.log("Orchestration workers disabled by feature flag");
+}
 startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {

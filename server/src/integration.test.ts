@@ -2971,4 +2971,124 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       });
     }
   });
+
+  test("compatibility mode disables orchestration endpoints while preserving task workflows", async () => {
+    const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
+    process.env.ORCHESTRATION_COMPATIBILITY_MODE = "1";
+    try {
+      const userId = createUser();
+      const basePath = randomPath("compat-mode");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: "Compatibility Task",
+        mode: "execution",
+        status: "queued"
+      });
+
+      const app = createApp();
+      const localServer = app.listen(0);
+      const localAddress = localServer.address();
+      if (!localAddress || typeof localAddress === "string") {
+        throw new Error("Failed to start test server");
+      }
+      const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+      const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+        callApiAt(localBaseUrl, pathname, options);
+
+      try {
+        const listTasks = await localCallApi(`/api/projects/${projectId}/tasks`, { userId });
+        assert.equal(listTasks.status, 200);
+        assert.equal(Array.isArray(listTasks.json?.tasks), true);
+
+        const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
+        assert.equal(taskDetails.status, 200);
+        assert.equal(taskDetails.json?.task?.id, taskId);
+
+        const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
+        assert.equal(hierarchy.status, 404);
+        assert.equal(hierarchy.json?.code, "FEATURE_DISABLED");
+
+        const nodeStart = await localCallApi(`/api/nodes/${taskId}/start`, {
+          method: "POST",
+          userId,
+          body: {}
+        });
+        assert.equal(nodeStart.status, 404);
+        assert.equal(nodeStart.json?.code, "FEATURE_DISABLED");
+      } finally {
+        await new Promise<void>((resolve) => {
+          localServer.close(() => resolve());
+        });
+      }
+    } finally {
+      process.env.ORCHESTRATION_COMPATIBILITY_MODE = previousCompatibility;
+    }
+  });
+
+  test("granular hierarchy/action feature flags can be disabled independently", async () => {
+    const previousHierarchy = process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
+    const previousActions = process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
+    const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
+    process.env.ORCHESTRATION_COMPATIBILITY_MODE = "0";
+    process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "false";
+    process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "false";
+    try {
+      const userId = createUser();
+      const basePath = randomPath("flag-disable");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: "Flagged Node",
+        mode: "plan",
+        status: "queued"
+      });
+
+      const app = createApp();
+      const localServer = app.listen(0);
+      const localAddress = localServer.address();
+      if (!localAddress || typeof localAddress === "string") {
+        throw new Error("Failed to start test server");
+      }
+      const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+      const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+        callApiAt(localBaseUrl, pathname, options);
+
+      try {
+        const nodeDetails = await localCallApi(`/api/nodes/${taskId}`, { userId });
+        assert.equal(nodeDetails.status, 404);
+        assert.equal(nodeDetails.json?.code, "FEATURE_DISABLED");
+
+        const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
+        assert.equal(graph.status, 404);
+        assert.equal(graph.json?.code, "FEATURE_DISABLED");
+
+        const toggleAutoMode = await localCallApi(`/api/nodes/${taskId}/auto-mode`, {
+          method: "POST",
+          userId,
+          body: { enabled: false }
+        });
+        assert.equal(toggleAutoMode.status, 404);
+        assert.equal(toggleAutoMode.json?.code, "FEATURE_DISABLED");
+
+        const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
+        assert.equal(taskDetails.status, 200);
+        assert.equal(taskDetails.json?.task?.id, taskId);
+      } finally {
+        await new Promise<void>((resolve) => {
+          localServer.close(() => resolve());
+        });
+      }
+    } finally {
+      process.env.ORCHESTRATION_COMPATIBILITY_MODE = previousCompatibility;
+      process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = previousHierarchy;
+      process.env.ORCHESTRATION_ACTIONS_API_ENABLED = previousActions;
+    }
+  });
 });
