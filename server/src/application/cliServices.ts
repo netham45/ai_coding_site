@@ -17,6 +17,7 @@ import { ideSessionRunning, prepareIdeWorkspace, startIdeSession, stopIdeSession
 import { parsePlanOutput } from "../services/planParser.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
+import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import type {
   IdeInstanceRow,
@@ -490,6 +491,14 @@ async function maybeAdvanceParentPlanAfterChildMerge(params: {
     return;
   }
 
+  recordEvent({
+    projectId: latestParent.project_id,
+    taskId: latestParent.id,
+    eventType: "plan.auto_merge_on_complete.started",
+    payload: { reason: "children_merged" },
+    database: params.projectDb
+  });
+
   try {
     await mergePlan({ userId: params.actorUserId, planId: latestParent.id });
   } catch (error: any) {
@@ -838,6 +847,7 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
   } catch {
     gitStatus = null;
   }
+  const visibility = buildAutomationVisibility(projectDb, task);
 
   return {
     task: serializeTask(projectDb, task),
@@ -845,7 +855,10 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
-    mergeRecords: mergeRecords.map(serializeMergeRecord)
+    mergeRecords: mergeRecords.map(serializeMergeRecord),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   };
 }
 
@@ -874,6 +887,7 @@ export async function getTaskDetails(params: { userId: string; taskId: string; p
   } catch {
     gitStatus = null;
   }
+  const visibility = buildAutomationVisibility(projectDb, task);
 
   return {
     task: serializeTask(projectDb, task),
@@ -881,7 +895,10 @@ export async function getTaskDetails(params: { userId: string; taskId: string; p
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
-    mergeRecords: mergeRecords.map(serializeMergeRecord)
+    mergeRecords: mergeRecords.map(serializeMergeRecord),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   };
 }
 
@@ -1598,6 +1615,7 @@ export async function getPlan(params: { userId: string; planId: string }) {
   const approvedTasks = projectDb
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
+  const visibility = buildAutomationVisibility(projectDb, plan);
 
   return {
     plan: serializeTask(projectDb, plan),
@@ -1615,7 +1633,10 @@ export async function getPlan(params: { userId: string; planId: string }) {
       approvedAt: revision.approved_at,
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
-    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task))
+    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   };
 }
 

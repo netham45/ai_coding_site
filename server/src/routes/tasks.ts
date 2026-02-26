@@ -22,6 +22,7 @@ import { kickTaskQueueProcessing } from "../services/queue.js";
 import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
+import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -717,6 +718,7 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   } catch {
     gitStatus = null;
   }
+  const visibility = buildAutomationVisibility(projectDb, task);
 
   res.json({
     task: serializeTask(projectDb, task),
@@ -724,7 +726,10 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
-    mergeRecords: mergeRecords.map(serializeMergeRecord)
+    mergeRecords: mergeRecords.map(serializeMergeRecord),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   });
 });
 
