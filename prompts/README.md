@@ -17,6 +17,7 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-approve.md` - approval/materialization template.
 - `task-execution.md` - execution-task runtime template.
 - `re-review-unblock.md` - re-review decision template for unblock vs delta-work.
+- `exec-task-runner.md` - exec-tier safe execution runtime template with evidence and merge-readiness reporting.
 
 ## Usage
 
