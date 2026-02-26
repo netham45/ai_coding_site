@@ -579,6 +579,8 @@ describe("integration: CLI subcommands", () => {
     assert.equal(plansFiltered.code, 0);
     assert.equal(plansFiltered.json.plans.length, 1);
     assert.equal(plansFiltered.json.plans[0].id, planA);
+    assert.equal(plansFiltered.json.plans[0].autoStart, false);
+    assert.equal(plansFiltered.json.plans[0].autoMergeOnComplete, false);
 
     const summaryOk = runCli(["tasks", "summary", taskAStandalone, "--project-id", projectA, "--json"]);
     assert.equal(summaryOk.code, 0);
@@ -709,6 +711,8 @@ describe("integration: CLI subcommands", () => {
     assert.equal(help.code, 0);
     assert.match(help.stdout, /tasks all \[--project-id <projectId>] \[--plan-id <planId>]/);
     assert.match(help.stdout, /tasks summary <taskId> \[--project-id <projectId>] \[--plan-id <planId>]/);
+    assert.match(help.stdout, /plans create --project <projectId> --title <title> --prompt <prompt> \[--ai-command <cmd>] \[--auto-start] \[--auto-merge-on-complete] \[--parent-plan-id <planId>]/);
+    assert.match(help.stdout, /plans approve <planId> \[--auto-merge-item-keys a,b] \[--auto-start] \[--auto-merge-on-complete] \[--parent-plan-id <planId>] \[--task-edits-file path.json]/);
     assert.match(help.stdout, /plans review <planId>/);
     assert.match(help.stdout, /ready_merge plan <planId>/);
     assert.match(help.stdout, /merge plan <planId>/);

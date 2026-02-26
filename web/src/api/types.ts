@@ -21,6 +21,7 @@ export type TaskStatus =
   | "queued"
   | "in_progress"
   | "waiting_input"
+  | "awaiting_children"
   | "merge_ready"
   | "merged"
   | "cancelled"
@@ -38,6 +39,8 @@ export type Task = {
   effectivePrompt: string;
   aiCommand: string;
   autoMerge: boolean;
+  autoStart: boolean;
+  autoMergeOnComplete: boolean;
   mode: TaskMode;
   parentPlanTaskId: string | null;
   sourcePlanRevisionId: string | null;
@@ -60,6 +63,7 @@ export type Task = {
 export type PlanRevisionItem = {
   id: string;
   itemKey: string;
+  itemType: "execution_task" | "sub_plan";
   title: string;
   prompt: string;
   ordinal: number;

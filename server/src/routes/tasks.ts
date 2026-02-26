@@ -213,6 +213,8 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
     autoMerge: Boolean(task.auto_merge),
+    autoStart: Boolean(task.auto_start),
+    autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
