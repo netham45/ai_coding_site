@@ -11,6 +11,9 @@ import type Database from "better-sqlite3";
 import { createApp } from "./app.js";
 import { db as appDb } from "./db/index.js";
 import {
+  PROJECT_DB_DIRNAME,
+  PROJECT_DB_FILENAME,
+  PROJECT_DB_SCHEMA_VERSION,
   ProjectDbError,
   closeAllProjectDbs,
   detectProjectDbMetadata,
@@ -23,6 +26,7 @@ import {
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration } from "./db/migrations.js";
+import { openSqliteDatabase } from "./db/sqlite.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
@@ -582,6 +586,91 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
         }),
       (error: unknown) => error instanceof ProjectDbError && error.code === "PROJECT_DB_CORRUPT"
     );
+  });
+
+  test("legacy project DB migrates missing orchestration columns and metadata schema version", () => {
+    const userId = createUser();
+    const basePath = randomPath("legacy-project-db-upgrade");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, PROJECT_DB_DIRNAME);
+    const dbPath = path.join(dbDir, PROJECT_DB_FILENAME);
+    const createdAt = nowIso();
+    const updatedAt = nowIso();
+    fs.mkdirSync(dbDir, { recursive: true });
+
+    const legacyDb = openSqliteDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS project_config (
+        project_id TEXT PRIMARY KEY,
+        project_prompt TEXT NOT NULL DEFAULT '',
+        project_rules TEXT NOT NULL DEFAULT '',
+        coding_standard TEXT NOT NULL DEFAULT '',
+        coding_standard_other TEXT NOT NULL DEFAULT '',
+        project_other TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS project_metadata (
+        project_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO project_config (
+        project_id,
+        project_prompt,
+        project_rules,
+        coding_standard,
+        coding_standard_other,
+        project_other,
+        created_at,
+        updated_at
+      ) VALUES ('${projectId}', '', '', '', '', '', '${createdAt}', '${updatedAt}');
+      INSERT INTO project_metadata (project_id, schema_version, created_at, updated_at)
+      VALUES ('${projectId}', 1, '${createdAt}', '${updatedAt}');
+    `);
+    legacyDb.pragma("user_version = 1");
+    legacyDb.close();
+
+    const handle = ensureProjectDb({
+      projectId,
+      basePath,
+      initializeIfMissing: false
+    });
+
+    const taskColumns = handle.db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    assert.equal(taskColumns.some((col) => col.name === "auto_start"), true);
+    assert.equal(taskColumns.some((col) => col.name === "auto_merge_on_complete"), true);
+    const hasOrchestrationTable = tableExists(handle.db, "plan_orchestration_state");
+    assert.equal(hasOrchestrationTable, true);
+    const schemaVersion = handle.db.pragma("user_version", { simple: true }) as number;
+    assert.equal(schemaVersion, PROJECT_DB_SCHEMA_VERSION);
+    assert.equal(handle.metadata.schema_version, PROJECT_DB_SCHEMA_VERSION);
+    assert.equal(handle.db.prepare("SELECT auto_start FROM tasks LIMIT 1").all().length, 0);
   });
 });
 

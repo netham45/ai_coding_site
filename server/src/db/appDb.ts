@@ -19,6 +19,12 @@ export function getAppDbPath(): string {
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, alterSql: string): void {
+  const tableRow = db
+    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+    .get(table) as { ok: number } | undefined;
+  if (!tableRow?.ok) {
+    return;
+  }
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (!cols.some((col) => col.name === column)) {
     db.exec(alterSql);
@@ -33,6 +39,41 @@ function applyLegacyMigrations(db: Database.Database): void {
     "default_ai_commands",
     `ALTER TABLE user_settings ADD COLUMN default_ai_commands TEXT NOT NULL DEFAULT '${DEFAULT_AI_COMMANDS_JSON}'`
   );
+  ensureColumn(
+    db,
+    "tasks",
+    "auto_start",
+    "ALTER TABLE tasks ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1))"
+  );
+  ensureColumn(
+    db,
+    "tasks",
+    "auto_merge_on_complete",
+    "ALTER TABLE tasks ADD COLUMN auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1))"
+  );
+  ensureColumn(
+    db,
+    "plan_revision_items",
+    "item_type",
+    "ALTER TABLE plan_revision_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'execution_task' CHECK (item_type IN ('execution_task','sub_plan'))"
+  );
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS plan_orchestration_state (
+      plan_task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+      lock_token TEXT,
+      lock_expires_at TEXT,
+      last_output_sha256 TEXT,
+      last_extracted_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+      last_approved_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+      last_approved_output_sha256 TEXT,
+      last_failed_output_sha256 TEXT,
+      last_error TEXT,
+      last_error_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );`
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_plan_orchestration_state_lock_expires_at ON plan_orchestration_state(lock_expires_at)");
 }
 
 function initializeAppDb(): Database.Database {
