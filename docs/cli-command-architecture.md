@@ -13,7 +13,7 @@ Define a new CLI tool architecture that reuses existing backend business logic (
   - Initializes `app.sqlite`, applies app migrations, seeds local user/settings, triggers project data migration backfill.
 - Project DB bootstrap and validation:
   - `server/src/db/projectDb.ts`
-  - Creates/opens `data/projects/<projectId>/project.sqlite`, validates `project_metadata`, enforces schema version, maintains handle cache.
+  - Creates/opens `<project>/base/.ai-coding/project.sqlite`, validates `project_metadata`, enforces schema version, maintains handle cache.
 - DB backend routing (monolith vs project DB):
   - `server/src/db/splitPersistence.ts`
   - `resolveProjectDatabase()` chooses DB backend by phase/migration status with fallback behavior.
@@ -173,11 +173,7 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
 
 2. Add CLI entrypoint and parser.
 - `server/src/cli/index.ts`
-- Add PATH-friendly `acs` executable, while keeping npm script fallback (`npm run cli -w server -- ...`).
-- Ensure root discovery works from nested directories inside the workspace (not only repo root).
-- Keep help/error copy explicit for root-not-found failures:
-  - `Error: Could not locate the ai-coding-site workspace root from <path>.`
-  - `Run this command from within an ai-coding-site workspace (for example, <workspace>/server).`
+- Add npm script, for example `npm run cli -w server -- ...`.
 
 3. Implement command handlers as thin adapters.
 - Each command calls exactly one application service operation.
@@ -204,3 +200,4 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
   - project create/clone + config update logic
 - Keep HTTP-only concerns in routes:
   - request parsing/response shaping/status codes.
+

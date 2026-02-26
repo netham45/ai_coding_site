@@ -26,7 +26,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { Project, Task, UserSettings } from "../api/types";
-import { TaskDependencyTree } from "../components/TaskDependencyTree";
 import { TaskSidebar } from "../components/TaskSidebar";
 
 type ProjectResponse = { project: Project };
@@ -243,7 +242,7 @@ export function ProjectDetailPage() {
     if (!projectId) return;
     const [projectRes, tasksRes, settingsRes] = await Promise.all([
       api<ProjectResponse>(`/api/projects/${projectId}`),
-      api<TasksResponse>(`/api/projects/${projectId}/tasks?include-children=true`),
+      api<TasksResponse>(`/api/projects/${projectId}/tasks`),
       api<SettingsResponse>("/api/users/me/settings")
     ]);
     setProject(projectRes.project);
@@ -654,14 +653,6 @@ export function ProjectDetailPage() {
                   Create Task
                 </Button>
               </form>
-
-              <Heading size="sm" mt={8} mb={3}>
-                Task Dependency Tree
-              </Heading>
-              <Text color="gray.600" mb={3}>
-                Hover any node to view summary and result. Nodes are linked by dependency relationships.
-              </Text>
-              {tasks.length ? <TaskDependencyTree tasks={tasks} /> : <Text color="gray.600">No tasks yet.</Text>}
             </TabPanel>
             <TabPanel px={0} pt={4}>
               <Heading size="md" mb={2}>

@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME, getProjectDb, getProjectDbPath, isProjectDbError } from "./projectDb.js";
+import { PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME, getProjectDb, isProjectDbError } from "./projectDb.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { logWarn } from "../utils/structuredLog.js";
 
@@ -122,14 +122,9 @@ function isProjectBackendAllowedByMigration(status: MigrationStatus | undefined)
   return status === "verified" || status === "cleaned";
 }
 
-function hasProjectDbFile(projectId: string, basePath: string): boolean {
-  const dataDbPath = getProjectDbPath(projectId);
-  if (fs.existsSync(dataDbPath)) {
-    return true;
-  }
-  // Legacy location support while older repos are still being migrated.
-  const legacyDbPath = path.join(path.resolve(basePath), PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME);
-  return fs.existsSync(legacyDbPath);
+function hasProjectDbFile(basePath: string): boolean {
+  const dbPath = path.join(path.resolve(basePath), PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME);
+  return fs.existsSync(dbPath);
 }
 
 export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): ResolveProjectDatabaseResult {
@@ -138,7 +133,7 @@ export function resolveProjectDatabase(params: ResolveProjectDatabaseParams): Re
   const preferProject = shouldPreferProjectBackend(phase, params.intent) || !monolithSupported;
   const migrationStatus = migrationStatusForProject(params.appDb, params.projectId);
   const canAttemptProjectDb =
-    !monolithSupported || migrationStatus !== undefined || hasProjectDbFile(params.projectId, params.basePath);
+    !monolithSupported || migrationStatus !== undefined || hasProjectDbFile(params.basePath);
 
   if (preferProject && canAttemptProjectDb && isProjectBackendAllowedByMigration(migrationStatus)) {
     try {

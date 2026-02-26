@@ -6,10 +6,8 @@ import { logWarn } from "../utils/structuredLog.js";
 import { projectBaselineMigration } from "./migrations.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { openSqliteDatabase } from "./sqlite.js";
-import { dataRoot } from "../utils/paths.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
-export const PROJECT_DB_DATA_DIRNAME = "projects";
 export const PROJECT_DB_FILENAME = "project.sqlite";
 export const PROJECT_DB_SCHEMA_VERSION = 1;
 
@@ -89,40 +87,8 @@ function isValidIsoTimestamp(input: string): boolean {
   return Number.isFinite(Date.parse(input));
 }
 
-function getLegacyProjectDbPath(basePath: string): string {
+function getProjectDbPath(basePath: string): string {
   return path.join(path.resolve(basePath), PROJECT_DB_DIRNAME, PROJECT_DB_FILENAME);
-}
-
-export function getProjectDbPath(projectId: string): string {
-  return path.join(dataRoot, PROJECT_DB_DATA_DIRNAME, projectId, PROJECT_DB_FILENAME);
-}
-
-function moveLegacyProjectDbIfNeeded(params: { basePath: string; dbPath: string }): void {
-  if (fs.existsSync(params.dbPath)) {
-    return;
-  }
-  const legacyDbPath = getLegacyProjectDbPath(params.basePath);
-  if (!fs.existsSync(legacyDbPath)) {
-    return;
-  }
-
-  fs.mkdirSync(path.dirname(params.dbPath), { recursive: true });
-  try {
-    fs.renameSync(legacyDbPath, params.dbPath);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException)?.code;
-    if (code !== "EXDEV") {
-      throw error;
-    }
-    fs.copyFileSync(legacyDbPath, params.dbPath);
-    fs.unlinkSync(legacyDbPath);
-  }
-
-  try {
-    fs.rmdirSync(path.dirname(legacyDbPath));
-  } catch {
-    // Directory may be non-empty or already removed.
-  }
 }
 
 function errorMessage(error: unknown): string {
@@ -375,7 +341,7 @@ function validateCachedHandle(params: {
 export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle {
   const projectId = params.projectId;
   const basePath = path.resolve(params.basePath);
-  const dbPath = getProjectDbPath(projectId);
+  const dbPath = getProjectDbPath(basePath);
   const allowCreate = params.initializeIfMissing === true;
   const existingPath = projectPathById.get(projectId);
 
@@ -397,8 +363,6 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
   if (cached && !cached.db.open) {
     cacheByPath.delete(dbPath);
   }
-
-  moveLegacyProjectDbIfNeeded({ basePath, dbPath });
 
   const dbExists = fs.existsSync(dbPath);
   if (!dbExists && !allowCreate) {
@@ -490,9 +454,9 @@ export function getProjectDb(params: { projectId: string; basePath: string }): D
   return ensureProjectDb({ ...params, initializeIfMissing: false }).db;
 }
 
-export function detectProjectDbMetadata(params: { basePath: string; projectId?: string }): ProjectDbMetadata | null {
+export function detectProjectDbMetadata(params: { basePath: string }): ProjectDbMetadata | null {
   const basePath = path.resolve(params.basePath);
-  const dbPath = params.projectId ? getProjectDbPath(params.projectId) : getLegacyProjectDbPath(basePath);
+  const dbPath = getProjectDbPath(basePath);
   if (!fs.existsSync(dbPath)) {
     return null;
   }

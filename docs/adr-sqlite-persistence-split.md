@@ -14,9 +14,9 @@ We are splitting persistence into two SQLite layers with clear ownership boundar
 Use two SQLite databases:
 
 1. App DB (global): `data/app.sqlite`
-2. Project DB (per project): `data/projects/<projectId>/project.sqlite`
+2. Project DB (per project): `<project.base_path>/.ai-coding/project.sqlite`
 
-`<projectId>` comes from `projects.id` in the app DB.
+`<project.base_path>` comes from `projects.base_path` in the app DB.
 
 ## Ownership Boundaries
 
@@ -29,7 +29,7 @@ Use two SQLite databases:
 
 `projects` keeps global project metadata only (identity, repo, path, membership-relevant metadata). Project prompt/config fields are removed from app DB ownership.
 
-### Project DB (`data/projects/<projectId>/project.sqlite`) is source of truth for
+### Project DB (`<project.base_path>/.ai-coding/project.sqlite`) is source of truth for
 
 - `tasks`
 - `task_dependencies`

@@ -18,6 +18,7 @@ AI Coding Site is a local-first web app for running AI coding tasks against Git 
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
 - [CLI usage](#cli-usage)
+- [Plan automation](#plan-automation)
 - [Usage flow](#usage-flow)
 - [API overview](#api-overview)
 - [Repository layout](#repository-layout)
@@ -58,6 +59,7 @@ Runtime model:
   - Extract and validate plan revisions
   - Regenerate with feedback
   - Approve plan revisions to create execution tasks
+  - Auto-orchestrate extract + approve when `auto_start` is enabled and plan is `waiting_input`
 - Terminal and IDE
   - xterm.js terminal with reconnect behavior
   - Tokenized terminal and IDE access URLs
@@ -203,57 +205,75 @@ When `web/dist` exists, the server also serves the frontend for non-API routes.
 
 ## CLI usage
 
-Run CLI commands from the repository root or any nested directory inside this `ai-coding-site` workspace:
-
-```bash
-acs <command>
-```
-
-Fallback (backward-compatible npm script):
+Run CLI commands from the repository root:
 
 ```bash
 npm run cli -w server -- <command>
 ```
 
-If root discovery fails, `acs` exits with:
-
-```text
-Error: Could not locate the ai-coding-site workspace root from <path>. Run this command from within an ai-coding-site workspace (for example, <workspace>/server).
-```
-
-Fix by `cd`-ing into this workspace (for example, `/server`, `/server/src/cli`, or `/web`) and rerunning.
-
 Common commands:
 
 ```bash
 # List execution tasks (all projects)
-acs tasks all --json
+npm run cli -w server -- tasks all --json
 
 # List active execution tasks scoped to a project/plan
-acs tasks active --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- tasks active --project-id <projectId> --plan-id <planId> --json
 
 # Task summary/details with optional scope filters
-acs tasks summary <taskId> --project-id <projectId> --plan-id <planId> --json
-acs tasks details <taskId> --project-id <projectId> --json
-acs info <taskId> --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- tasks summary <taskId> --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- tasks details <taskId> --project-id <projectId> --json
+npm run cli -w server -- info <taskId> --project-id <projectId> --plan-id <planId> --json
 
 # Plan listing/review
-acs plans list --project-id <projectId> --plan-id <planId> --json
-acs plans review <planId> --json
-acs review plan <planId> --json
+npm run cli -w server -- plans list --project-id <projectId> --plan-id <planId> --json
+npm run cli -w server -- plans review <planId> --json
+npm run cli -w server -- review plan <planId> --json
 
 # Merge workflows (task + plan)
-acs ready_merge task <taskId> --json
-acs ready_merge plan <planId> --json
-acs merge task <taskId> --json
-acs merge plan <planId> --json
+npm run cli -w server -- ready_merge task <taskId> --json
+npm run cli -w server -- ready_merge plan <planId> --json
+npm run cli -w server -- merge task <taskId> --json
+npm run cli -w server -- merge plan <planId> --json
+
+# Plan automation options
+npm run cli -w server -- plans create --project <projectId> --title "Plan" --prompt "..." --auto-start --auto-merge-on-complete
+npm run cli -w server -- plans approve <planId> --auto-merge-item-keys task_a,task_b --auto-start --auto-merge-on-complete
 ```
 
 For the complete command list, run:
 
 ```bash
-acs --help
+npm run cli -w server -- --help
 ```
+
+## Plan automation
+
+Automation uses the plan output file at `.ai-plan/latest-plan.yaml` and runs in passes.
+
+- A plan is auto-processed only when:
+  - `mode = plan`
+  - `auto_start = true`
+  - `status = waiting_input`
+  - plan YAML file exists and is non-empty
+- Auto-processing runs extract then approve, deduped by output hash.
+- If extraction/approval fails, it retries only after plan output changes.
+- Approving from an auto-start plan defaults execution child tasks to `auto_merge=true`.
+
+YAML contract highlights:
+
+- Top-level `tasks:` list is required (`items:` is accepted for compatibility).
+- Optional top-level defaults:
+  - `auto_start`
+  - `auto_merge_on_complete`
+  - `auto_merge_item_keys`
+- Item types:
+  - `execution_task` supports `auto_merge`
+  - `sub_plan` supports `auto_start` and `auto_merge_on_complete`
+
+Full operational details, migration notes, state machine, and rollout checklist:
+
+- `docs/plan-automation-model.md`
 
 ## Usage flow
 

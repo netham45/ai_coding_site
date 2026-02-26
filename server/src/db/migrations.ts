@@ -61,11 +61,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   effective_prompt TEXT NOT NULL,
   ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
   auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+  auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
+  auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
   mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
   parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
   source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
   source_plan_item_key TEXT,
-  status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','merge_ready','merged','cancelled','failed','merge_conflict')),
+  status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','awaiting_children','merge_ready','merged','cancelled','failed','merge_conflict')),
   workspace_path TEXT NOT NULL,
   base_commit_sha_at_create TEXT NOT NULL,
   head_commit_sha TEXT,
@@ -175,6 +177,7 @@ CREATE TABLE IF NOT EXISTS plan_revision_items (
   id TEXT PRIMARY KEY,
   revision_id TEXT NOT NULL REFERENCES plan_revisions(id) ON DELETE CASCADE,
   item_key TEXT NOT NULL,
+  item_type TEXT NOT NULL DEFAULT 'execution_task' CHECK (item_type IN ('execution_task','sub_plan')),
   title TEXT NOT NULL,
   prompt TEXT NOT NULL,
   ordinal INTEGER NOT NULL,
@@ -189,6 +192,22 @@ CREATE TABLE IF NOT EXISTS plan_revision_item_dependencies (
   PRIMARY KEY (revision_item_id, depends_on_item_key)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_revision_item_dependencies_revision_item_id ON plan_revision_item_dependencies(revision_item_id);
+
+CREATE TABLE IF NOT EXISTS plan_orchestration_state (
+  plan_task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  lock_token TEXT,
+  lock_expires_at TEXT,
+  last_output_sha256 TEXT,
+  last_extracted_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+  last_approved_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+  last_approved_output_sha256 TEXT,
+  last_failed_output_sha256 TEXT,
+  last_error TEXT,
+  last_error_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_orchestration_state_lock_expires_at ON plan_orchestration_state(lock_expires_at);
 
 CREATE TABLE IF NOT EXISTS ide_instances (
   id TEXT PRIMARY KEY,

@@ -22,9 +22,9 @@ import { kickTaskQueueProcessing } from "../services/queue.js";
 import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
+import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
-import { legacyProjectTaskWorkspacesRoot, projectTaskWorkspacesRoot, taskWorkspacePath } from "../utils/paths.js";
 import { nowIso } from "../utils/time.js";
 
 const createTaskSchema = z.object({
@@ -49,15 +49,11 @@ const cancelTaskSchema = z.object({
 
 const mergeLocks = new Set<string>();
 
-function isSafeTaskWorkspacePath(workspacePath: string, project: Pick<ProjectRow, "id" | "base_path">): boolean {
+function isSafeTaskWorkspacePath(workspacePath: string, projectBasePath: string): boolean {
   const resolvedWorkspacePath = path.resolve(workspacePath);
-  const roots = [projectTaskWorkspacesRoot(project.id), legacyProjectTaskWorkspacesRoot(project.base_path)].map((root) =>
-    path.resolve(root)
-  );
-  return roots.some((root) => {
-    const relative = path.relative(root, resolvedWorkspacePath);
-    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
-  });
+  const projectTasksRoot = path.resolve(path.dirname(projectBasePath), "tasks");
+  const relative = path.relative(projectTasksRoot, resolvedWorkspacePath);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function projectForUser(projectId: string, userId: string): ProjectRow | undefined {
@@ -218,6 +214,8 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     effectivePrompt: task.effective_prompt,
     aiCommand: task.ai_command,
     autoMerge: Boolean(task.auto_merge),
+    autoStart: Boolean(task.auto_start),
+    autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
@@ -596,7 +594,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const input = parsed.data;
   const id = makeId();
   const now = nowIso();
-  const workspacePath = taskWorkspacePath(project.id, id);
+  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
   const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
@@ -692,16 +690,9 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
   if (!scopedProject) return;
   const { project, projectDb } = scopedProject;
 
-  const includeChildren =
-    req.query.includeChildren === "true" ||
-    req.query.includeChildren === "1" ||
-    req.query["include-children"] === "true" ||
-    req.query["include-children"] === "1";
-  const tasks = (
-    includeChildren
-      ? projectDb.prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC").all(project.id)
-      : projectDb.prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC").all(project.id)
-  ) as TaskRow[];
+  const tasks = projectDb
+    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
+    .all(project.id) as TaskRow[];
 
   res.json({ tasks: tasks.map((task) => serializeTask(projectDb, task)) });
 });
@@ -727,6 +718,7 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   } catch {
     gitStatus = null;
   }
+  const visibility = buildAutomationVisibility(projectDb, task);
 
   res.json({
     task: serializeTask(projectDb, task),
@@ -734,7 +726,10 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
-    mergeRecords: mergeRecords.map(serializeMergeRecord)
+    mergeRecords: mergeRecords.map(serializeMergeRecord),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   });
 });
 
@@ -1056,7 +1051,7 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       return;
     }
 
-    if (!isSafeTaskWorkspacePath(task.workspace_path, project)) {
+    if (!isSafeTaskWorkspacePath(task.workspace_path, project.base_path)) {
       throw new Error("Unsafe task workspace path; refusing to reset outside task workspace directory");
     }
 

@@ -7,7 +7,7 @@ Date updated: 2026-02-16
 This runbook covers operational backup and restore for:
 
 - app DB (`app.sqlite`) for users, projects, memberships, and migration state
-- per-project DBs (`data/projects/<projectId>/project.sqlite`) for project config, tasks, plans, runtime state, and events
+- per-project DBs (`<project>/base/.ai-coding/project.sqlite`) for project config, tasks, plans, runtime state, and events
 
 ## Backup strategy
 
@@ -44,8 +44,8 @@ mkdir -p "${BACKUP_ROOT}/app" "${BACKUP_ROOT}/projects"
 sqlite3 data/app.sqlite ".backup '${BACKUP_ROOT}/app/app.sqlite'"
 
 # Project DBs
-find data/projects -type f -path "*/project.sqlite" | while read -r db; do
-  rel="${db#data/projects/}"
+find repos -type f -path "*/base/.ai-coding/project.sqlite" | while read -r db; do
+  rel="${db#repos/}"
   out="${BACKUP_ROOT}/projects/${rel}"
   mkdir -p "$(dirname "${out}")"
   sqlite3 "${db}" ".backup '${out}'"
@@ -71,7 +71,7 @@ For each backup file:
 
 1. Stop API process.
 2. Restore `app.sqlite` from selected snapshot.
-3. Restore project DBs into corresponding `data/projects/<projectId>/project.sqlite` paths.
+3. Restore project DBs into corresponding `repos/<slug>/base/.ai-coding/project.sqlite` paths.
 4. Start API process.
 5. Verify:
    - `GET /api/health`
