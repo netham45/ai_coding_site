@@ -14,7 +14,9 @@ export type OrchestrationJobType =
   | "task_queue_dispatch"
   | "plan_orchestration_pass"
   | "evaluate_readiness"
-  | "decompose";
+  | "decompose"
+  | "re_review"
+  | "delta_plan";
 
 type PendingJobPayload = {
   schemaVersion: 1;

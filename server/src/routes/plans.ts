@@ -31,6 +31,7 @@ const createPlanSchema = z.object({
   aiCommand: z.string().min(1).max(500).optional(),
   autoStart: z.boolean().optional(),
   autoMergeOnComplete: z.boolean().optional(),
+  allowReplanBudgetOverride: z.boolean().optional(),
   parentPlanTaskId: z.string().min(1).max(200).optional()
 });
 
@@ -54,12 +55,24 @@ const approvePlanSchema = z.object({
         aiCommand: z.string().min(1).max(500).optional(),
         parentPlanTaskId: z.string().min(1).max(200).nullable().optional(),
         autoStart: z.boolean().optional(),
-        autoMergeOnComplete: z.boolean().optional()
+        autoMergeOnComplete: z.boolean().optional(),
+        allowReplanBudgetOverride: z.boolean().optional()
       })
     )
     .max(1000)
     .optional()
 });
+
+function withReplanBudgetOverride(metadata: any, enabled: boolean) {
+  if (!enabled) return metadata;
+  return {
+    ...metadata,
+    custom: {
+      ...(metadata.custom ?? {}),
+      replan_budget_override: true
+    }
+  };
+}
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 
@@ -400,6 +413,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
   const autoStart = Boolean(input.autoStart);
   const autoMergeOnComplete = Boolean(input.autoMergeOnComplete);
+  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
 
   let parentPlanTask: TaskRow | undefined;
   if (input.parentPlanTaskId) {
@@ -426,7 +440,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
 
   projectDb.transaction(() => {
     const metadataJson = serializeNodeMetadata(
-      buildInitialNodeMetadata({
+      withReplanBudgetOverride(buildInitialNodeMetadata({
         task: {
           id,
           project_id: project.id,
@@ -442,7 +456,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
         dependencyTaskIds: [],
         tier: "plan",
         crossTierDependencies: parentPlanTask ? [{ id: parentPlanTask.id, tier: "plan", reason: "parent_plan" }] : []
-      })
+      }), allowReplanBudgetOverride)
     );
     projectDb.prepare(
       `INSERT INTO tasks (
@@ -486,6 +500,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
       aiCommand,
       autoStart,
       autoMergeOnComplete,
+      allowReplanBudgetOverride,
       parentPlanTaskId: parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha
@@ -974,7 +989,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       ];
       const partitionedDeps = partitionDependenciesByTier(materializedDependencies, nodeTier);
       const metadataJson = serializeNodeMetadata(
-        buildInitialNodeMetadata({
+        withReplanBudgetOverride(buildInitialNodeMetadata({
           task: {
             id: row.taskId,
             project_id: project.id,
@@ -991,7 +1006,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
           tier: nodeTier,
           sameTierDependencies: partitionedDeps.sameTierDependencies,
           crossTierDependencies: partitionedDeps.crossTierDependencies
-        })
+        }), Boolean(edit?.allowReplanBudgetOverride))
       );
 
       projectDb.prepare(

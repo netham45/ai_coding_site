@@ -28,7 +28,7 @@ function enqueueWatchdogAction(params: {
     enqueueOrchestrationJob({
       projectId: params.projectId,
       taskId: params.task.id,
-      jobType: "task_queue_dispatch",
+      jobType: "evaluate_readiness",
       idempotencyKey: `watchdog:evaluate_readiness:${params.task.id}:${params.bucket}`,
       debounceMs: 250,
       dedupeWindowMs: WATCHDOG_DEDUPE_MS,
@@ -43,7 +43,7 @@ function enqueueWatchdogAction(params: {
     enqueueOrchestrationJob({
       projectId: params.projectId,
       taskId: params.task.id,
-      jobType: "plan_orchestration_pass",
+      jobType: "re_review",
       idempotencyKey: `watchdog:re_review:${params.task.id}:${params.bucket}`,
       debounceMs: 250,
       dedupeWindowMs: WATCHDOG_DEDUPE_MS,
