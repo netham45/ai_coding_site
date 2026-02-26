@@ -1,4 +1,4 @@
-import type { ProjectRow } from "../types.js";
+import type { NodeTier, ProjectRow } from "../types.js";
 
 type DependencySummary = {
   id: string;
@@ -89,5 +89,27 @@ export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string, de
   }
   sections.push(cliUsageInstructions());
 
+  return sections.join("\n\n").trim();
+}
+
+export function buildTierOrchestrationPrompt(params: {
+  tier: NodeTier;
+  action: "decompose" | "evaluate_readiness";
+  nodeId: string;
+  nodeTitle: string;
+  nodePrompt: string;
+  autoMode?: boolean;
+  tierTemplatePath: string;
+  tierTemplate: string;
+  coordinatorTemplatePath: string;
+  coordinatorTemplate: string;
+}): string {
+  const sections = [
+    `Orchestration Action:\n${params.action}`,
+    `Node Context:\n- id: ${params.nodeId}\n- tier: ${params.tier}\n- title: ${params.nodeTitle || "(untitled)"}\n- auto_mode: ${params.autoMode ? "true" : "false"}`,
+    `Node Prompt:\n${params.nodePrompt.trim() || "(empty)"}`,
+    `Coordinator Template (${params.coordinatorTemplatePath}):\n${params.coordinatorTemplate || "(template unavailable)"}`,
+    `Tier Template (${params.tierTemplatePath}):\n${params.tierTemplate || "(template unavailable)"}`
+  ];
   return sections.join("\n\n").trim();
 }

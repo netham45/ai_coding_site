@@ -2,6 +2,7 @@ import http from "node:http";
 import { db as appDb, ensureLocalUser, resolveProjectDatabase } from "./db/index.js";
 import { startIdeHeartbeat } from "./services/ide.js";
 import { startOrchestrationJobQueueWorker } from "./services/orchestration/jobQueue.js";
+import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
 import { startPlanOrchestrationWorker } from "./services/planOrchestrator.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
@@ -26,6 +27,7 @@ startRuntimeHeartbeat().catch((error) => {
   console.warn(`Runtime heartbeat disabled: ${String((error as Error).message || error)}`);
 });
 startOrchestrationJobQueueWorker();
+startHierarchicalOrchestrationJobs();
 startPlanOrchestrationWorker();
 startTaskQueueWorker();
 

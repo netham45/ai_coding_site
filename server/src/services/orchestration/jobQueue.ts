@@ -10,7 +10,11 @@ const JOB_POLL_INTERVAL_MS = 1_000;
 const JOB_TIMER_TICK_MS = 10_000;
 const MAX_JOBS_PER_PROJECT_PASS = 32;
 
-export type OrchestrationJobType = "task_queue_dispatch" | "plan_orchestration_pass";
+export type OrchestrationJobType =
+  | "task_queue_dispatch"
+  | "plan_orchestration_pass"
+  | "evaluate_readiness"
+  | "decompose";
 
 type PendingJobPayload = {
   schemaVersion: 1;

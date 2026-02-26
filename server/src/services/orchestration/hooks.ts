@@ -11,7 +11,7 @@ export type OrchestrationHookName =
   | "on_timer_tick";
 
 export type OrchestrationJobRequest = {
-  jobType: "task_queue_dispatch" | "plan_orchestration_pass";
+  jobType: "task_queue_dispatch" | "plan_orchestration_pass" | "evaluate_readiness" | "decompose";
   idempotencyKey: string;
   debounceMs?: number;
   dedupeWindowMs?: number;
@@ -59,6 +59,33 @@ function buildKey(seed: string, context: EventContext): string {
 }
 
 function jobsForHook(hookName: OrchestrationHookName, context: EventContext): OrchestrationJobRequest[] {
+  const taskScopedJobs: OrchestrationJobRequest[] =
+    context.taskId && context.projectId
+      ? [
+          {
+            jobType: "evaluate_readiness",
+            idempotencyKey: buildKey(`hook:${hookName}:readiness`, context),
+            debounceMs: DEFAULT_DEBOUNCE_MS,
+            dedupeWindowMs: DEFAULT_DEDUPE_WINDOW_MS,
+            projectId: context.projectId,
+            taskId: context.taskId,
+            payload: { hookName, eventType: context.eventType }
+          }
+        ]
+      : [];
+
+  if (hookName === "on_node_created" && context.taskId && context.projectId) {
+    taskScopedJobs.push({
+      jobType: "decompose",
+      idempotencyKey: buildKey(`hook:${hookName}:decompose`, context),
+      debounceMs: DEFAULT_DEBOUNCE_MS,
+      dedupeWindowMs: DEFAULT_DEDUPE_WINDOW_MS,
+      projectId: context.projectId,
+      taskId: context.taskId,
+      payload: { hookName, eventType: context.eventType, autoMode: true }
+    });
+  }
+
   if (hookName === "on_timer_tick") {
     return [
       {
@@ -78,7 +105,8 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
         projectId: context.projectId ?? null,
         taskId: context.taskId ?? null,
         payload: { hookName, eventType: context.eventType }
-      }
+      },
+      ...taskScopedJobs
     ];
   }
 
@@ -100,7 +128,8 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
       projectId: context.projectId ?? null,
       taskId: context.taskId ?? null,
       payload: { hookName, eventType: context.eventType }
-    }
+    },
+    ...taskScopedJobs
   ];
 }
 

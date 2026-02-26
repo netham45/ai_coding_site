@@ -32,6 +32,9 @@ import {
   resetOrchestrationJobQueueForTests,
   runOrchestrationJobQueuePassForTests
 } from "./services/orchestration/jobQueue.js";
+import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
+import { runDecomposeForTask } from "./services/orchestration/jobs/decompose.js";
+import { runEvaluateReadinessForTask } from "./services/orchestration/jobs/evaluateReadiness.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { recordEvent } from "./services/events.js";
@@ -2019,5 +2022,181 @@ describe("integration: orchestration hooks and job queue", () => {
     });
     await runOrchestrationJobQueuePassForTests();
     assert.equal(handledCount, 1);
+  });
+});
+
+describe("integration: hierarchical decomposition and readiness jobs", () => {
+  beforeEach(() => {
+    resetAppDatabaseState();
+    startHierarchicalOrchestrationJobs();
+  });
+
+  test("decompose auto-mode derives missing lower tiers from epoch", async () => {
+    const userId = createUser();
+    const basePath = randomPath("decompose-epoch");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const epochId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Epoch Node",
+      mode: "plan",
+      status: "queued"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "epoch" }),
+      nowIso(),
+      epochId
+    );
+
+    await runDecomposeForTask({
+      projectDb,
+      projectId,
+      taskId: epochId,
+      autoMode: true
+    });
+
+    const children = projectDb
+      .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+      .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
+    const tiers = children
+      .map((row) => {
+        try {
+          return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((tier): tier is string => Boolean(tier));
+
+    assert.ok(tiers.includes("epoch"));
+    assert.ok(tiers.includes("phase"));
+    assert.ok(tiers.includes("plan"));
+    assert.ok(tiers.includes("task"));
+    assert.ok(tiers.includes("exec"));
+  });
+
+  test("decompose auto-mode derives only lower tiers from phase/plan/task starts", async () => {
+    const fixtures: Array<{ tier: "phase" | "plan" | "task"; mode: "plan" | "execution"; expected: string[] }> = [
+      { tier: "phase", mode: "plan", expected: ["plan", "task", "exec"] },
+      { tier: "plan", mode: "plan", expected: ["task", "exec"] },
+      { tier: "task", mode: "execution", expected: ["exec"] }
+    ];
+
+    for (const fixture of fixtures) {
+      const userId = createUser();
+      const basePath = randomPath(`decompose-${fixture.tier}`);
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+      const rootId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: `Root ${fixture.tier}`,
+        mode: fixture.mode,
+        status: "queued"
+      });
+      projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+        JSON.stringify({ schema_version: 1, tier: fixture.tier }),
+        nowIso(),
+        rootId
+      );
+      await runDecomposeForTask({
+        projectDb,
+        projectId,
+        taskId: rootId,
+        autoMode: true
+      });
+      const root = projectDb
+        .prepare("SELECT * FROM tasks WHERE title = ? ORDER BY created_at DESC LIMIT 1")
+        .get(`Root ${fixture.tier}`) as TaskRow;
+      const all = projectDb
+        .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+        .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
+      const descendants: Array<{ metadata_json: string | null }> = [];
+      const queue = [root.id];
+      while (queue.length > 0) {
+        const parentId = queue.shift() as string;
+        const children = all.filter((row) => row.parent_plan_task_id === parentId);
+        for (const child of children) {
+          descendants.push({ metadata_json: child.metadata_json });
+          queue.push(child.id);
+        }
+      }
+      const tiers = new Set(
+        descendants
+          .map((row) => {
+            try {
+              return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
+            } catch {
+              return undefined;
+            }
+          })
+          .filter((value): value is string => Boolean(value))
+      );
+      for (const expectedTier of fixture.expected) {
+        assert.equal(tiers.has(expectedTier), true, `missing ${expectedTier} for ${fixture.tier}`);
+      }
+    }
+  });
+
+  test("evaluate_readiness emits deterministic structured decisions", async () => {
+    const userId = createUser();
+    const basePath = randomPath("evaluate-readiness");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Blocker",
+      mode: "execution",
+      status: "in_progress"
+    });
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Readiness Target",
+      mode: "execution",
+      status: "queued"
+    });
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      taskId,
+      blockerId,
+      nowIso()
+    );
+
+    const firstDecision = await runEvaluateReadinessForTask({
+      projectDb,
+      taskId
+    });
+    assert.ok(firstDecision);
+    const firstKey = String(firstDecision?.idempotencyKey ?? "");
+    assert.ok(firstKey.length > 0);
+    assert.equal(firstDecision?.reasonCodes.includes("DEPS_INCOMPLETE"), true);
+
+    const secondDecision = await runEvaluateReadinessForTask({
+      projectDb,
+      taskId
+    });
+    assert.equal(secondDecision?.idempotencyKey, firstKey);
+
+    const latest = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.readiness.evaluated'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(taskId) as { payload: string } | undefined;
+    assert.ok(latest?.payload);
+    const latestPayload = JSON.parse(latest?.payload ?? "{}");
+    assert.equal(latestPayload?.readiness?.idempotency_key, firstKey);
   });
 });
