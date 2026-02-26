@@ -13,7 +13,7 @@ Define a new CLI tool architecture that reuses existing backend business logic (
   - Initializes `app.sqlite`, applies app migrations, seeds local user/settings, triggers project data migration backfill.
 - Project DB bootstrap and validation:
   - `server/src/db/projectDb.ts`
-  - Creates/opens `<project>/base/.ai-coding/project.sqlite`, validates `project_metadata`, enforces schema version, maintains handle cache.
+  - Creates/opens `data/projects/<projectId>/project.sqlite`, validates `project_metadata`, enforces schema version, maintains handle cache.
 - DB backend routing (monolith vs project DB):
   - `server/src/db/splitPersistence.ts`
   - `resolveProjectDatabase()` chooses DB backend by phase/migration status with fallback behavior.
@@ -200,4 +200,3 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
   - project create/clone + config update logic
 - Keep HTTP-only concerns in routes:
   - request parsing/response shaping/status codes.
-

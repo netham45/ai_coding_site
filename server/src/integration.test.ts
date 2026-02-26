@@ -18,6 +18,7 @@ import {
   ensureProjectDb,
   getProjectConfig,
   getProjectDb,
+  getProjectDbPath,
   resolveProjectDatabase
 } from "./db/index.js";
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
@@ -285,8 +286,9 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     const intruderUserId = createUser();
     const basePath = randomPath("auth");
     const projectId = createProject({ userId: ownerUserId, basePath, cloneStatus: "ready" });
-    fs.mkdirSync(path.join(basePath, ".ai-coding"), { recursive: true });
-    fs.writeFileSync(path.join(basePath, ".ai-coding", "project.sqlite"), "not-a-sqlite-db");
+    const dbPath = getProjectDbPath(projectId);
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.writeFileSync(dbPath, "not-a-sqlite-db");
 
     const denied = await callApi(`/api/projects/${projectId}`, { userId: intruderUserId });
     assert.equal(denied.status, 404);
@@ -366,8 +368,9 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
 
     const corruptBasePath = randomPath("corrupt");
     const corruptProjectId = createProject({ userId, basePath: corruptBasePath, cloneStatus: "ready" });
-    fs.mkdirSync(path.join(corruptBasePath, ".ai-coding"), { recursive: true });
-    fs.writeFileSync(path.join(corruptBasePath, ".ai-coding", "project.sqlite"), "corrupt");
+    const corruptDbPath = getProjectDbPath(corruptProjectId);
+    fs.mkdirSync(path.dirname(corruptDbPath), { recursive: true });
+    fs.writeFileSync(corruptDbPath, "corrupt");
 
     const missing = await callApi(`/api/projects/${missingProjectId}`, { userId });
     assert.equal(missing.status, 503);
@@ -414,25 +417,28 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
       initializeIfMissing: true
     });
 
-    const sourceMetadata = detectProjectDbMetadata({ basePath: sourceBasePath });
+    const sourceMetadata = detectProjectDbMetadata({ basePath: sourceBasePath, projectId: sourceProjectId });
     assert.equal(sourceMetadata?.project_id, sourceProjectId);
 
     closeAllProjectDbs();
 
     const importedBasePath = randomPath("portable-import");
-    fs.mkdirSync(path.join(importedBasePath, ".ai-coding"), { recursive: true });
+    const importedProjectId = randomUUID();
+    const sourceDbPath = getProjectDbPath(sourceProjectId);
+    const importedDbPath = getProjectDbPath(importedProjectId);
+    fs.mkdirSync(path.dirname(importedDbPath), { recursive: true });
     fs.copyFileSync(
-      path.join(sourceBasePath, ".ai-coding", "project.sqlite"),
-      path.join(importedBasePath, ".ai-coding", "project.sqlite")
+      sourceDbPath,
+      importedDbPath
     );
 
-    const importedMetadata = detectProjectDbMetadata({ basePath: importedBasePath });
+    const importedMetadata = detectProjectDbMetadata({ basePath: importedBasePath, projectId: importedProjectId });
     assert.equal(importedMetadata?.project_id, sourceProjectId);
 
     assert.throws(
       () =>
         ensureProjectDb({
-          projectId: randomUUID(),
+          projectId: importedProjectId,
           basePath: importedBasePath,
           initializeIfMissing: false
         }),
@@ -446,8 +452,9 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
     appDb.exec(projectBaselineMigration);
 
-    fs.mkdirSync(path.join(basePath, ".ai-coding"), { recursive: true });
-    fs.writeFileSync(path.join(basePath, ".ai-coding", "project.sqlite"), "corrupt");
+    const dbPath = getProjectDbPath(projectId);
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.writeFileSync(dbPath, "corrupt");
 
     runProjectDataMigrationBackfill(appDb);
 
