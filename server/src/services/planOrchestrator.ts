@@ -7,6 +7,8 @@ import { approvePlan, extractPlan } from "../application/cliServices.js";
 import type { PlanOrchestrationStateRow, PlanRevisionRow, TaskRow } from "../types.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
+import { observeNodeOutputMaterialChange } from "./orchestration/outputMonitor.js";
+import { runOrchestrationWatchdog } from "./orchestration/watchdog.js";
 import {
   enqueueOrchestrationJob,
   kickOrchestrationJobQueueProcessing,
@@ -324,6 +326,26 @@ async function processPlanOrchestrationPass(): Promise<void> {
       if (!output) {
         continue;
       }
+      const outputMonitor = observeNodeOutputMaterialChange({
+        projectDb: scoped.database,
+        taskId: row.id,
+        source: "plan_file",
+        rawOutput: output.normalized,
+        debounceMs: 1_500
+      });
+      if (outputMonitor.materialChanged) {
+        recordEvent({
+          projectId: row.project_id,
+          taskId: row.id,
+          eventType: "task.output.material_changed",
+          payload: {
+            source: outputMonitor.source,
+            outputHash: outputMonitor.outputHash,
+            previousOutputHash: outputMonitor.previousOutputHash
+          },
+          database: scoped.database
+        });
+      }
       candidates.push({
         projectId: project.id,
         basePath: project.base_path,
@@ -402,7 +424,14 @@ export function kickPlanOrchestrationProcessing(): void {
 
 export function startPlanOrchestrationWorker(): void {
   if (!planJobRegistered) {
-    registerOrchestrationJobHandler(PLAN_ORCHESTRATION_JOB_TYPE, async () => {
+    registerOrchestrationJobHandler(PLAN_ORCHESTRATION_JOB_TYPE, async (context) => {
+      if (context.payload.metadata?.hookName === "on_timer_tick") {
+        runOrchestrationWatchdog({
+          projectId: context.projectId,
+          projectDb: context.projectDb,
+          trigger: "timer_tick"
+        });
+      }
       await runPlanOrchestrationPass();
     });
     planJobRegistered = true;
