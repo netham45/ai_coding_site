@@ -179,3 +179,18 @@ export type PlanRevisionItemDependencyRow = {
   revision_item_id: string;
   depends_on_item_key: string;
 };
+
+export type PlanOrchestrationStateRow = {
+  plan_task_id: string;
+  lock_token: string | null;
+  lock_expires_at: string | null;
+  last_output_sha256: string | null;
+  last_extracted_revision_id: string | null;
+  last_approved_revision_id: string | null;
+  last_approved_output_sha256: string | null;
+  last_failed_output_sha256: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  created_at: string;
+  updated_at: string;
+};

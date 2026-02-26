@@ -1,6 +1,7 @@
 import http from "node:http";
 import { db as appDb, ensureLocalUser, resolveProjectDatabase } from "./db/index.js";
 import { startIdeHeartbeat } from "./services/ide.js";
+import { startPlanOrchestrationWorker } from "./services/planOrchestrator.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
@@ -23,6 +24,7 @@ server.listen(port, host, () => {
 startRuntimeHeartbeat().catch((error) => {
   console.warn(`Runtime heartbeat disabled: ${String((error as Error).message || error)}`);
 });
+startPlanOrchestrationWorker();
 startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {
