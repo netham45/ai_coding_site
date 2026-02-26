@@ -16,6 +16,7 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-extract.md` - extraction/runtime normalization template.
 - `plan-approve.md` - approval/materialization template.
 - `task-execution.md` - execution-task runtime template.
+- `re-review-unblock.md` - re-review decision template for unblock vs delta-work.
 
 ## Usage
 
