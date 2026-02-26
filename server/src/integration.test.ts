@@ -220,7 +220,7 @@ function insertTask(params: {
   return taskId;
 }
 
-async function callApi(pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
+async function callApiAt(baseUrl: string, pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
   const headers: Record<string, string> = {};
   if (options?.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -228,7 +228,7 @@ async function callApi(pathname: string, options?: { method?: string; body?: unk
   if (options?.userId) {
     headers["x-user-id"] = options.userId;
   }
-  const response = await fetch(`${apiBaseUrl}${pathname}`, {
+  const response = await fetch(`${baseUrl}${pathname}`, {
     method: options?.method ?? "GET",
     headers,
     body: options?.body !== undefined ? JSON.stringify(options.body) : undefined
@@ -241,6 +241,10 @@ async function callApi(pathname: string, options?: { method?: string; body?: unk
     json = null;
   }
   return { status: response.status, text, json };
+}
+
+async function callApi(pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
+  return callApiAt(apiBaseUrl, pathname, options);
 }
 
 describe("integration: ownership, auth, migration, portability, diagnostics", () => {
@@ -2735,5 +2739,236 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     assert.equal(metadata?.lifecycle?.synthesis_passed, true);
     assert.equal(metadata?.lifecycle?.verification_passed, false);
     assert.equal(metadata?.custom?.verification_verdict, "fail");
+  });
+
+  test("orchestration hierarchy and dependency graph endpoints provide cross-tier navigation data", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hierarchy-api");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const now = nowIso();
+
+    const epochId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Epoch",
+      mode: "plan",
+      status: "queued"
+    });
+    const phaseId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Phase",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: epochId
+    });
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: phaseId
+    });
+    const taskTierId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Task Tier",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: planId
+    });
+    const execId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Exec Tier",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: taskTierId
+    });
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "epoch", custom: { auto_mode: true } }),
+      now,
+      epochId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "phase", custom: { auto_mode: true } }),
+      now,
+      phaseId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 3 } }),
+      now,
+      planId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "task",
+        dependencies: { cross_tier: [{ id: planId, tier: "plan", reason: "await_parent_plan" }] }
+      }),
+      now,
+      taskTierId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "exec",
+        dependencies: { same_tier: [{ id: taskTierId, tier: "task", reason: "await_task_tier" }] }
+      }),
+      now,
+      execId
+    );
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      execId,
+      taskTierId,
+      now
+    );
+
+    const app = createApp();
+    const localServer = app.listen(0);
+    const localAddress = localServer.address();
+    if (!localAddress || typeof localAddress === "string") {
+      throw new Error("Failed to start test server");
+    }
+    const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+    const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+      callApiAt(localBaseUrl, pathname, options);
+
+    try {
+      const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
+      assert.equal(hierarchy.status, 200);
+      assert.equal(hierarchy.json?.hierarchy?.roots?.length, 1);
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.tier, "epoch");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.tier, "phase");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.tier, "plan");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.tier, "task");
+      assert.equal(
+        hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.tier,
+        "exec"
+      );
+      assert.equal(typeof hierarchy.json?.hierarchy?.roots?.[0]?.task?.orchestrationControls?.replan?.iterationsUsed, "number");
+
+      const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
+      assert.equal(graph.status, 200);
+      assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
+      assert.equal(Array.isArray(graph.json?.graph?.edges), true);
+      assert.equal(
+        graph.json?.graph?.edges?.some((edge: any) => edge.fromId === execId && edge.toId === taskTierId && edge.reason === "await_task_tier"),
+        true
+      );
+
+      const nodeDetails = await localCallApi(`/api/nodes/${execId}`, { userId });
+      assert.equal(nodeDetails.status, 200);
+      assert.equal(nodeDetails.json?.node?.id, execId);
+      assert.equal(nodeDetails.json?.dependencyDiagnostics?.node?.tier, "exec");
+      assert.equal(Array.isArray(nodeDetails.json?.children), true);
+    } finally {
+      await new Promise<void>((resolve) => {
+        localServer.close(() => resolve());
+      });
+    }
+  });
+
+  test("manual orchestration override actions validate input and are audited", async () => {
+    const userId = createUser();
+    const basePath = randomPath("override-actions");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const nodeId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Override Node",
+      mode: "plan",
+      status: "queued"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 1 } }),
+      nowIso(),
+      nodeId
+    );
+
+    const app = createApp();
+    const localServer = app.listen(0);
+    const localAddress = localServer.address();
+    if (!localAddress || typeof localAddress === "string") {
+      throw new Error("Failed to start test server");
+    }
+    const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+    const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+      callApiAt(localBaseUrl, pathname, options);
+
+    try {
+      const invalidAutoMode = await localCallApi(`/api/nodes/${nodeId}/auto-mode`, {
+        method: "POST",
+        userId,
+        body: {}
+      });
+      assert.equal(invalidAutoMode.status, 400);
+
+      const autoMode = await localCallApi(`/api/nodes/${nodeId}/auto-mode`, {
+        method: "POST",
+        userId,
+        body: { enabled: false }
+      });
+      assert.equal(autoMode.status, 200);
+      assert.equal(autoMode.json?.node?.orchestrationControls?.autoMode, false);
+
+      const autoMerge = await localCallApi(`/api/nodes/${nodeId}/auto-merge`, {
+        method: "POST",
+        userId,
+        body: { enabled: true, onComplete: true }
+      });
+      assert.equal(autoMerge.status, 200);
+      assert.equal(autoMerge.json?.node?.autoMergeOnComplete, true);
+
+      const budgetOverride = await localCallApi(`/api/nodes/${nodeId}/approve-budget-override`, {
+        method: "POST",
+        userId,
+        body: { reason: "human approved" }
+      });
+      assert.equal(budgetOverride.status, 200);
+      assert.equal(budgetOverride.json?.node?.orchestrationControls?.replan?.budgetOverride, true);
+
+      const forceReReview = await localCallApi(`/api/nodes/${nodeId}/force-re-review`, {
+        method: "POST",
+        userId,
+        body: { reason: "manual retry" }
+      });
+      assert.equal(forceReReview.status, 202);
+      assert.equal(Boolean(forceReReview.json?.pendingEventId), true);
+
+      const startNode = await localCallApi(`/api/nodes/${nodeId}/start`, {
+        method: "POST",
+        userId,
+        body: { autoMode: true }
+      });
+      assert.equal(startNode.status, 200);
+      assert.equal(startNode.json?.started, true);
+      assert.equal(startNode.json?.tier, "plan");
+
+      const auditTypes = (
+        projectDb
+          .prepare("SELECT event_type FROM events WHERE task_id = ? ORDER BY created_at ASC")
+          .all(nodeId) as Array<{ event_type: string }>
+      ).map((row) => row.event_type);
+      assert.equal(auditTypes.includes("orchestration.override.auto_mode"), true);
+      assert.equal(auditTypes.includes("orchestration.override.auto_merge"), true);
+      assert.equal(auditTypes.includes("orchestration.override.replan_budget"), true);
+      assert.equal(auditTypes.includes("orchestration.override.force_re_review"), true);
+      assert.equal(auditTypes.includes("orchestration.manual_start"), true);
+    } finally {
+      await new Promise<void>((resolve) => {
+        localServer.close(() => resolve());
+      });
+    }
   });
 });

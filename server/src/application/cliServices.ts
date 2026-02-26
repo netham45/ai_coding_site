@@ -19,6 +19,7 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
+import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { runParentCompletionFeedbackLoop } from "../services/orchestration/completion.js";
 import {
   buildConflictResolutionArtifact,
@@ -32,6 +33,7 @@ import {
   resolveAndValidateNodeDependencies,
   validateProposedNodeGraph
 } from "../services/orchestration/dependencyGraph.js";
+import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
 import { assertTaskStatusTransition, evaluateParentCompletionGuards } from "../services/orchestration/stateMachine.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import type {
@@ -240,6 +242,10 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     task,
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
   });
+  const replan = readReplanControl(nodeMetadata);
+  const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+    ? Boolean(nodeMetadata.custom?.auto_mode)
+    : true;
 
   return {
     id: task.id,
@@ -267,6 +273,16 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
     blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
     isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+    orchestrationControls: {
+      autoMode,
+      replan: {
+        maxIterations: replan.maxIterations,
+        iterationsUsed: replan.iterationsUsed,
+        remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+        budgetOverride: replan.budgetOverride,
+        gapHashesSeen: replan.gapHashesSeen
+      }
+    },
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
@@ -444,6 +460,22 @@ function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
     )
     .get(taskId) as { task_id: string } | undefined;
   return Boolean(row?.task_id);
+}
+
+function dependencyTaskIdsFor(projectDb: Database.Database, taskId: string): string[] {
+  return (
+    projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(taskId) as Array<{ dependency_task_id: string }>
+  ).map((row) => row.dependency_task_id);
+}
+
+function nodeTierForTask(projectDb: Database.Database, task: TaskRow): "epoch" | "phase" | "plan" | "task" | "exec" {
+  return readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata.tier;
 }
 
 function hasUnmergedPlanChildren(projectDb: Database.Database, planTaskId: string): boolean {
@@ -1096,6 +1128,239 @@ export async function getTaskSummary(params: { userId: string; taskId: string; p
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id))
   };
+}
+
+export async function startNode(params: { userId: string; nodeId: string; autoMode?: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, project, projectDb } = scopedTask;
+  const diagnostics = buildDependencyDiagnostics({ projectDb, task });
+  if (diagnostics.unresolved.length > 0) {
+    throw new CliServiceError("CONFLICT", "Node is blocked by unresolved dependencies");
+  }
+  const tier = nodeTierForTask(projectDb, task);
+
+  if (tier === "exec") {
+    try {
+      await startTaskRuntimeWorker(task.id, params.userId, {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb
+      });
+    } catch (error: any) {
+      throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
+    }
+  } else {
+    const metadata = readNodeMetadata({
+      projectDb,
+      task,
+      dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+    }).metadata;
+    const autoMode = params.autoMode
+      ?? (typeof metadata.custom?.auto_mode === "boolean" ? Boolean(metadata.custom?.auto_mode) : true);
+    enqueueOrchestrationJob({
+      database: projectDb,
+      projectId: task.project_id,
+      taskId: task.id,
+      jobType: "decompose",
+      idempotencyKey: `manual_start:${task.id}:${makeId()}`,
+      debounceMs: 0,
+      dedupeWindowMs: 250,
+      metadata: {
+        source: "cli.manual_start",
+        actorUserId: params.userId,
+        autoMode
+      }
+    });
+    kickOrchestrationJobQueueProcessing();
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "orchestration.manual_start",
+      database: projectDb,
+      payload: {
+        source: "cli",
+        autoMode,
+        actorUserId: params.userId
+      }
+    });
+  }
+
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated), tier };
+}
+
+export async function toggleNodeAutoMode(params: { userId: string; nodeId: string; enabled: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      orchestration: {
+        ...(metadata.orchestration ?? {}),
+        auto_start: params.enabled
+      },
+      custom: {
+        ...(metadata.custom ?? {}),
+        auto_mode: params.enabled
+      }
+    }
+  });
+  projectDb.prepare("UPDATE tasks SET auto_start = ?, updated_at = ? WHERE id = ?").run(params.enabled ? 1 : 0, nowIso(), task.id);
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_mode",
+    database: projectDb,
+    payload: {
+      enabled: params.enabled,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
+}
+
+export async function toggleNodeAutoMerge(params: { userId: string; nodeId: string; enabled: boolean; onComplete?: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const onComplete = params.onComplete ?? task.mode === "plan";
+  if (onComplete) {
+    projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = ?, updated_at = ? WHERE id = ?").run(
+      params.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  } else {
+    projectDb.prepare("UPDATE tasks SET auto_merge = ?, updated_at = ? WHERE id = ?").run(
+      params.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  }
+
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      orchestration: {
+        ...(metadata.orchestration ?? {}),
+        auto_merge: onComplete ? metadata.orchestration?.auto_merge : params.enabled,
+        auto_merge_on_complete: onComplete ? params.enabled : metadata.orchestration?.auto_merge_on_complete
+      }
+    }
+  });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_merge",
+    database: projectDb,
+    payload: {
+      enabled: params.enabled,
+      onComplete,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
+}
+
+export async function forceNodeReReview(params: { userId: string; nodeId: string; reason?: string }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const { pendingEventId } = enqueueOrchestrationJob({
+    database: projectDb,
+    projectId: task.project_id,
+    taskId: task.id,
+    jobType: "re_review",
+    idempotencyKey: `manual_re_review:${task.id}:${makeId()}`,
+    debounceMs: 0,
+    dedupeWindowMs: 250,
+    metadata: {
+      source: "cli.manual_re_review",
+      reason: params.reason ?? null,
+      actorUserId: params.userId
+    }
+  });
+  kickOrchestrationJobQueueProcessing();
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.force_re_review",
+    database: projectDb,
+    payload: {
+      pendingEventId,
+      reason: params.reason ?? null,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  return { ok: true, pendingEventId };
+}
+
+export async function approveNodeBudgetOverride(params: { userId: string; nodeId: string; enabled?: boolean; reason?: string }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const enabled = params.enabled ?? true;
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      custom: {
+        ...(metadata.custom ?? {}),
+        replan_budget_override: enabled
+      }
+    }
+  });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.replan_budget",
+    database: projectDb,
+    payload: {
+      enabled,
+      reason: params.reason ?? null,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
 }
 
 export async function startTaskSession(params: { userId: string; taskId: string }) {

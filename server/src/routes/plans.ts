@@ -10,7 +10,8 @@ import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
-import { partitionDependenciesByTier, validateProposedNodeGraph } from "../services/orchestration/dependencyGraph.js";
+import { readReplanControl } from "../services/orchestration/idempotency.js";
+import { buildDependencyDiagnostics, partitionDependenciesByTier, validateProposedNodeGraph } from "../services/orchestration/dependencyGraph.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
@@ -251,6 +252,10 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     task,
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
   });
+  const replan = readReplanControl(nodeMetadata);
+  const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+    ? Boolean(nodeMetadata.custom?.auto_mode)
+    : true;
 
   return {
     id: task.id,
@@ -278,6 +283,16 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
     blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
     isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+    orchestrationControls: {
+      autoMode,
+      replan: {
+        maxIterations: replan.maxIterations,
+        iterationsUsed: replan.iterationsUsed,
+        remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+        budgetOverride: replan.budgetOverride,
+        gapHashesSeen: replan.gapHashesSeen
+      }
+    },
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
@@ -582,6 +597,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
   const visibility = buildAutomationVisibility(projectDb, plan);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task: plan });
 
   res.json({
     plan: serializeTask(projectDb, plan),
@@ -600,6 +616,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
     approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
