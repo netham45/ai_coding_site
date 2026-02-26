@@ -1017,6 +1017,210 @@ tasks:
     );
   });
 
+  test("approvePlan defaults execution children to auto-merge when plan auto-start is enabled", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-auto-start-default-merge-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Auto-start defaults",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const plan = projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    projectDb.prepare("UPDATE tasks SET auto_start = 1, updated_at = ? WHERE id = ?").run(nowIso(), planId);
+
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "auto-start plan workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
+
+    const revisionId = randomUUID();
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revisions (
+           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
+         ) VALUES (?, ?, 1, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
+      )
+      .run(
+        revisionId,
+        planId,
+        [
+          "tasks:",
+          "  - id: build_a",
+          "    title: Build A",
+          "    prompt: Build A prompt",
+          "  - id: build_b",
+          "    title: Build B",
+          "    prompt: Build B prompt",
+          "    depends_on: [build_a]",
+          ""
+        ].join("\n"),
+        userId,
+        now
+      );
+    const itemAId = randomUUID();
+    const itemBId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemAId, revisionId, "build_a", "Build A", "Build A prompt", 1, now);
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemBId, revisionId, "build_b", "Build B", "Build B prompt", 2, now);
+    projectDb
+      .prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)")
+      .run(itemBId, "build_a");
+
+    await approvePlan({ userId, planId });
+
+    const children = projectDb
+      .prepare("SELECT source_plan_item_key, auto_merge, status FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
+      .all(planId) as Array<{ source_plan_item_key: string; auto_merge: number; status: string }>;
+    assert.equal(children.length, 2);
+    assert.deepEqual(children.map((row) => row.source_plan_item_key), ["build_a", "build_b"]);
+    assert.deepEqual(children.map((row) => row.auto_merge), [1, 1]);
+    assert.deepEqual(children.map((row) => row.status), ["queued", "queued"]);
+
+    const taskDependencies = projectDb
+      .prepare("SELECT td.task_id, dep.source_plan_item_key AS dependency_key FROM task_dependencies td JOIN tasks dep ON dep.id = td.dependency_task_id")
+      .all() as Array<{ task_id: string; dependency_key: string }>;
+    assert.equal(taskDependencies.length, 1);
+    assert.equal(taskDependencies[0]?.dependency_key, "build_a");
+  });
+
+  test("plan orchestration only auto-starts plans that are waiting_input", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-orchestrator-waiting-input-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Queued Plan",
+      mode: "plan",
+      status: "queued"
+    });
+    const plan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    projectDb.prepare("UPDATE tasks SET auto_start = 1, updated_at = ? WHERE id = ?").run(nowIso(), planId);
+
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "queued plan workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
+
+    const planDir = path.join(plan.workspace_path, ".ai-plan");
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(planDir, "latest-plan.yaml"),
+      [
+        "tasks:",
+        "  - id: task_a",
+        "    title: Build A",
+        "    prompt: Build A prompt",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    await runPlanOrchestrationPassForTests();
+    const noRevisionWhileQueued = projectDb
+      .prepare("SELECT COUNT(*) AS count FROM plan_revisions WHERE plan_task_id = ?")
+      .get(planId) as { count: number };
+    assert.equal(noRevisionWhileQueued.count, 0);
+
+    projectDb.prepare("UPDATE tasks SET status = 'waiting_input', updated_at = ? WHERE id = ?").run(nowIso(), planId);
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+
+    const approvedRevision = projectDb
+      .prepare("SELECT status FROM plan_revisions WHERE plan_task_id = ? ORDER BY revision_number DESC LIMIT 1")
+      .get(planId) as { status: string } | undefined;
+    assert.equal(approvedRevision?.status, "approved");
+  });
+
+  test("plan orchestration retries after parse failure when plan output changes", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-orchestrator-retry-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Retry Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const plan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    projectDb.prepare("UPDATE tasks SET auto_start = 1, updated_at = ? WHERE id = ?").run(nowIso(), planId);
+
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "retry plan workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
+
+    const planDir = path.join(plan.workspace_path, ".ai-plan");
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(path.join(planDir, "latest-plan.yaml"), "tasks\n", "utf8");
+
+    await runPlanOrchestrationPassForTests();
+    const failedEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'plan.orchestration.auto_extract.failed' LIMIT 1")
+      .get(planId) as { event_type: string } | undefined;
+    assert.equal(failedEvent?.event_type, "plan.orchestration.auto_extract.failed");
+
+    fs.writeFileSync(
+      path.join(planDir, "latest-plan.yaml"),
+      [
+        "tasks:",
+        "  - id: task_a",
+        "    title: Retry A",
+        "    prompt: Retry A prompt",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+
+    const retryEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'plan.orchestration.retry.started' LIMIT 1")
+      .get(planId) as { event_type: string } | undefined;
+    assert.equal(retryEvent?.event_type, "plan.orchestration.retry.started");
+
+    const approvedEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'plan.orchestration.auto_approve.succeeded' LIMIT 1")
+      .get(planId) as { event_type: string } | undefined;
+    assert.equal(approvedEvent?.event_type, "plan.orchestration.auto_approve.succeeded");
+  });
+
   test("plan orchestration auto-extracts and auto-approves once per output hash", async () => {
     const userId = createUser();
     const basePath = randomPath("plan-orchestrator-project");
