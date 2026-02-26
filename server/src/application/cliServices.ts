@@ -35,6 +35,7 @@ import { nowIso } from "../utils/time.js";
 
 const mergeLocks = new Set<string>();
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
+const MAX_SUB_PLAN_RECURSION_DEPTH = 6;
 const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "awaiting_children", "merge_conflict", "merge_ready"]);
 
 export type CliServiceErrorCode = "VALIDATION" | "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE";
@@ -544,6 +545,31 @@ function planTaskInProject(projectDb: Database.Database, projectId: string, plan
   return projectDb
     .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ? AND mode = 'plan'")
     .get(planTaskId, projectId) as TaskRow | undefined;
+}
+
+function resolvePlanDepth(
+  projectDb: Database.Database,
+  planTaskId: string,
+  cache: Map<string, number>,
+  visiting: Set<string> = new Set<string>()
+): number {
+  const cached = cache.get(planTaskId);
+  if (cached !== undefined) {
+    return cached;
+  }
+  if (visiting.has(planTaskId)) {
+    throw new CliServiceError("CONFLICT", "Invalid plan topology: cyclic parent plan relationship detected");
+  }
+  visiting.add(planTaskId);
+  const plan = projectDb.prepare("SELECT * FROM tasks WHERE id = ? AND mode = 'plan'").get(planTaskId) as TaskRow | undefined;
+  if (!plan) {
+    throw new CliServiceError("VALIDATION", "Invalid plan topology: referenced parent plan was not found");
+  }
+  const depth =
+    plan.parent_plan_task_id === null ? 0 : resolvePlanDepth(projectDb, plan.parent_plan_task_id, cache, visiting) + 1;
+  visiting.delete(planTaskId);
+  cache.set(planTaskId, depth);
+  return depth;
 }
 
 function getLatestSessionOutput(projectDb: Database.Database, taskId: string): string {
@@ -1772,12 +1798,12 @@ export async function approvePlan(params: {
   }
 
   const alreadyApproved = projectDb
-    .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ? AND parent_plan_task_id = ? LIMIT 1")
-    .get(latestRevision.id, plan.id) as { id: string } | undefined;
+    .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ? LIMIT 1")
+    .get(latestRevision.id) as { id: string } | undefined;
   if (alreadyApproved) {
     const approvedTasks = projectDb
-      .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-      .all(plan.id) as TaskRow[];
+      .prepare("SELECT * FROM tasks WHERE source_plan_revision_id = ? ORDER BY created_at ASC")
+      .all(latestRevision.id) as TaskRow[];
     return { approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) };
   }
 
@@ -1838,6 +1864,8 @@ export async function approvePlan(params: {
   const defaultSubPlanAutoMergeOnComplete = params.autoMergeOnComplete ?? parsedRevisionDefaults?.autoMergeOnComplete ?? false;
   const defaultSubPlanParentPlanTaskId = params.parentPlanTaskId === undefined ? plan.id : params.parentPlanTaskId;
   const defaultExecutionAutoMerge = Boolean(plan.auto_start);
+  const planDepthCache = new Map<string, number>();
+  const currentPlanDepth = resolvePlanDepth(projectDb, plan.id, planDepthCache);
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
       itemIdToDeps.set(row.revision_item_id, []);
@@ -1894,6 +1922,20 @@ export async function approvePlan(params: {
       sourcePath = project.base_path;
       sourceBranch = project.default_branch;
     }
+    const planDepth =
+      mode !== "plan"
+        ? -1
+        : ((parentPlanTaskId === null
+            ? 0
+            : (parentPlanTaskId === plan.id
+                ? currentPlanDepth
+                : resolvePlanDepth(projectDb, parentPlanTaskId, planDepthCache))) + 1);
+    if (mode === "plan" && planDepth > MAX_SUB_PLAN_RECURSION_DEPTH) {
+      throw new CliServiceError(
+        "VALIDATION",
+        `Sub-plan recursion depth ${planDepth} exceeds limit ${MAX_SUB_PLAN_RECURSION_DEPTH} for item ${item.item_key}`
+      );
+    }
 
     itemKeyToTaskId.set(item.item_key.toLowerCase(), taskId);
     taskRows.push({
@@ -1921,6 +1963,27 @@ export async function approvePlan(params: {
       }
       return depTaskId;
     });
+  }
+  const rowByTaskId = new Map(taskRows.map((row) => [row.taskId, row]));
+  for (const row of taskRows) {
+    for (const dependencyTaskId of row.dependencyTaskIds) {
+      const dependencyRow = rowByTaskId.get(dependencyTaskId);
+      if (!dependencyRow) {
+        throw new CliServiceError("CONFLICT", "Revision dependency resolution failed");
+      }
+      if (row.parentPlanTaskId !== dependencyRow.parentPlanTaskId) {
+        throw new CliServiceError(
+          "VALIDATION",
+          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different parent plans`
+        );
+      }
+      if (row.sourcePath !== dependencyRow.sourcePath || row.sourceBranch !== dependencyRow.sourceBranch) {
+        throw new CliServiceError(
+          "VALIDATION",
+          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different merge targets`
+        );
+      }
+    }
   }
 
   try {
@@ -2018,8 +2081,8 @@ export async function approvePlan(params: {
   kickTaskQueueProcessing();
 
   const approvedTasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-    .all(plan.id) as TaskRow[];
+    .prepare("SELECT * FROM tasks WHERE source_plan_revision_id = ? ORDER BY created_at ASC")
+    .all(latestRevision.id) as TaskRow[];
   return { approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) };
 }
 
