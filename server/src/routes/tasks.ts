@@ -31,7 +31,18 @@ import {
 } from "../services/orchestration/dependencyGraph.js";
 import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
-import type { IdeInstanceRow, MergeRecordRow, NodeDependencyRef, NodeTier, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
+import type {
+  IdeInstanceRow,
+  MergeRecordRow,
+  NodeDependencyRef,
+  NodeMetadata,
+  NodeTier,
+  ProjectRow,
+  TaskRow,
+  TaskSessionRow,
+  TaskStatus,
+  TaskTransitionRow
+} from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 
@@ -260,6 +271,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
   const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
     ? Boolean(nodeMetadata.custom?.auto_mode)
     : true;
+  const completion = buildCompletionEvidence(projectDb, task, nodeMetadata);
 
   return {
     id: task.id,
@@ -297,9 +309,114 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
         gapHashesSeen: replan.gapHashesSeen
       }
     },
+    completion,
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
+  };
+}
+
+type CompletionEvidenceView = {
+  synthesisArtifactEventId: string | null;
+  verificationArtifactEventId: string | null;
+  verificationVerdict: "pass" | "fail" | null;
+  summary: string | null;
+  synthesisArtifact: Record<string, unknown> | null;
+  verificationArtifact: Record<string, unknown> | null;
+  deltaLoopHistory: Array<Record<string, unknown>>;
+};
+
+function parseJsonObject(input: unknown): Record<string, unknown> | null {
+  if (typeof input !== "string") return null;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readEventArtifact(
+  projectDb: Database.Database,
+  eventId: string | null,
+  expectedType: string
+): Record<string, unknown> | null {
+  if (!eventId) return null;
+  const row = projectDb
+    .prepare("SELECT event_type, payload FROM events WHERE id = ? LIMIT 1")
+    .get(eventId) as { event_type: string; payload: string } | undefined;
+  if (!row || row.event_type !== expectedType) return null;
+  const parsed = parseJsonObject(row.payload);
+  const artifact = parsed?.artifact;
+  return artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : null;
+}
+
+function readVerificationHistory(projectDb: Database.Database, taskId: string): Array<Record<string, unknown>> {
+  const rows = projectDb
+    .prepare(
+      `SELECT id, payload
+       FROM events
+       WHERE task_id = ? AND event_type = 'orchestration.verify.completed'
+       ORDER BY created_at ASC`
+    )
+    .all(taskId) as Array<{ id: string; payload: string }>;
+  return rows
+    .map((row) => {
+      const parsed = parseJsonObject(row.payload);
+      const artifact = parsed?.artifact;
+      if (!artifact || typeof artifact !== "object") return null;
+      return {
+        generated_at: (artifact as Record<string, unknown>).generated_at ?? null,
+        verdict: (artifact as Record<string, unknown>).verdict ?? null,
+        reasons: Array.isArray((artifact as Record<string, unknown>).reasons)
+          ? ((artifact as Record<string, unknown>).reasons as unknown[])
+          : [],
+        failing_requirements: Array.isArray((artifact as Record<string, unknown>).failing_requirements)
+          ? ((artifact as Record<string, unknown>).failing_requirements as unknown[])
+          : [],
+        delta_plan_enqueued: Boolean((artifact as Record<string, unknown>).delta_plan_enqueued),
+        budget_exhausted: Boolean((artifact as Record<string, unknown>).budget_exhausted),
+        verification_artifact_event_id: row.id
+      } as Record<string, unknown>;
+    })
+    .filter((value): value is Record<string, unknown> => Boolean(value))
+    .slice(-20);
+}
+
+function buildCompletionEvidence(projectDb: Database.Database, task: TaskRow, nodeMetadata: NodeMetadata): CompletionEvidenceView {
+  const custom = ((nodeMetadata.custom ?? {}) as Record<string, unknown>) ?? {};
+  const completionArtifacts =
+    custom.completion_artifacts && typeof custom.completion_artifacts === "object"
+      ? (custom.completion_artifacts as Record<string, unknown>)
+      : {};
+  const synthesisArtifactEventId = typeof custom.synthesis_artifact_event_id === "string"
+    ? custom.synthesis_artifact_event_id
+    : null;
+  const verificationArtifactEventId = typeof custom.verification_artifact_event_id === "string"
+    ? custom.verification_artifact_event_id
+    : null;
+  const verificationVerdict = custom.verification_verdict === "pass" || custom.verification_verdict === "fail"
+    ? custom.verification_verdict
+    : null;
+
+  const synthesisArtifact = completionArtifacts.synthesis && typeof completionArtifacts.synthesis === "object"
+    ? (completionArtifacts.synthesis as Record<string, unknown>)
+    : readEventArtifact(projectDb, synthesisArtifactEventId, "orchestration.synthesize.completed");
+  const verificationArtifact = completionArtifacts.verification && typeof completionArtifacts.verification === "object"
+    ? (completionArtifacts.verification as Record<string, unknown>)
+    : readEventArtifact(projectDb, verificationArtifactEventId, "orchestration.verify.completed");
+  const deltaLoopHistory = Array.isArray(completionArtifacts.delta_loop_history)
+    ? (completionArtifacts.delta_loop_history as Array<Record<string, unknown>>).slice(-20)
+    : readVerificationHistory(projectDb, task.id);
+
+  return {
+    synthesisArtifactEventId,
+    verificationArtifactEventId,
+    verificationVerdict,
+    summary: typeof synthesisArtifact?.summary === "string" ? synthesisArtifact.summary : null,
+    synthesisArtifact,
+    verificationArtifact,
+    deltaLoopHistory
   };
 }
 
