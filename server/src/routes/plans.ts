@@ -53,8 +53,9 @@ function planningFormatInstructions(): string {
   return [
     "CLI Usage Context:",
     "- Run commands from /server.",
-    "- First run `npm run cli -- --help` to view all available commands and options.",
-    "- Execute commands with `npm run cli -- <command>`.",
+    "- First run `acs --help` to view all available commands and options.",
+    "- Execute commands with `acs <command>`.",
+    "- Backward compatible fallback: `npm run cli -- <command>`.",
     "- Available commands:",
     "  - tasks list [--project-id <projectId>] [--plan-id <planId>]",
     "  - tasks all [--project-id <projectId>] [--plan-id <planId>]",

@@ -206,6 +206,12 @@ When `web/dist` exists, the server also serves the frontend for non-API routes.
 Run CLI commands from the repository root:
 
 ```bash
+acs <command>
+```
+
+Fallback (backward-compatible npm script):
+
+```bash
 npm run cli -w server -- <command>
 ```
 
@@ -213,32 +219,32 @@ Common commands:
 
 ```bash
 # List execution tasks (all projects)
-npm run cli -w server -- tasks all --json
+acs tasks all --json
 
 # List active execution tasks scoped to a project/plan
-npm run cli -w server -- tasks active --project-id <projectId> --plan-id <planId> --json
+acs tasks active --project-id <projectId> --plan-id <planId> --json
 
 # Task summary/details with optional scope filters
-npm run cli -w server -- tasks summary <taskId> --project-id <projectId> --plan-id <planId> --json
-npm run cli -w server -- tasks details <taskId> --project-id <projectId> --json
-npm run cli -w server -- info <taskId> --project-id <projectId> --plan-id <planId> --json
+acs tasks summary <taskId> --project-id <projectId> --plan-id <planId> --json
+acs tasks details <taskId> --project-id <projectId> --json
+acs info <taskId> --project-id <projectId> --plan-id <planId> --json
 
 # Plan listing/review
-npm run cli -w server -- plans list --project-id <projectId> --plan-id <planId> --json
-npm run cli -w server -- plans review <planId> --json
-npm run cli -w server -- review plan <planId> --json
+acs plans list --project-id <projectId> --plan-id <planId> --json
+acs plans review <planId> --json
+acs review plan <planId> --json
 
 # Merge workflows (task + plan)
-npm run cli -w server -- ready_merge task <taskId> --json
-npm run cli -w server -- ready_merge plan <planId> --json
-npm run cli -w server -- merge task <taskId> --json
-npm run cli -w server -- merge plan <planId> --json
+acs ready_merge task <taskId> --json
+acs ready_merge plan <planId> --json
+acs merge task <taskId> --json
+acs merge plan <planId> --json
 ```
 
 For the complete command list, run:
 
 ```bash
-npm run cli -w server -- --help
+acs --help
 ```
 
 ## Usage flow

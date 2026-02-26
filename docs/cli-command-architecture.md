@@ -173,7 +173,7 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
 
 2. Add CLI entrypoint and parser.
 - `server/src/cli/index.ts`
-- Add npm script, for example `npm run cli -w server -- ...`.
+- Add PATH-friendly `acs` executable, while keeping npm script fallback (`npm run cli -w server -- ...`).
 
 3. Implement command handlers as thin adapters.
 - Each command calls exactly one application service operation.
@@ -200,4 +200,3 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
   - project create/clone + config update logic
 - Keep HTTP-only concerns in routes:
   - request parsing/response shaping/status codes.
-
