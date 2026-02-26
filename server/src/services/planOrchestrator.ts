@@ -6,6 +6,7 @@ import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { approvePlan, extractPlan } from "../application/cliServices.js";
 import type { PlanOrchestrationStateRow, PlanRevisionRow, TaskRow } from "../types.js";
 import { nowIso } from "../utils/time.js";
+import { recordEvent } from "./events.js";
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 const PLAN_ORCHESTRATION_INTERVAL_MS = 10_000;
@@ -187,6 +188,20 @@ async function orchestrateOnePlan(params: {
   let approvedRevision = latestRevisionWithStatus(projectDb, plan.id, "approved");
 
   if (!proposedRevision) {
+    if (state?.last_failed_output_sha256 && state.last_failed_output_sha256 !== output.sha256) {
+      recordEvent({
+        projectId: plan.project_id,
+        taskId: plan.id,
+        eventType: "plan.orchestration.retry.started",
+        payload: {
+          previousFailedOutputSha256: state.last_failed_output_sha256,
+          outputSha256: output.sha256,
+          lastError: state.last_error,
+          lastErrorAt: state.last_error_at
+        },
+        database: projectDb
+      });
+    }
     if (approvedRevision && sha256Text(normalizedPlanText(approvedRevision.raw_output)) === output.sha256) {
       markApproval(projectDb, plan.id, output.sha256, approvedRevision.id);
       return;
@@ -201,8 +216,27 @@ async function orchestrateOnePlan(params: {
         planId: plan.id
       });
       markExtraction(projectDb, plan.id, output.sha256, extracted.revisionId);
+      recordEvent({
+        projectId: plan.project_id,
+        taskId: plan.id,
+        eventType: "plan.orchestration.auto_extract.succeeded",
+        payload: {
+          revisionId: extracted.revisionId,
+          revisionNumber: extracted.revisionNumber,
+          outputSha256: output.sha256
+        },
+        database: projectDb
+      });
     } catch (error: any) {
-      markOrchestrationFailure(projectDb, plan.id, output.sha256, String(error?.message ?? "plan extraction failed"));
+      const message = String(error?.message ?? "plan extraction failed");
+      markOrchestrationFailure(projectDb, plan.id, output.sha256, message);
+      recordEvent({
+        projectId: plan.project_id,
+        taskId: plan.id,
+        eventType: "plan.orchestration.auto_extract.failed",
+        payload: { outputSha256: output.sha256, error: message },
+        database: projectDb
+      });
       return;
     }
 
@@ -217,7 +251,15 @@ async function orchestrateOnePlan(params: {
         planId: plan.id
       });
     } catch (error: any) {
-      markOrchestrationFailure(projectDb, plan.id, output.sha256, String(error?.message ?? "plan approval failed"));
+      const message = String(error?.message ?? "plan approval failed");
+      markOrchestrationFailure(projectDb, plan.id, output.sha256, message);
+      recordEvent({
+        projectId: plan.project_id,
+        taskId: plan.id,
+        eventType: "plan.orchestration.auto_approve.failed",
+        payload: { outputSha256: output.sha256, error: message },
+        database: projectDb
+      });
       return;
     }
   }
@@ -225,6 +267,17 @@ async function orchestrateOnePlan(params: {
   approvedRevision = latestRevisionWithStatus(projectDb, plan.id, "approved");
   if (approvedRevision && sha256Text(normalizedPlanText(approvedRevision.raw_output)) === output.sha256) {
     markApproval(projectDb, plan.id, output.sha256, approvedRevision.id);
+    recordEvent({
+      projectId: plan.project_id,
+      taskId: plan.id,
+      eventType: "plan.orchestration.auto_approve.succeeded",
+      payload: {
+        revisionId: approvedRevision.id,
+        revisionNumber: approvedRevision.revision_number,
+        outputSha256: output.sha256
+      },
+      database: projectDb
+    });
   }
 }
 

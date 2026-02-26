@@ -8,6 +8,7 @@ import { recordEvent } from "../services/events.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
+import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
@@ -536,6 +537,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
   const approvedTasks = projectDb
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
+  const visibility = buildAutomationVisibility(projectDb, plan);
 
   res.json({
     plan: serializeTask(projectDb, plan),
@@ -553,7 +555,10 @@ plansRouter.get("/plans/:planId", (req, res) => {
       approvedAt: revision.approved_at,
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
-    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task))
+    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)),
+    automation: visibility.automation,
+    waiting: visibility.waiting,
+    orchestration: visibility.orchestration
   });
 });
 

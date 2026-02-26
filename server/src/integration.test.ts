@@ -634,14 +634,35 @@ describe("integration: CLI subcommands", () => {
       status: "queued",
       parentPlanTaskId: planId
     });
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Blocker",
+      status: "in_progress"
+    });
+    const eventAt = nowIso();
+    const laterAt = new Date(Date.parse(eventAt) + 1000).toISOString();
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(planId, blockerId, eventAt);
+    projectDb
+      .prepare("INSERT INTO events (id, project_id, task_id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?)")
+      .run(randomUUID(), projectId, planId, "plan.orchestration.auto_extract.succeeded", JSON.stringify({}), eventAt);
+    projectDb
+      .prepare("INSERT INTO events (id, project_id, task_id, session_id, event_type, payload, created_at) VALUES (?, ?, ?, NULL, ?, ?, ?)")
+      .run(randomUUID(), projectId, planId, "plan.orchestration.auto_approve.succeeded", JSON.stringify({}), laterAt);
 
     const plansReview = runCli(["plans", "review", planId, "--json"]);
     assert.equal(plansReview.code, 0);
     assert.equal(plansReview.json?.plan?.id, planId);
+    assert.equal(plansReview.json?.waiting?.reasonCode, "blocked_dependencies");
+    assert.equal(plansReview.json?.waiting?.dependencyBlockerTaskId, blockerId);
+    assert.equal(plansReview.json?.automation?.lastAction?.eventType, "plan.orchestration.auto_approve.succeeded");
 
     const reviewPlan = runCli(["review", "plan", planId, "--json"]);
     assert.equal(reviewPlan.code, 0);
     assert.equal(reviewPlan.json?.plan?.id, planId);
+    assert.equal(Array.isArray(reviewPlan.json?.automation?.recentActions), true);
+    assert.equal(reviewPlan.json?.waiting?.blockingDependencies?.[0]?.id, blockerId);
 
     const reviewTask = runCli(["review", "task", taskId, "--json"]);
     assert.equal(reviewTask.code, 0);
@@ -1075,6 +1096,12 @@ tasks:
       .get(planId) as { last_approved_output_sha256: string | null; lock_token: string | null };
     assert.equal(typeof orchestration.last_approved_output_sha256, "string");
     assert.equal(orchestration.lock_token, null);
+
+    const orchestrationEvents = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type LIKE 'plan.orchestration.%' ORDER BY created_at ASC")
+      .all(planId) as Array<{ event_type: string }>;
+    assert.equal(orchestrationEvents.some((row) => row.event_type === "plan.orchestration.auto_extract.succeeded"), true);
+    assert.equal(orchestrationEvents.some((row) => row.event_type === "plan.orchestration.auto_approve.succeeded"), true);
   });
 
   test("plan-created sub-plans are recursively orchestrated with duplicate-safe approvals", async () => {

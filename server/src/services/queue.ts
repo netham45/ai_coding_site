@@ -1,4 +1,5 @@
 import { db as appDb, resolveProjectDatabase } from "../db/index.js";
+import { recordEvent } from "./events.js";
 import { startTaskRuntimeWorker } from "./runtimeWorker.js";
 
 const QUEUE_INTERVAL_MS = 10_000;
@@ -7,6 +8,9 @@ const startingTaskIds = new Set<string>();
 
 type QueuedTaskRow = {
   id: string;
+  project_id: string;
+  parent_plan_task_id: string | null;
+  mode: "execution" | "plan";
   created_by_user_id: string;
   created_at: string;
 };
@@ -26,7 +30,7 @@ async function processQueuedTasksPass(): Promise<void> {
     });
     const rows = scoped.database
       .prepare(
-        `SELECT t.id, t.created_by_user_id, t.created_at
+        `SELECT t.id, t.project_id, t.parent_plan_task_id, t.mode, t.created_by_user_id, t.created_at
          FROM tasks t
          WHERE t.project_id = ?
            AND t.status = 'queued'
@@ -65,13 +69,61 @@ async function processQueuedTasksPass(): Promise<void> {
         return;
       }
       startingTaskIds.add(row.task.id);
+      const projectDb = resolveProjectDatabase({
+        appDb,
+        projectId: row.projectId,
+        basePath: row.basePath,
+        intent: "write"
+      }).database;
       try {
         await startTaskRuntimeWorker(row.task.id, row.task.created_by_user_id, {
           projectId: row.projectId,
           basePath: row.basePath
         });
-      } catch {
-        // Best-effort queue dispatch. Task remains queued for retry.
+        recordEvent({
+          projectId: row.task.project_id,
+          taskId: row.task.id,
+          eventType: "task.queue.dispatch.succeeded",
+          payload: {
+            mode: row.task.mode,
+            parentPlanTaskId: row.task.parent_plan_task_id
+          },
+          database: projectDb
+        });
+        if (row.task.parent_plan_task_id) {
+          recordEvent({
+            projectId: row.task.project_id,
+            taskId: row.task.parent_plan_task_id,
+            eventType: "plan.auto_start_child.started",
+            payload: {
+              childTaskId: row.task.id,
+              childMode: row.task.mode
+            },
+            database: projectDb
+          });
+        }
+      } catch (error: any) {
+        const message = String(error?.message ?? "queue dispatch failed");
+        recordEvent({
+          projectId: row.task.project_id,
+          taskId: row.task.id,
+          eventType: "task.queue.dispatch.failed",
+          payload: { retryScheduled: true, error: message },
+          database: projectDb
+        });
+        if (row.task.parent_plan_task_id) {
+          recordEvent({
+            projectId: row.task.project_id,
+            taskId: row.task.parent_plan_task_id,
+            eventType: "plan.auto_start_child.failed",
+            payload: {
+              childTaskId: row.task.id,
+              childMode: row.task.mode,
+              error: message
+            },
+            database: projectDb
+          });
+        }
       } finally {
         startingTaskIds.delete(row.task.id);
       }
