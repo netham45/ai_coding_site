@@ -23,6 +23,7 @@ import {
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration } from "./db/migrations.js";
+import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
@@ -1101,5 +1102,250 @@ tasks:
       .all(planId) as Array<{ event_type: string }>;
     assert.equal(orchestrationEvents.some((row) => row.event_type === "plan.orchestration.auto_extract.succeeded"), true);
     assert.equal(orchestrationEvents.some((row) => row.event_type === "plan.orchestration.auto_approve.succeeded"), true);
+  });
+
+  test("plan-created sub-plans are recursively orchestrated with duplicate-safe approvals", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-orchestrator-recursive-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const rootPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Root Auto Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const rootPlan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(rootPlanId) as { workspace_path: string };
+    projectDb.prepare("UPDATE tasks SET auto_start = 1, updated_at = ? WHERE id = ?").run(nowIso(), rootPlanId);
+
+    fs.mkdirSync(rootPlan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], rootPlan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], rootPlan.workspace_path);
+    runGit(["config", "user.name", "Tests"], rootPlan.workspace_path);
+    fs.writeFileSync(path.join(rootPlan.workspace_path, "README.md"), "root plan workspace\n", "utf8");
+    runGit(["add", "."], rootPlan.workspace_path);
+    runGit(["commit", "-m", "init"], rootPlan.workspace_path);
+    runGit(["checkout", "-b", `task/${rootPlanId}`], rootPlan.workspace_path);
+
+    const rootPlanDir = path.join(rootPlan.workspace_path, ".ai-plan");
+    fs.mkdirSync(rootPlanDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(rootPlanDir, "latest-plan.yaml"),
+      [
+        "tasks:",
+        "  - id: sub_plan_a",
+        "    item_type: sub_plan",
+        "    title: Build nested plan",
+        "    prompt: Create nested plan output",
+        "    auto_start: true",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+
+    const subPlan = projectDb
+      .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? AND source_plan_item_key = 'sub_plan_a'")
+      .get(rootPlanId) as { id: string; mode: string; auto_start: number; status: string; workspace_path: string } | undefined;
+    assert.ok(subPlan);
+    assert.equal(subPlan.mode, "plan");
+    assert.equal(subPlan.auto_start, 1);
+
+    projectDb.prepare("UPDATE tasks SET status = 'waiting_input', updated_at = ? WHERE id = ?").run(nowIso(), subPlan.id);
+    const subPlanDir = path.join(subPlan.workspace_path, ".ai-plan");
+    fs.mkdirSync(subPlanDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(subPlanDir, "latest-plan.yaml"),
+      [
+        "tasks:",
+        "  - id: child_exec",
+        "    title: Child execution item",
+        "    prompt: Implement child execution item",
+        "  - id: child_sub_plan",
+        "    item_type: sub_plan",
+        "    title: Child sub plan",
+        "    prompt: Implement child sub plan",
+        "    depends_on: [child_exec]",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+
+    const subPlanRevisions = projectDb
+      .prepare("SELECT status FROM plan_revisions WHERE plan_task_id = ? ORDER BY revision_number ASC")
+      .all(subPlan.id) as Array<{ status: string }>;
+    assert.equal(subPlanRevisions.length, 1);
+    assert.equal(subPlanRevisions[0]?.status, "approved");
+
+    const subPlanChildren = projectDb
+      .prepare("SELECT source_plan_item_key, mode FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
+      .all(subPlan.id) as Array<{ source_plan_item_key: string; mode: string }>;
+    assert.equal(subPlanChildren.length, 2);
+    assert.equal(subPlanChildren[0]?.source_plan_item_key, "child_exec");
+    assert.equal(subPlanChildren[0]?.mode, "execution");
+    assert.equal(subPlanChildren[1]?.source_plan_item_key, "child_sub_plan");
+    assert.equal(subPlanChildren[1]?.mode, "plan");
+
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+    const subPlanChildrenAfterExtraPasses = projectDb
+      .prepare("SELECT COUNT(*) AS count FROM tasks WHERE parent_plan_task_id = ?")
+      .get(subPlan.id) as { count: number };
+    assert.equal(subPlanChildrenAfterExtraPasses.count, 2);
+  });
+
+  test("approvePlan rejects sub-plan recursion beyond depth limit", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-recursion-depth-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const rootPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Root",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    let parentPlanId = rootPlanId;
+    for (let i = 1; i <= 6; i += 1) {
+      parentPlanId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: `Nested ${i}`,
+        mode: "plan",
+        status: "waiting_input",
+        parentPlanTaskId: parentPlanId
+      });
+    }
+
+    const revisionId = randomUUID();
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revisions (
+           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
+         ) VALUES (?, ?, 1, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
+      )
+      .run(revisionId, parentPlanId, "tasks:\n  - id: too_deep\n    item_type: sub_plan\n    title: Too Deep\n    prompt: Too Deep\n", userId, now);
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, 'too_deep', 'sub_plan', 'Too Deep', 'Too Deep', 1, ?)`
+      )
+      .run(randomUUID(), revisionId, now);
+
+    await assert.rejects(
+      async () => approvePlan({ userId, planId: parentPlanId }),
+      (error: unknown) =>
+        error instanceof CliServiceError
+        && error.code === "VALIDATION"
+        && /recursion depth/i.test(error.message)
+    );
+
+    const created = projectDb
+      .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ?")
+      .all(revisionId) as Array<{ id: string }>;
+    assert.equal(created.length, 0);
+  });
+
+  test("approvePlan rejects dependencies that cross merge topology boundaries", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-topology-guard-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Topology Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const revisionId = randomUUID();
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revisions (
+           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
+         ) VALUES (?, ?, 1, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
+      )
+      .run(
+        revisionId,
+        planId,
+        [
+          "tasks:",
+          "  - id: root_target",
+          "    item_type: sub_plan",
+          "    title: Root Target",
+          "    prompt: Root Target",
+          "  - id: parent_target",
+          "    item_type: sub_plan",
+          "    title: Parent Target",
+          "    prompt: Parent Target",
+          "    depends_on: [root_target]",
+          ""
+        ].join("\n"),
+        userId,
+        now
+      );
+    const itemAId = randomUUID();
+    const itemBId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'sub_plan', ?, ?, ?, ?)`
+      )
+      .run(itemAId, revisionId, "root_target", "Root Target", "Root Target", 1, now);
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'sub_plan', ?, ?, ?, ?)`
+      )
+      .run(itemBId, revisionId, "parent_target", "Parent Target", "Parent Target", 2, now);
+    projectDb
+      .prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)")
+      .run(itemBId, "root_target");
+
+    await assert.rejects(
+      async () =>
+        approvePlan({
+          userId,
+          planId,
+          taskEdits: [
+            {
+              itemKey: "root_target",
+              title: "Root Target",
+              description: "Root Target",
+              parentPlanTaskId: null
+            },
+            {
+              itemKey: "parent_target",
+              title: "Parent Target",
+              description: "Parent Target"
+            }
+          ]
+        }),
+      (error: unknown) =>
+        error instanceof CliServiceError
+        && error.code === "VALIDATION"
+        && /dependency topology/i.test(error.message)
+    );
+
+    const created = projectDb
+      .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ?")
+      .all(revisionId) as Array<{ id: string }>;
+    assert.equal(created.length, 0);
   });
 });
