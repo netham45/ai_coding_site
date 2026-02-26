@@ -17,6 +17,7 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-approve.md` - approval/materialization template.
 - `epoch-to-phases.md` - epoch-tier decomposition template for generating phase children.
 - `task-execution.md` - execution-task runtime template.
+- `re-review-unblock.md` - re-review decision template for unblock vs delta-work.
 
 ## Usage
 
