@@ -203,7 +203,7 @@ When `web/dist` exists, the server also serves the frontend for non-API routes.
 
 ## CLI usage
 
-Run CLI commands from the repository root:
+Run CLI commands from the repository root or any nested directory inside this `ai-coding-site` workspace:
 
 ```bash
 acs <command>
@@ -214,6 +214,14 @@ Fallback (backward-compatible npm script):
 ```bash
 npm run cli -w server -- <command>
 ```
+
+If root discovery fails, `acs` exits with:
+
+```text
+Error: Could not locate the ai-coding-site workspace root from <path>. Run this command from within an ai-coding-site workspace (for example, <workspace>/server).
+```
+
+Fix by `cd`-ing into this workspace (for example, `/server`, `/server/src/cli`, or `/web`) and rerunning.
 
 Common commands:
 
