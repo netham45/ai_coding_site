@@ -212,6 +212,13 @@ function helpText(): string {
   return [
     "Usage: acs <command> [subcommand] [options]",
     "",
+    "Location and root discovery:",
+    "  Run from the repository root or any nested directory inside an ai-coding-site workspace.",
+    "  Fallback: npm run cli -w server -- <command>",
+    "  If root discovery fails, acs exits with:",
+    "    Error: Could not locate the ai-coding-site workspace root from <path>.",
+    "  Fix: run the command from within this workspace (for example, <workspace>/server).",
+    "",
     "Commands:",
     "  tasks list [--project-id <projectId>] [--plan-id <planId>]",
     "  tasks all [--project-id <projectId>] [--plan-id <planId>]",

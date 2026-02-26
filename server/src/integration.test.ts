@@ -743,6 +743,8 @@ describe("integration: CLI subcommands", () => {
   test("help output includes command examples for new subcommands", () => {
     const help = runCli(["--help"]);
     assert.equal(help.code, 0);
+    assert.match(help.stdout, /Location and root discovery:/);
+    assert.match(help.stdout, /Run from the repository root or any nested directory inside an ai-coding-site workspace/);
     assert.match(help.stdout, /tasks all \[--project-id <projectId>] \[--plan-id <planId>]/);
     assert.match(help.stdout, /tasks summary <taskId> \[--project-id <projectId>] \[--plan-id <planId>]/);
     assert.match(help.stdout, /plans review <planId>/);
