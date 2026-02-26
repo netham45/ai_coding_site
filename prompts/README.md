@@ -17,6 +17,7 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-approve.md` - approval/materialization template.
 - `phase-to-plans.md` - phase decomposition template for generating plan children.
 - `task-execution.md` - execution-task runtime template.
+- `synthesis.md` - parent synthesis template for requirement-to-evidence coverage aggregation.
 - `re-review-unblock.md` - re-review decision template for unblock vs delta-work.
 
 ## Usage
