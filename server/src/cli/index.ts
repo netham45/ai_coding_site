@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { getWorkspaceRootOrThrow } from "../utils/workspaceRoot.js";
 
 enum ExitCode {
   Success = 0,
@@ -472,6 +473,8 @@ function parseEntityId(
 }
 
 async function run(): Promise<void> {
+  getWorkspaceRootOrThrow(process.cwd());
+
   const argv = process.argv.slice(2);
   const parsed = parseArgv(argv);
   if (argv.length === 0 || parsed.flags.has("help") || parsed.positionals[0] === "help") {

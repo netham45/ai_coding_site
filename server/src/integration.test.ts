@@ -73,8 +73,12 @@ type CliRunResult = {
 };
 
 function runCli(args: string[]): CliRunResult {
+  return runCliFromCwd(args, serverRoot);
+}
+
+function runCliFromCwd(args: string[], cwd: string): CliRunResult {
   const result = spawnSync("npm", ["run", "-s", "cli", "--", ...args], {
-    cwd: serverRoot,
+    cwd,
     env: process.env,
     encoding: "utf8"
   });
@@ -714,5 +718,25 @@ describe("integration: CLI subcommands", () => {
     assert.match(help.stdout, /merge plan <planId>/);
     assert.match(help.stdout, /Examples:/);
     assert.match(help.stdout, /acs tasks active --project-id <projectId> --json/);
+  });
+
+  test("cli commands work from nested server directories", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-nested-cwd-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Nested cwd task",
+      status: "queued"
+    });
+
+    const nestedServerDir = path.join(serverRoot, "src", "cli");
+    const allTasks = runCliFromCwd(["tasks", "all", "--json"], nestedServerDir);
+    assert.equal(allTasks.code, 0);
+    assert.equal(Array.isArray(allTasks.json?.tasks), true);
+    assert.equal(allTasks.json.tasks.length, 1);
   });
 });
