@@ -1,12 +1,19 @@
 export type ParsedPlanTask = {
   itemKey: string;
+  itemType: "execution_task" | "sub_plan";
   title: string;
   prompt: string;
   dependsOnItemKeys: string[];
+  autoMerge: boolean;
+  autoStart: boolean;
+  autoMergeOnComplete: boolean;
 };
 
 export type ParsedPlan = {
   tasks: ParsedPlanTask[];
+  autoStart: boolean;
+  autoMergeOnComplete: boolean;
+  autoMergeItemKeys: string[];
   yamlText: string;
 };
 
@@ -34,6 +41,13 @@ function parseInlineList(value: string): string[] {
     .filter(Boolean);
 }
 
+function parseBoolean(value: string): boolean | undefined {
+  const normalized = stripQuotes(value).trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  return undefined;
+}
+
 function countIndent(line: string): number {
   let indent = 0;
   while (indent < line.length && line[indent] === " ") {
@@ -53,9 +67,9 @@ export function extractYamlDocument(rawText: string): string {
     return fencedMatch[1].trim();
   }
 
-  const tasksStart = rawText.search(/(^|\n)tasks:\s*(\n|$)/i);
-  if (tasksStart >= 0) {
-    return rawText.slice(tasksStart).trim();
+  const planStart = rawText.search(/(^|\n)(tasks|items):\s*(\n|$)/i);
+  if (planStart >= 0) {
+    return rawText.slice(planStart).trim();
   }
 
   throw new Error("No YAML plan found. Provide a YAML block containing a top-level `tasks:` list.");
@@ -91,9 +105,79 @@ function detectCycles(tasks: ParsedPlanTask[]): void {
 
 export function parsePlanYaml(yamlText: string): ParsedPlan {
   const lines = yamlText.replace(/\r\n/g, "\n").split("\n");
-  const tasksRootIndex = lines.findIndex((line) => line.trim() === "tasks:");
+  const tasksRootIndex = lines.findIndex((line) => line.trim() === "tasks:" || line.trim() === "items:");
   if (tasksRootIndex < 0) {
     throw new Error("YAML plan must include a top-level `tasks:` key");
+  }
+
+  let defaultAutoStart = false;
+  let defaultAutoMergeOnComplete = false;
+  let defaultAutoMergeItemKeys: string[] = [];
+  let topLevelIndex = 0;
+  while (topLevelIndex < tasksRootIndex) {
+    const line = lines[topLevelIndex];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      topLevelIndex += 1;
+      continue;
+    }
+    if (countIndent(line) !== 0) {
+      topLevelIndex += 1;
+      continue;
+    }
+    const topLevelMatch = line.match(/^([a-zA-Z0-9_]+):\s*(.*)$/);
+    if (!topLevelMatch) {
+      topLevelIndex += 1;
+      continue;
+    }
+    const key = topLevelMatch[1];
+    const value = topLevelMatch[2] ?? "";
+    if (key === "auto_start") {
+      const parsed = parseBoolean(value);
+      if (parsed === undefined) {
+        throw new Error("Top-level `auto_start` must be true or false");
+      }
+      defaultAutoStart = parsed;
+      topLevelIndex += 1;
+      continue;
+    }
+    if (key === "auto_merge_on_complete") {
+      const parsed = parseBoolean(value);
+      if (parsed === undefined) {
+        throw new Error("Top-level `auto_merge_on_complete` must be true or false");
+      }
+      defaultAutoMergeOnComplete = parsed;
+      topLevelIndex += 1;
+      continue;
+    }
+    if (key === "auto_merge_item_keys") {
+      const inlineList = parseInlineList(value);
+      if (inlineList.length > 0) {
+        defaultAutoMergeItemKeys = inlineList;
+        topLevelIndex += 1;
+        continue;
+      }
+
+      topLevelIndex += 1;
+      const itemKeys: string[] = [];
+      while (topLevelIndex < tasksRootIndex) {
+        const depLine = lines[topLevelIndex];
+        const depTrimmed = depLine.trim();
+        const depIndent = countIndent(depLine);
+        if (!depTrimmed) {
+          topLevelIndex += 1;
+          continue;
+        }
+        if (depIndent < 2) break;
+        const depMatch = depLine.match(/^\s{2}-\s*(.+)$/);
+        if (!depMatch) break;
+        itemKeys.push(normalizeKey(stripQuotes(depMatch[1])));
+        topLevelIndex += 1;
+      }
+      defaultAutoMergeItemKeys = itemKeys.filter(Boolean);
+      continue;
+    }
+    topLevelIndex += 1;
   }
 
   const tasks: ParsedPlanTask[] = [];
@@ -117,7 +201,16 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
       throw new Error(`Invalid task list entry near line ${index + 1}`);
     }
 
-    const item: { id?: string; title?: string; prompt?: string; depends_on?: string[] } = {
+    const item: {
+      id?: string;
+      title?: string;
+      prompt?: string;
+      item_type?: "execution_task" | "sub_plan";
+      auto_merge?: boolean;
+      auto_start?: boolean;
+      auto_merge_on_complete?: boolean;
+      depends_on?: string[];
+    } = {
       depends_on: []
     };
 
@@ -131,6 +224,16 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
       if (k.trim() === "id") item.id = stripQuotes(v);
       if (k.trim() === "title") item.title = stripQuotes(v);
       if (k.trim() === "prompt") item.prompt = stripQuotes(v);
+      if (k.trim() === "item_type" || k.trim() === "type") {
+        const candidate = stripQuotes(v).trim().toLowerCase();
+        if (candidate === "execution_task" || candidate === "sub_plan") {
+          item.item_type = candidate;
+        } else if (candidate === "execution" || candidate === "task") {
+          item.item_type = "execution_task";
+        } else if (candidate === "plan" || candidate === "subplan" || candidate === "sub_plan") {
+          item.item_type = "sub_plan";
+        }
+      }
     }
 
     index += 1;
@@ -219,6 +322,47 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
         item.depends_on = deps;
         continue;
       }
+      if (key === "item_type" || key === "type") {
+        const candidate = stripQuotes(value).trim().toLowerCase();
+        if (candidate === "execution_task" || candidate === "sub_plan") {
+          item.item_type = candidate;
+        } else if (candidate === "execution" || candidate === "task") {
+          item.item_type = "execution_task";
+        } else if (candidate === "plan" || candidate === "subplan" || candidate === "sub_plan") {
+          item.item_type = "sub_plan";
+        } else {
+          throw new Error(`Task item_type must be execution_task or sub_plan (line ${index + 1})`);
+        }
+        index += 1;
+        continue;
+      }
+      if (key === "auto_merge") {
+        const parsed = parseBoolean(value);
+        if (parsed === undefined) {
+          throw new Error(`Task auto_merge must be true or false (line ${index + 1})`);
+        }
+        item.auto_merge = parsed;
+        index += 1;
+        continue;
+      }
+      if (key === "auto_start") {
+        const parsed = parseBoolean(value);
+        if (parsed === undefined) {
+          throw new Error(`Task auto_start must be true or false (line ${index + 1})`);
+        }
+        item.auto_start = parsed;
+        index += 1;
+        continue;
+      }
+      if (key === "auto_merge_on_complete") {
+        const parsed = parseBoolean(value);
+        if (parsed === undefined) {
+          throw new Error(`Task auto_merge_on_complete must be true or false (line ${index + 1})`);
+        }
+        item.auto_merge_on_complete = parsed;
+        index += 1;
+        continue;
+      }
 
       index += 1;
     }
@@ -232,8 +376,22 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
     if (!prompt) {
       throw new Error(`Task ${itemKey} is missing a prompt`);
     }
+    const itemType = item.item_type ?? "execution_task";
+    const autoMerge =
+      itemType === "execution_task"
+        ? (item.auto_merge ?? defaultAutoMergeItemKeys.some((key) => key.toLowerCase() === itemKey.toLowerCase()))
+        : (item.auto_merge ?? false);
+    const autoStart = itemType === "sub_plan" ? (item.auto_start ?? defaultAutoStart) : (item.auto_start ?? false);
+    const autoMergeOnComplete =
+      itemType === "sub_plan" ? (item.auto_merge_on_complete ?? defaultAutoMergeOnComplete) : (item.auto_merge_on_complete ?? false);
+    if (itemType === "execution_task" && (autoStart || autoMergeOnComplete)) {
+      throw new Error(`Task ${itemKey} is execution_task and cannot set auto_start or auto_merge_on_complete`);
+    }
+    if (itemType === "sub_plan" && autoMerge) {
+      throw new Error(`Task ${itemKey} is sub_plan and cannot set auto_merge`);
+    }
 
-    const dependsOnItemKeys = (item.depends_on ?? []).map((dep) => normalizeKey(dep)).filter(Boolean);
+    const dependsOnItemKeys = [...new Set((item.depends_on ?? []).map((dep) => normalizeKey(dep)).filter(Boolean))];
     const selfDependency = dependsOnItemKeys.find((dep) => dep.toLowerCase() === itemKey.toLowerCase());
     if (selfDependency) {
       throw new Error(`Task ${itemKey} cannot depend on itself`);
@@ -241,9 +399,13 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
 
     tasks.push({
       itemKey,
+      itemType,
       title,
       prompt,
-      dependsOnItemKeys
+      dependsOnItemKeys,
+      autoMerge,
+      autoStart,
+      autoMergeOnComplete
     });
   }
 
@@ -270,7 +432,13 @@ export function parsePlanYaml(yamlText: string): ParsedPlan {
   }
 
   detectCycles(tasks);
-  return { tasks, yamlText };
+  return {
+    tasks,
+    autoStart: defaultAutoStart,
+    autoMergeOnComplete: defaultAutoMergeOnComplete,
+    autoMergeItemKeys: defaultAutoMergeItemKeys,
+    yamlText
+  };
 }
 
 export function parsePlanOutput(rawOutput: string): ParsedPlan {

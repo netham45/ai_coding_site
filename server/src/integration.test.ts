@@ -23,6 +23,7 @@ import {
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration } from "./db/migrations.js";
+import { parsePlanOutput } from "./services/planParser.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
 import { nowIso } from "./utils/time.js";
 
@@ -718,5 +719,75 @@ describe("integration: CLI subcommands", () => {
     assert.match(help.stdout, /merge plan <planId>/);
     assert.match(help.stdout, /Examples:/);
     assert.match(help.stdout, /acs tasks active --project-id <projectId> --json/);
+  });
+
+  test("plan parser accepts mixed item types and automation defaults", () => {
+    const parsed = parsePlanOutput(`
+\`\`\`yaml
+auto_start: true
+auto_merge_on_complete: true
+auto_merge_item_keys: [task_1]
+tasks:
+  - id: task_1
+    title: Implement API
+    item_type: execution_task
+    auto_merge: true
+    prompt: Build API endpoint
+  - id: plan_2
+    title: Integration Plan
+    item_type: sub_plan
+    depends_on: [task_1]
+    prompt: Build integration plan
+\`\`\`
+`);
+
+    assert.equal(parsed.tasks.length, 2);
+    assert.equal(parsed.tasks[0]?.itemType, "execution_task");
+    assert.equal(parsed.tasks[0]?.autoMerge, true);
+    assert.equal(parsed.tasks[1]?.itemType, "sub_plan");
+    assert.deepEqual(parsed.tasks[1]?.dependsOnItemKeys, ["task_1"]);
+    assert.equal(parsed.tasks[1]?.autoStart, true);
+    assert.equal(parsed.tasks[1]?.autoMergeOnComplete, true);
+  });
+
+  test("plan parser remains backward-compatible with legacy task-only YAML", () => {
+    const parsed = parsePlanOutput(`
+\`\`\`yaml
+tasks:
+  - id: task_a
+    title: A
+    prompt: Do A
+  - id: task_b
+    title: B
+    prompt: Do B
+    depends_on: [task_a]
+\`\`\`
+`);
+    assert.equal(parsed.tasks.length, 2);
+    assert.equal(parsed.tasks[0]?.itemType, "execution_task");
+    assert.equal(parsed.tasks[0]?.autoMerge, false);
+    assert.deepEqual(parsed.tasks[1]?.dependsOnItemKeys, ["task_a"]);
+  });
+
+  test("plan parser rejects cross-item cycles across mixed item types", () => {
+    assert.throws(
+      () =>
+        parsePlanOutput(`
+\`\`\`yaml
+tasks:
+  - id: task_a
+    title: A
+    item_type: execution_task
+    prompt: Do A
+    depends_on: [plan_b]
+  - id: plan_b
+    title: B
+    item_type: sub_plan
+    prompt: Do B
+    depends_on: [task_a]
+\`\`\`
+`),
+      /Cyclic dependency/
+    );
   });
 });

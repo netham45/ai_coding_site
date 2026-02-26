@@ -104,12 +104,21 @@ function planningFormatInstructions(): string {
     "Planner Output Contract:",
     "Return the final plan as YAML only.",
     "Wrap YAML in a fenced block using ```yaml.",
-    "Top-level key must be `tasks:`.",
-    "Each task entry must include:",
+    "Top-level key must be `tasks:` (or `items:` for compatibility).",
+    "Optional top-level defaults:",
+    "- auto_start: default for sub_plan items",
+    "- auto_merge_on_complete: default for sub_plan items",
+    "- auto_merge_item_keys: execution item ids that should auto-merge",
+    "Each plan item entry must include:",
     "- id: unique task identifier",
     "- title: short task title",
     "- prompt: implementation prompt for that task",
+    "- item_type: execution_task | sub_plan (optional, defaults to execution_task)",
     "- depends_on: list of task ids (optional)",
+    "Dependencies may reference any prior item type and must form an acyclic graph.",
+    "Optional item-level automation:",
+    "- execution_task: auto_merge: true|false",
+    "- sub_plan: auto_start: true|false, auto_merge_on_complete: true|false",
     "After generating YAML, write the exact same YAML to this file in the workspace:",
     `${PLAN_OUTPUT_RELATIVE_PATH}`
   ].join("\n");
@@ -584,9 +593,9 @@ plansRouter.post("/plans/:planId/extract", (req, res) => {
         const task = parsed.tasks[i];
         const itemId = makeId();
         projectDb.prepare(
-          `INSERT INTO plan_revision_items (id, revision_id, item_key, title, prompt, ordinal, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(itemId, revisionId, task.itemKey, task.title, task.prompt, i + 1, createdAt);
+          `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(itemId, revisionId, task.itemKey, task.itemType, task.title, task.prompt, i + 1, createdAt);
 
         for (const dep of task.dependsOnItemKeys) {
           projectDb.prepare(
@@ -740,8 +749,44 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
   const taskEditsByItemKey = new Map(
     (parsed.data.taskEdits ?? []).map((edit) => [edit.itemKey.toLowerCase(), edit])
   );
-  const defaultSubPlanAutoStart = Boolean(parsed.data.autoStart);
-  const defaultSubPlanAutoMergeOnComplete = Boolean(parsed.data.autoMergeOnComplete);
+  let parsedRevisionDefaults:
+    | {
+        autoStart: boolean;
+        autoMergeOnComplete: boolean;
+        tasksByItemKey: Map<
+          string,
+          {
+            itemType: "execution_task" | "sub_plan";
+            autoMerge: boolean;
+            autoStart: boolean;
+            autoMergeOnComplete: boolean;
+          }
+        >;
+      }
+    | undefined;
+  try {
+    const parsedRevision = parsePlanOutput(latestRevision.raw_output);
+    parsedRevisionDefaults = {
+      autoStart: parsedRevision.autoStart,
+      autoMergeOnComplete: parsedRevision.autoMergeOnComplete,
+      tasksByItemKey: new Map(
+        parsedRevision.tasks.map((task) => [
+          task.itemKey.toLowerCase(),
+          {
+            itemType: task.itemType,
+            autoMerge: task.autoMerge,
+            autoStart: task.autoStart,
+            autoMergeOnComplete: task.autoMergeOnComplete
+          }
+        ])
+      )
+    };
+  } catch {
+    // Fallback to revision rows only when stored raw_output is not parseable.
+  }
+  const defaultSubPlanAutoStart = parsed.data.autoStart ?? parsedRevisionDefaults?.autoStart ?? false;
+  const defaultSubPlanAutoMergeOnComplete =
+    parsed.data.autoMergeOnComplete ?? parsedRevisionDefaults?.autoMergeOnComplete ?? false;
   const defaultSubPlanParentPlanTaskId = parsed.data.parentPlanTaskId === undefined ? plan.id : parsed.data.parentPlanTaskId;
   for (const row of depRows) {
     if (!itemIdToDeps.has(row.revision_item_id)) {
@@ -769,11 +814,16 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
   for (const item of items) {
     const taskId = makeId();
     const edit = taskEditsByItemKey.get(item.item_key.toLowerCase());
-    const itemType = edit?.itemType ?? item.item_type;
+    const parsedRevisionItem = parsedRevisionDefaults?.tasksByItemKey.get(item.item_key.toLowerCase());
+    const itemType = edit?.itemType ?? parsedRevisionItem?.itemType ?? item.item_type;
     const mode = itemType === "sub_plan" ? "plan" : "execution";
-    const autoMerge = mode === "execution" && autoMergeItemKeys.has(item.item_key.toLowerCase());
-    const autoStart = mode === "plan" ? (edit?.autoStart ?? defaultSubPlanAutoStart) : false;
-    const autoMergeOnComplete = mode === "plan" ? (edit?.autoMergeOnComplete ?? defaultSubPlanAutoMergeOnComplete) : false;
+    const autoMerge =
+      mode === "execution" && (autoMergeItemKeys.has(item.item_key.toLowerCase()) || Boolean(parsedRevisionItem?.autoMerge));
+    const autoStart = mode === "plan" ? (edit?.autoStart ?? parsedRevisionItem?.autoStart ?? defaultSubPlanAutoStart) : false;
+    const autoMergeOnComplete =
+      mode === "plan"
+        ? (edit?.autoMergeOnComplete ?? parsedRevisionItem?.autoMergeOnComplete ?? defaultSubPlanAutoMergeOnComplete)
+        : false;
     const parentPlanTaskId =
       mode === "plan"
         ? (edit?.parentPlanTaskId === undefined ? defaultSubPlanParentPlanTaskId : edit.parentPlanTaskId)
