@@ -4,6 +4,7 @@ export type TaskStatus =
   | "queued"
   | "in_progress"
   | "waiting_input"
+  | "awaiting_children"
   | "merge_ready"
   | "merged"
   | "cancelled"
@@ -45,6 +46,8 @@ export type TaskRow = {
   effective_prompt: string;
   ai_command: string;
   auto_merge: number;
+  auto_start: number;
+  auto_merge_on_complete: number;
   mode: TaskMode;
   parent_plan_task_id: string | null;
   source_plan_revision_id: string | null;
@@ -163,11 +166,14 @@ export type PlanRevisionItemRow = {
   id: string;
   revision_id: string;
   item_key: string;
+  item_type: PlanRevisionItemType;
   title: string;
   prompt: string;
   ordinal: number;
   created_at: string;
 };
+
+export type PlanRevisionItemType = "execution_task" | "sub_plan";
 
 export type PlanRevisionItemDependencyRow = {
   revision_item_id: string;
