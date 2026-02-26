@@ -193,6 +193,22 @@ CREATE TABLE IF NOT EXISTS plan_revision_item_dependencies (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_revision_item_dependencies_revision_item_id ON plan_revision_item_dependencies(revision_item_id);
 
+CREATE TABLE IF NOT EXISTS plan_orchestration_state (
+  plan_task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  lock_token TEXT,
+  lock_expires_at TEXT,
+  last_output_sha256 TEXT,
+  last_extracted_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+  last_approved_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+  last_approved_output_sha256 TEXT,
+  last_failed_output_sha256 TEXT,
+  last_error TEXT,
+  last_error_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_orchestration_state_lock_expires_at ON plan_orchestration_state(lock_expires_at);
+
 CREATE TABLE IF NOT EXISTS ide_instances (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

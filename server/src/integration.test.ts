@@ -24,6 +24,7 @@ import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration } from "./db/migrations.js";
 import { parsePlanOutput } from "./services/planParser.js";
+import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
 import { nowIso } from "./utils/time.js";
 
@@ -94,6 +95,13 @@ function runCli(args: string[]): CliRunResult {
     stderr: result.stderr ?? "",
     json
   };
+}
+
+function runGit(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  }
 }
 
 function createUser(userId = randomUUID()): string {
@@ -789,5 +797,86 @@ tasks:
 `),
       /Cyclic dependency/
     );
+  });
+
+  test("plan orchestration auto-extracts and auto-approves once per output hash", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-orchestrator-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Auto Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const plan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    projectDb.prepare("UPDATE tasks SET auto_start = 1, updated_at = ? WHERE id = ?").run(nowIso(), planId);
+
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "plan workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
+
+    const planDir = path.join(plan.workspace_path, ".ai-plan");
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(planDir, "latest-plan.yaml"),
+      [
+        "tasks:",
+        "  - id: task_a",
+        "    title: Build A",
+        "    prompt: Build A prompt",
+        "  - id: plan_b",
+        "    item_type: sub_plan",
+        "    title: Build B Plan",
+        "    prompt: Build B prompt",
+        "    depends_on: [task_a]",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    await runPlanOrchestrationPassForTests();
+    await runPlanOrchestrationPassForTests();
+
+    const revisions = projectDb
+      .prepare("SELECT * FROM plan_revisions WHERE plan_task_id = ? ORDER BY revision_number ASC")
+      .all(planId) as Array<{ status: string }>;
+    assert.equal(revisions.length, 1);
+    assert.equal(revisions[0]?.status, "approved");
+
+    const childTasks = projectDb
+      .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
+      .all(planId) as Array<{ id: string; source_plan_item_key: string; mode: string; status: string }>;
+    assert.equal(childTasks.length, 2);
+    assert.equal(childTasks[0]?.source_plan_item_key, "task_a");
+    assert.equal(childTasks[0]?.mode, "execution");
+    assert.equal(childTasks[1]?.source_plan_item_key, "plan_b");
+    assert.equal(childTasks[1]?.mode, "plan");
+
+    const depRows = projectDb.prepare("SELECT * FROM task_dependencies").all() as Array<{ task_id: string; dependency_task_id: string }>;
+    assert.equal(depRows.length, 1);
+    const taskA = projectDb
+      .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND source_plan_item_key = ?")
+      .get(planId, "task_a") as { id: string };
+    const planB = projectDb
+      .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND source_plan_item_key = ?")
+      .get(planId, "plan_b") as { id: string };
+    assert.equal(depRows[0]?.task_id, planB.id);
+    assert.equal(depRows[0]?.dependency_task_id, taskA.id);
+
+    const orchestration = projectDb
+      .prepare("SELECT * FROM plan_orchestration_state WHERE plan_task_id = ?")
+      .get(planId) as { last_approved_output_sha256: string | null; lock_token: string | null };
+    assert.equal(typeof orchestration.last_approved_output_sha256, "string");
+    assert.equal(orchestration.lock_token, null);
   });
 });
