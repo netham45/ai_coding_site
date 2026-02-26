@@ -37,6 +37,7 @@ import { runDecomposeForTask } from "./services/orchestration/jobs/decompose.js"
 import { runDeltaPlanForTask } from "./services/orchestration/jobs/deltaPlan.js";
 import { runEvaluateReadinessForTask } from "./services/orchestration/jobs/evaluateReadiness.js";
 import { runReReviewForTask } from "./services/orchestration/jobs/reReview.js";
+import { runSynthesizeForParent, runVerifyForParent } from "./services/orchestration/completion.js";
 import { observeNodeOutputMaterialChange } from "./services/orchestration/outputMonitor.js";
 import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
@@ -2519,5 +2520,148 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     assert.equal(secondReview.deltaPlanEnqueued.includes(planId), true);
     const secondDelta = await runDeltaPlanForTask({ projectDb, taskId: planId });
     assert.equal(secondDelta?.createdChildIds.length, 0);
+  });
+
+  test("synthesize persists summary and requirement-to-evidence coverage matrix artifacts", async () => {
+    const userId = createUser();
+    const basePath = randomPath("synthesize-artifacts");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Synthesis Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET task_prompt = ?, metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      "- Implement API endpoint\n- Add integration tests",
+      JSON.stringify({ schema_version: 1, tier: "plan" }),
+      nowIso(),
+      planId
+    );
+    const childId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Implement API endpoint",
+      mode: "execution",
+      status: "merged",
+      parentPlanTaskId: planId
+    });
+    projectDb.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(
+      "Implemented API endpoint and request validation.",
+      nowIso(),
+      childId
+    );
+
+    const synth = await runSynthesizeForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(synth);
+    assert.equal(synth?.artifact.template.id, "ip-09");
+    assert.equal(Array.isArray(synth?.artifact.coverage_matrix), true);
+    assert.equal((synth?.artifact.coverage_matrix.length ?? 0) >= 2, true);
+
+    const eventRow = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.synthesize.completed'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(planId) as { payload: string } | undefined;
+    assert.ok(eventRow?.payload);
+    const payload = JSON.parse(eventRow?.payload ?? "{}");
+    assert.equal(payload?.artifact?.summary?.length > 0, true);
+    assert.equal(Array.isArray(payload?.artifact?.coverage_matrix), true);
+    assert.equal(payload?.artifact?.coverage_matrix?.every((row: any) => typeof row?.requirement_id === "string"), true);
+    assert.equal(
+      payload?.artifact?.coverage_matrix?.every((row: any) => Array.isArray(row?.evidence)),
+      true
+    );
+
+    const metadataRow = projectDb.prepare("SELECT metadata_json FROM tasks WHERE id = ?").get(planId) as { metadata_json: string | null };
+    const metadata = JSON.parse(metadataRow.metadata_json ?? "{}");
+    assert.equal(Boolean(metadata?.custom?.synthesis_artifact_event_id), true);
+  });
+
+  test("verify failure deterministically enqueues bounded delta work and records verdict artifact", async () => {
+    const userId = createUser();
+    const basePath = randomPath("verify-delta-loop");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Verify Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET task_prompt = ?, metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      "- deliver backend endpoint\n- include integration tests",
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 1 } }),
+      nowIso(),
+      planId
+    );
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Only endpoint child",
+      mode: "execution",
+      status: "merged",
+      parentPlanTaskId: planId
+    });
+
+    const first = await runVerifyForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(first);
+    assert.equal(first?.artifact.template.id, "ip-10");
+    assert.equal(first?.artifact.verdict, "fail");
+    assert.equal(first?.artifact.delta_plan_enqueued, true);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+
+    const second = await runVerifyForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(second);
+    assert.equal(second?.artifact.verdict, "fail");
+    assert.equal(typeof second?.artifact.budget_exhausted, "boolean");
+    assert.equal(typeof second?.artifact.delta_plan_enqueued, "boolean");
+
+    const latestVerify = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.verify.completed'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(planId) as { payload: string } | undefined;
+    const verifyPayload = JSON.parse(latestVerify?.payload ?? "{}");
+    assert.equal(verifyPayload?.artifact?.verdict, "fail");
+
+    const metadataRow = projectDb.prepare("SELECT metadata_json FROM tasks WHERE id = ?").get(planId) as { metadata_json: string | null };
+    const metadata = JSON.parse(metadataRow.metadata_json ?? "{}");
+    assert.equal(metadata?.lifecycle?.synthesis_passed, true);
+    assert.equal(metadata?.lifecycle?.verification_passed, false);
+    assert.equal(metadata?.custom?.verification_verdict, "fail");
   });
 });
