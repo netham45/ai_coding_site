@@ -23,6 +23,11 @@ export type NodeDependencyRef = {
 export type NodeMetadata = {
   schema_version: 1;
   tier: NodeTier;
+  lifecycle?: {
+    synthesis_passed?: boolean;
+    verification_passed?: boolean;
+    last_transition_reason_code?: string;
+  };
   orchestration?: {
     auto_merge?: boolean;
     auto_start?: boolean;

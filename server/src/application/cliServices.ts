@@ -18,13 +18,14 @@ import { parsePlanOutput } from "../services/planParser.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
-import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
 import {
   buildDependencyDiagnostics,
   partitionDependenciesByTier,
   resolveAndValidateNodeDependencies,
   validateProposedNodeGraph
 } from "../services/orchestration/dependencyGraph.js";
+import { assertTaskStatusTransition, evaluateParentCompletionGuards } from "../services/orchestration/stateMachine.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import type {
   IdeInstanceRow,
@@ -45,7 +46,6 @@ import { nowIso } from "../utils/time.js";
 const mergeLocks = new Set<string>();
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 const MAX_SUB_PLAN_RECURSION_DEPTH = 6;
-const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "awaiting_children", "merge_conflict", "merge_ready"]);
 
 export type CliServiceErrorCode = "VALIDATION" | "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE";
 
@@ -334,37 +334,67 @@ function recordTaskTransition(params: {
   taskId: string;
   fromStatus: string;
   toStatus: string;
-  reason: string;
+  reasonCode: string;
+  reasonDetail?: string;
   actorUserId: string;
 }): void {
+  const reason = params.reasonDetail ? `${params.reasonCode}: ${params.reasonDetail}` : params.reasonCode;
   params.projectDb.prepare(
     `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, params.reason, params.actorUserId, nowIso());
+  ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, reason, params.actorUserId, nowIso());
 }
 
 function setTaskStatus(
   projectDb: Database.Database,
   task: TaskRow,
   nextStatus: TaskStatus,
-  reason: string,
-  actorUserId: string
+  reasonCode: string,
+  actorUserId: string,
+  updates?: {
+    mergedAt?: string | null;
+    mergedByUserId?: string | null;
+    headCommitSha?: string | null;
+    cancelReason?: string | null;
+  }
 ): TaskRow {
   const now = nowIso();
+  const hasBlockingDependencies = taskIsBlocked(projectDb, task.id);
+  const hasPendingChildren = task.mode === "plan" ? hasUnmergedPlanChildren(projectDb, task.id) : false;
+  const parentGuards = evaluateParentCompletionGuards(projectDb, task);
+  let transitionLifecycles: { fromLifecycle: string; toLifecycle: string };
+  try {
+    transitionLifecycles = assertTaskStatusTransition({
+      mode: task.mode,
+      fromStatus: task.status,
+      toStatus: nextStatus,
+      hasBlockingDependencies,
+      hasPendingChildren,
+      parentGuards
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
+  }
+
   projectDb.transaction(() => {
     if (nextStatus === "merged") {
-      projectDb.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+      projectDb
+        .prepare(
+          "UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
+        )
+        .run(nextStatus, updates?.mergedAt ?? now, updates?.mergedByUserId ?? actorUserId, updates?.headCommitSha ?? null, now, task.id);
     } else {
       projectDb
-        .prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?")
-        .run(nextStatus, now, task.id);
+        .prepare("UPDATE tasks SET status = ?, cancel_reason = ?, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?")
+        .run(nextStatus, updates?.cancelReason ?? null, now, task.id);
     }
     recordTaskTransition({
       projectDb,
       taskId: task.id,
       fromStatus: task.status,
       toStatus: nextStatus,
-      reason,
+      reasonCode,
+      reasonDetail: `lifecycle ${transitionLifecycles.fromLifecycle}->${transitionLifecycles.toLifecycle}`,
       actorUserId
     });
   })();
@@ -459,20 +489,31 @@ async function maybeAdvanceParentPlanAfterChildMerge(params: {
   }
 
   if (latestParent.status !== "merge_ready") {
-    latestParent = setTaskStatus(
-      params.projectDb,
-      latestParent,
-      "merge_ready",
-      "plan_children_merged_auto_merge_ready",
-      params.actorUserId
-    );
-    recordEvent({
-      projectId: latestParent.project_id,
-      taskId: latestParent.id,
-      eventType: "plan.mark_merge_ready",
-      payload: { auto: true, reason: "children_merged" },
-      database: params.projectDb
-    });
+    try {
+      latestParent = setTaskStatus(
+        params.projectDb,
+        latestParent,
+        "merge_ready",
+        "plan_children_merged_auto_merge_ready",
+        params.actorUserId
+      );
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.mark_merge_ready",
+        payload: { auto: true, reason: "children_merged" },
+        database: params.projectDb
+      });
+    } catch (error: any) {
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.parent_completion.blocked",
+        payload: { reason: String(error?.message ?? "parent completion guard failed") },
+        database: params.projectDb
+      });
+      return;
+    }
   }
 
   if (!latestParent.auto_merge_on_complete) {
@@ -588,6 +629,21 @@ function readPlanOutputSource(projectDb: Database.Database, plan: TaskRow): { ra
 
   const raw = getLatestSessionOutput(projectDb, plan.id);
   return { raw, source: "session_output", filePath };
+}
+
+function markPlanLifecycleFlags(projectDb: Database.Database, plan: TaskRow, updates: { synthesisPassed?: boolean; verificationPassed?: boolean; reasonCode: string }): void {
+  const metadataRead = readNodeMetadata({ projectDb, task: plan, dependencyTaskIds: [] });
+  const metadata = metadataRead.metadata;
+  metadata.lifecycle = {
+    synthesis_passed: updates.synthesisPassed ?? metadata.lifecycle?.synthesis_passed,
+    verification_passed: updates.verificationPassed ?? metadata.lifecycle?.verification_passed,
+    last_transition_reason_code: updates.reasonCode
+  };
+  writeNodeMetadata({
+    projectDb,
+    taskId: plan.id,
+    metadata
+  });
 }
 
 function nextRevisionNumber(projectDb: Database.Database, planTaskId: string): number {
@@ -1047,8 +1103,17 @@ export async function markTaskMergeReady(params: { userId: string; taskId: strin
     throw new CliServiceError("NOT_FOUND", "Task not found");
   }
   const { task, projectDb } = scopedTask;
-  if (!MERGE_READY_ALLOWED_FROM.has(task.status)) {
-    throw new CliServiceError("CONFLICT", `Task cannot be marked merge-ready from status ${task.status}`);
+  try {
+    assertTaskStatusTransition({
+      mode: task.mode,
+      fromStatus: task.status,
+      toStatus: "merge_ready",
+      hasBlockingDependencies: taskIsBlocked(projectDb, task.id),
+      hasPendingChildren: false,
+      parentGuards: evaluateParentCompletionGuards(projectDb, task)
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
   }
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
@@ -1122,22 +1187,12 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
 
       if (mergeResult.conflicted) {
         const conflictSummary = mergeResult.conflictFiles.join("\n");
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
-            conflictSummary || "conflicts detected",
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, task.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: task.id,
-            fromStatus: "merge_ready",
-            toStatus: "merge_conflict",
-            reason: "merge_conflict",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
+          conflictSummary || "conflicts detected",
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, task, "merge_conflict", "merge_conflict", params.userId);
         recordEvent({
           projectId: project.id,
           taskId: task.id,
@@ -1148,24 +1203,16 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
           }
         });
       } else {
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
-            mergeResult.mergeCommitSha,
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare(
-            "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
-          ).run(completedAt, params.userId, mergeResult.mergeCommitSha, completedAt, task.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: task.id,
-            fromStatus: "merge_ready",
-            toStatus: "merged",
-            reason: "merge_success",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+          mergeResult.mergeCommitSha,
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, task, "merged", "merge_success", params.userId, {
+          mergedAt: completedAt,
+          mergedByUserId: params.userId,
+          headCommitSha: mergeResult.mergeCommitSha
+        });
         recordEvent({
           projectId: project.id,
           taskId: task.id,
@@ -1221,11 +1268,20 @@ export async function markPlanMergeReady(params: { userId: string; planId: strin
     throw new CliServiceError("NOT_FOUND", "Plan not found");
   }
   const { plan, projectDb } = scopedPlan;
-  if (!MERGE_READY_ALLOWED_FROM.has(plan.status)) {
-    throw new CliServiceError("CONFLICT", `Plan cannot be marked merge-ready from status ${plan.status}`);
-  }
   if (hasUnmergedPlanChildren(projectDb, plan.id)) {
     throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
+  }
+  try {
+    assertTaskStatusTransition({
+      mode: plan.mode,
+      fromStatus: plan.status,
+      toStatus: "merge_ready",
+      hasBlockingDependencies: taskIsBlocked(projectDb, plan.id),
+      hasPendingChildren: false,
+      parentGuards: evaluateParentCompletionGuards(projectDb, plan)
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
   }
 
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
@@ -1303,22 +1359,12 @@ export async function mergePlan(params: { userId: string; planId: string }) {
 
       if (mergeResult.conflicted) {
         const conflictSummary = mergeResult.conflictFiles.join("\n");
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
-            conflictSummary || "conflicts detected",
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, plan.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: plan.id,
-            fromStatus: "merge_ready",
-            toStatus: "merge_conflict",
-            reason: "merge_conflict",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
+          conflictSummary || "conflicts detected",
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, plan, "merge_conflict", "merge_conflict", params.userId);
         recordEvent({
           projectId: project.id,
           taskId: plan.id,
@@ -1329,24 +1375,16 @@ export async function mergePlan(params: { userId: string; planId: string }) {
           }
         });
       } else {
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
-            mergeResult.mergeCommitSha,
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare(
-            "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
-          ).run(completedAt, params.userId, mergeResult.mergeCommitSha, completedAt, plan.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: plan.id,
-            fromStatus: "merge_ready",
-            toStatus: "merged",
-            reason: "merge_success",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+          mergeResult.mergeCommitSha,
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, plan, "merged", "merge_success", params.userId, {
+          mergedAt: completedAt,
+          mergedByUserId: params.userId,
+          headCommitSha: mergeResult.mergeCommitSha
+        });
         recordEvent({
           projectId: project.id,
           taskId: plan.id,
@@ -1770,6 +1808,10 @@ export async function extractPlan(params: { userId: string; planId: string }) {
         }
       }
     })();
+    markPlanLifecycleFlags(projectDb, plan, {
+      synthesisPassed: true,
+      reasonCode: "plan_synthesis_passed"
+    });
 
     recordEvent({
       projectId: plan.project_id,
@@ -2178,6 +2220,11 @@ export async function approvePlan(params: {
       }
     }
   })();
+  markPlanLifecycleFlags(projectDb, plan, {
+    synthesisPassed: true,
+    verificationPassed: true,
+    reasonCode: "plan_verification_passed"
+  });
 
   recordEvent({
     projectId: project.id,
