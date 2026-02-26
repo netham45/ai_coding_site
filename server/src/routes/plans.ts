@@ -10,9 +10,11 @@ import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
+import { partitionDependenciesByTier, validateProposedNodeGraph } from "../services/orchestration/dependencyGraph.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
+  NodeDependencyRef,
   PlanRevisionItemDependencyRow,
   PlanRevisionItemRow,
   PlanRevisionRow,
@@ -834,6 +836,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     taskId: string;
     workspacePath: string;
     dependencyTaskIds: string[];
+    dependencyNodeRefs: NodeDependencyRef[];
     mode: "execution" | "plan";
     parentPlanTaskId: string | null;
     autoStart: boolean;
@@ -886,6 +889,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       taskId,
       workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
       dependencyTaskIds: [],
+      dependencyNodeRefs: [],
       mode,
       parentPlanTaskId,
       autoStart,
@@ -906,6 +910,29 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       }
       return depTaskId;
     });
+    row.dependencyNodeRefs = depKeys.map((depKey, idx) => {
+      const depTaskId = row.dependencyTaskIds[idx];
+      const depRow = taskRows.find((candidate) => candidate.taskId === depTaskId);
+      return {
+        id: depTaskId,
+        tier: depRow?.mode === "plan" ? "plan" : "exec",
+        reason: `plan_item:${depKey}`
+      };
+    });
+  }
+  try {
+    validateProposedNodeGraph({
+      projectDb,
+      projectId: project.id,
+      proposedNodes: taskRows.map((row) => ({
+        id: row.taskId,
+        tier: row.mode === "plan" ? "plan" : "exec",
+        dependencies: row.dependencyNodeRefs
+      }))
+    });
+  } catch (error: any) {
+    res.status(400).json({ error: String(error?.message ?? "Invalid dependency graph") });
+    return;
   }
 
   try {
@@ -940,6 +967,12 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
       const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, req.user.id);
+      const nodeTier = row.mode === "plan" ? "plan" : "exec";
+      const materializedDependencies = [
+        ...row.dependencyNodeRefs,
+        { id: plan.id, tier: "plan" as const, reason: "created_from_plan_revision" }
+      ];
+      const partitionedDeps = partitionDependenciesByTier(materializedDependencies, nodeTier);
       const metadataJson = serializeNodeMetadata(
         buildInitialNodeMetadata({
           task: {
@@ -955,8 +988,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
             source_plan_item_key: row.item.item_key
           },
           dependencyTaskIds: row.dependencyTaskIds,
-          tier: row.mode === "plan" ? "plan" : "exec",
-          crossTierDependencies: [{ id: plan.id, tier: "plan", reason: "created_from_plan_revision" }]
+          tier: nodeTier,
+          sameTierDependencies: partitionedDeps.sameTierDependencies,
+          crossTierDependencies: partitionedDeps.crossTierDependencies
         })
       );
 

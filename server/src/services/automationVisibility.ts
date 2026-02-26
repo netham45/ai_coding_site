@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
-import type { PlanOrchestrationStateRow, TaskMode, TaskStatus, TaskTransitionRow } from "../types.js";
+import type { PlanOrchestrationStateRow, TaskMode, TaskRow, TaskStatus, TaskTransitionRow } from "../types.js";
+import { buildDependencyDiagnostics } from "./orchestration/dependencyGraph.js";
 
 type EventRow = {
   id: string;
@@ -78,14 +79,25 @@ function waitingDiagnostics(
   deps: BlockingTask[],
   children: BlockingTask[],
   latest: TaskTransitionRow | null,
-  lastAutomationAction: unknown
+  lastAutomationAction: unknown,
+  dependencyDiagnostics: ReturnType<typeof buildDependencyDiagnostics>
 ) {
+  const unresolved = dependencyDiagnostics.unresolved;
+  const unresolvedIds = unresolved.map((dep) => dep.id);
+  const unresolvedWithReasons = unresolved.map((dep) => ({
+    id: dep.id,
+    tier: dep.tier,
+    reason: dep.reason,
+    status: dep.status
+  }));
   if (task.status === "queued" && deps.length > 0) {
     return {
       waiting: true,
       reasonCode: "blocked_dependencies",
       reason: "Task is queued but blocked by unmerged dependencies.",
       dependencyBlockerTaskId: deps[0]?.id ?? null,
+      unresolvedDependencyIds: unresolvedIds,
+      unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
       latestTransition: latest,
@@ -98,6 +110,8 @@ function waitingDiagnostics(
       reasonCode: "awaiting_children",
       reason: "Plan is waiting for child tasks to merge.",
       dependencyBlockerTaskId: null,
+      unresolvedDependencyIds: unresolvedIds,
+      unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
       latestTransition: latest,
@@ -110,6 +124,8 @@ function waitingDiagnostics(
       reasonCode: "merge_conflict",
       reason: "Task is waiting for merge conflict resolution.",
       dependencyBlockerTaskId: null,
+      unresolvedDependencyIds: unresolvedIds,
+      unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
       latestTransition: latest,
@@ -122,6 +138,8 @@ function waitingDiagnostics(
       reasonCode: "waiting_input",
       reason: "Task is waiting for runtime input or follow-up automation.",
       dependencyBlockerTaskId: deps[0]?.id ?? null,
+      unresolvedDependencyIds: unresolvedIds,
+      unresolvedDependencyDetails: unresolvedWithReasons,
       blockingDependencies: deps,
       pendingChildren: children,
       latestTransition: latest,
@@ -133,6 +151,8 @@ function waitingDiagnostics(
     reasonCode: task.status,
     reason: `Task is currently ${task.status}.`,
     dependencyBlockerTaskId: deps[0]?.id ?? null,
+    unresolvedDependencyIds: unresolvedIds,
+    unresolvedDependencyDetails: unresolvedWithReasons,
     blockingDependencies: deps,
     pendingChildren: children,
     latestTransition: latest,
@@ -190,13 +210,22 @@ export function buildAutomationVisibility(projectDb: Database.Database, task: Ta
   const deps = blockingDependencies(projectDb, task.id);
   const children = task.mode === "plan" ? pendingChildren(projectDb, task.id) : [];
   const latest = latestTransition(projectDb, task.id);
+  const diagnosticTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow | undefined;
+  const dependencyDiagnostics = diagnosticTask
+    ? buildDependencyDiagnostics({ projectDb, task: diagnosticTask })
+    : {
+      node: { id: task.id, tier: "task" as const },
+      unresolved: [],
+      lineage: []
+    };
 
   return {
     automation: {
       lastAction: actions[0] ?? null,
       recentActions: actions
     },
-    waiting: waitingDiagnostics(task, deps, children, latest, actions[0] ?? null),
+    waiting: waitingDiagnostics(task, deps, children, latest, actions[0] ?? null, dependencyDiagnostics),
+    dependencyDiagnostics,
     orchestration: orchestrationState(projectDb, task)
   };
 }

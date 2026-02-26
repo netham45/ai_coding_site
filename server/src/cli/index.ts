@@ -28,6 +28,12 @@ type TaskEdit = {
   autoMergeOnComplete?: boolean;
 };
 
+type NodeDependencyRef = {
+  id: string;
+  tier?: "epoch" | "phase" | "plan" | "task" | "exec";
+  reason?: string;
+};
+
 type Services = typeof import("../application/cliServices.js");
 type OutputHint = "taskCreate" | "planCreate" | "planReview" | "default";
 
@@ -107,6 +113,32 @@ function csvFlag(parsed: ParsedArgv, name: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseDependencySpecs(rawDeps: string[]): { dependencyTaskIds: string[]; dependencyNodeRefs: NodeDependencyRef[] } {
+  const dependencyTaskIds: string[] = [];
+  const dependencyNodeRefs: NodeDependencyRef[] = [];
+  for (const raw of rawDeps) {
+    const hashIdx = raw.indexOf("#");
+    const withReasonSplit = hashIdx >= 0
+      ? { base: raw.slice(0, hashIdx), reason: raw.slice(hashIdx + 1).trim() || undefined }
+      : { base: raw, reason: undefined };
+    const atIdx = withReasonSplit.base.indexOf("@");
+    if (atIdx < 0) {
+      dependencyTaskIds.push(withReasonSplit.base.trim());
+      continue;
+    }
+    const id = withReasonSplit.base.slice(0, atIdx).trim();
+    const tierRaw = withReasonSplit.base.slice(atIdx + 1).trim();
+    const tier = ["epoch", "phase", "plan", "task", "exec"].includes(tierRaw)
+      ? (tierRaw as NodeDependencyRef["tier"])
+      : undefined;
+    if (!id) {
+      argError(`Invalid dependency spec: ${raw}`);
+    }
+    dependencyNodeRefs.push({ id, tier, reason: withReasonSplit.reason });
+  }
+  return { dependencyTaskIds, dependencyNodeRefs };
 }
 
 function maybeTaskEdits(parsed: ParsedArgv): TaskEdit[] | undefined {
@@ -223,6 +255,7 @@ function helpText(): string {
     "  tasks summary <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  tasks details <taskId> [--project-id <projectId>] [--plan-id <planId>]",
     "  tasks create --project <projectId> --title <title> --prompt <prompt> [--ai-command <cmd>] [--depends-on a,b] [--auto-merge]",
+    "    depends-on supports id or id@tier#reason entries",
     "  tasks start <taskId>",
     "  tasks input <taskId> --text <text>",
     "  tasks pull-main <taskId>",
@@ -328,6 +361,7 @@ async function handleTasks(args: string[], userId: string, services: Services): 
     });
   }
   if (subcommand === "create") {
+    const parsedDependencies = parseDependencySpecs(csvFlag(parsed, "depends-on"));
     return await services.createTask({
       userId,
       projectId: requireFlag(parsed, "project"),
@@ -335,7 +369,8 @@ async function handleTasks(args: string[], userId: string, services: Services): 
       taskPrompt: requireFlag(parsed, "prompt"),
       aiCommand: optionalFlag(parsed, "ai-command"),
       autoMerge: booleanFlag(parsed, "auto-merge"),
-      dependencyTaskIds: csvFlag(parsed, "depends-on")
+      dependencyTaskIds: parsedDependencies.dependencyTaskIds,
+      dependencyNodeRefs: parsedDependencies.dependencyNodeRefs
     });
   }
   if (subcommand === "start") {

@@ -24,9 +24,11 @@ import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
+import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
+import type { TaskRow } from "./types.js";
 import { nowIso } from "./utils/time.js";
 
 type ApiResponse = {
@@ -1595,11 +1597,18 @@ tasks:
     assert.equal(created.length, 0);
   });
 
-  test("approvePlan rejects dependencies that cross merge topology boundaries", async () => {
+  test("approvePlan allows cross-tier dependencies and persists dependency reasons", async () => {
     const userId = createUser();
     const basePath = randomPath("plan-topology-guard-project");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
     const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    fs.mkdirSync(basePath, { recursive: true });
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "topology test\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
 
     const planId = insertTask({
       projectDb,
@@ -1609,6 +1618,15 @@ tasks:
       mode: "plan",
       status: "waiting_input"
     });
+    const planRow = projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    fs.mkdirSync(planRow.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], planRow.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], planRow.workspace_path);
+    runGit(["config", "user.name", "Tests"], planRow.workspace_path);
+    fs.writeFileSync(path.join(planRow.workspace_path, "README.md"), "plan workspace\n", "utf8");
+    runGit(["add", "."], planRow.workspace_path);
+    runGit(["commit", "-m", "init"], planRow.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], planRow.workspace_path);
     const revisionId = randomUUID();
     const now = nowIso();
     projectDb
@@ -1654,34 +1672,115 @@ tasks:
       .prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)")
       .run(itemBId, "root_target");
 
+    const result = await approvePlan({
+      userId,
+      planId,
+      taskEdits: [
+        {
+          itemKey: "root_target",
+          title: "Root Target",
+          description: "Root Target",
+          parentPlanTaskId: null
+        },
+        {
+          itemKey: "parent_target",
+          title: "Parent Target",
+          description: "Parent Target"
+        }
+      ]
+    });
+
+    assert.equal(result.approvedTasks.length, 2);
+    const parentTarget = result.approvedTasks.find((task) => task.sourcePlanItemKey === "parent_target");
+    const sameTier = parentTarget?.nodeMetadata?.dependencies?.same_tier ?? [];
+    assert.equal(
+      sameTier.some((dep: any) => dep.reason === "plan_item:root_target"),
+      true
+    );
+  });
+
+  test("approvePlan rejects cycles with actionable dependency path", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-cycle-validation-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Cycle Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const revisionId = randomUUID();
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revisions (
+           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
+         ) VALUES (?, ?, 1, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
+      )
+      .run(revisionId, planId, "tasks:\n  - id: a\n    title: A\n    prompt: A\n  - id: b\n    title: B\n    prompt: B\n", userId, now);
+    const itemAId = randomUUID();
+    const itemBId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemAId, revisionId, "a", "A", "A", 1, now);
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemBId, revisionId, "b", "B", "B", 2, now);
+    projectDb.prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)").run(itemAId, "b");
+    projectDb.prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)").run(itemBId, "a");
+
     await assert.rejects(
-      async () =>
-        approvePlan({
-          userId,
-          planId,
-          taskEdits: [
-            {
-              itemKey: "root_target",
-              title: "Root Target",
-              description: "Root Target",
-              parentPlanTaskId: null
-            },
-            {
-              itemKey: "parent_target",
-              title: "Parent Target",
-              description: "Parent Target"
-            }
-          ]
-        }),
+      async () => approvePlan({ userId, planId }),
       (error: unknown) =>
         error instanceof CliServiceError
         && error.code === "VALIDATION"
-        && /dependency topology/i.test(error.message)
+        && /Cyclic dependency detected/i.test(error.message)
     );
+  });
 
-    const created = projectDb
-      .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ?")
-      .all(revisionId) as Array<{ id: string }>;
-    assert.equal(created.length, 0);
+  test("dependency diagnostics exposes unresolved ids, reasons, and lineage", () => {
+    const userId = createUser();
+    const basePath = randomPath("dependency-diagnostics-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Blocker",
+      status: "in_progress"
+    });
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Dependent",
+      status: "queued"
+    });
+    const metadata = {
+      schema_version: 1,
+      tier: "task",
+      dependencies: {
+        same_tier: [{ id: blockerId, tier: "task", reason: "await_blocker_merge" }]
+      }
+    };
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(metadata), nowIso(), taskId);
+
+    const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow;
+    const diagnostics = buildDependencyDiagnostics({ projectDb, task });
+    assert.equal(diagnostics.unresolved[0]?.id, blockerId);
+    assert.equal(diagnostics.unresolved[0]?.reason, "await_blocker_merge");
+    assert.equal(diagnostics.lineage[0]?.fromId, taskId);
+    assert.equal(diagnostics.lineage[0]?.toId, blockerId);
   });
 });
