@@ -234,16 +234,23 @@ export async function prepareIdeWorkspace(params: {
   workspacePath: string;
   tmuxSocketPath?: string | null;
   tmuxSessionName?: string | null;
+  hasSessionHistory?: boolean;
 }): Promise<string> {
   const hasTmuxTarget = Boolean(params.tmuxSocketPath && params.tmuxSessionName);
-  if (!hasTmuxTarget) {
+  const hasSessionHistory = Boolean(params.hasSessionHistory);
+  if (!hasTmuxTarget && !hasSessionHistory) {
     return params.workspacePath;
   }
 
   const workspaceFilePath = path.join(params.workspacePath, `.ai-coding-site-${compactId(params.taskId)}.code-workspace`);
-  const tmuxSocketPath = params.tmuxSocketPath as string;
-  const tmuxSessionName = params.tmuxSessionName as string;
-  const attachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+  const resumeCommand = `cd ${shellSingleQuote(params.workspacePath)} && codex resume --last`;
+  let attachCommand = resumeCommand;
+  if (hasTmuxTarget) {
+    const tmuxSocketPath = params.tmuxSocketPath as string;
+    const tmuxSessionName = params.tmuxSessionName as string;
+    const tmuxAttachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+    attachCommand = hasSessionHistory ? `${tmuxAttachCommand} || ${resumeCommand}` : tmuxAttachCommand;
+  }
 
   const workspaceSpec = {
     folders: [{ path: params.workspacePath }],
