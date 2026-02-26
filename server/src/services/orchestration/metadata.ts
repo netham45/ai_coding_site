@@ -187,6 +187,7 @@ export function buildInitialNodeMetadata(params: {
   task: MetadataReadableTask;
   dependencyTaskIds?: string[];
   tier?: NodeTier;
+  sameTierDependencies?: NodeDependencyRef[];
   crossTierDependencies?: NodeDependencyRef[];
 }): NodeMetadata {
   const base = normalizeMetadataShape({
@@ -194,9 +195,9 @@ export function buildInitialNodeMetadata(params: {
     dependencyTaskIds: params.dependencyTaskIds ?? [],
     metadataObj: params.tier ? { tier: params.tier } : null
   });
-  if (params.crossTierDependencies?.length) {
+  if ((params.sameTierDependencies?.length ?? 0) > 0 || (params.crossTierDependencies?.length ?? 0) > 0) {
     base.dependencies = {
-      same_tier: base.dependencies?.same_tier,
+      same_tier: params.sameTierDependencies?.length ? params.sameTierDependencies : base.dependencies?.same_tier,
       cross_tier: params.crossTierDependencies
     };
   }

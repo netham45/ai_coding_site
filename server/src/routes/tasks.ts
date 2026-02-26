@@ -24,6 +24,11 @@ import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
+import {
+  buildDependencyDiagnostics,
+  partitionDependenciesByTier,
+  resolveAndValidateNodeDependencies
+} from "../services/orchestration/dependencyGraph.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -33,7 +38,12 @@ const createTaskSchema = z.object({
   taskPrompt: z.string().min(1).max(12000),
   aiCommand: z.string().min(1).max(500).optional(),
   autoMerge: z.boolean().optional(),
-  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional()
+  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional(),
+  dependencyNodeRefs: z.array(z.object({
+    id: z.string().min(1).max(200),
+    tier: z.enum(["epoch", "phase", "plan", "task", "exec"]).optional(),
+    reason: z.string().min(1).max(500).optional()
+  })).max(200).optional()
 });
 
 const patchTaskSchema = z.object({
@@ -241,33 +251,6 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     createdAt: task.created_at,
     updatedAt: task.updated_at
   };
-}
-
-function resolveTaskDependencies(params: {
-  projectDb: Database.Database;
-  projectId: string;
-  dependencyTaskIds: string[];
-  taskId?: string;
-}): TaskRow[] {
-  const unique = [...new Set(params.dependencyTaskIds)];
-  if (unique.length !== params.dependencyTaskIds.length) {
-    throw new Error("Duplicate dependency ids are not allowed");
-  }
-  if (params.taskId && unique.includes(params.taskId)) {
-    throw new Error("A task cannot depend on itself");
-  }
-  if (unique.length === 0) {
-    return [];
-  }
-
-  const placeholders = unique.map(() => "?").join(", ");
-  const rows = params.projectDb
-    .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
-    .all(params.projectId, ...unique) as TaskRow[];
-  if (rows.length !== unique.length) {
-    throw new Error("One or more dependencies were not found in this project");
-  }
-  return rows;
 }
 
 function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
@@ -607,16 +590,25 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
   const autoMerge = Boolean(input.autoMerge);
 
-  let dependencies: TaskRow[];
+  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
   try {
-    dependencies = resolveTaskDependencies({ projectDb, projectId: project.id, dependencyTaskIds, taskId: id });
+    dependencyResolution = resolveAndValidateNodeDependencies({
+      projectDb,
+      projectId: project.id,
+      nodeId: id,
+      nodeTier: "task",
+      dependencyTaskIds,
+      dependencyNodeRefs: input.dependencyNodeRefs
+    });
   } catch (error: any) {
     res.status(400).json({ error: String(error?.message ?? "Invalid dependencies") });
     return;
   }
 
-  const unresolvedDependencies = dependencies.filter((x) => x.status !== "merged");
+  const dependencies = dependencyResolution.taskDependencies;
+  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
   const isBlocked = unresolvedDependencies.length > 0;
+  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, "task");
 
   let baseCommitSha: string;
   try {
@@ -647,7 +639,9 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
           source_plan_item_key: null
         },
         dependencyTaskIds: dependencies.map((dependency) => dependency.id),
-        tier: "task"
+        tier: "task",
+        sameTierDependencies: partitionedDeps.sameTierDependencies,
+        crossTierDependencies: partitionedDeps.crossTierDependencies
       })
     );
     projectDb.prepare(
@@ -698,6 +692,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha,
       dependencyTaskIds: dependencies.map((x) => x.id),
+      dependencyNodeRefs: dependencyResolution.normalizedDependencies,
       blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
       blocked: isBlocked
     }
@@ -745,6 +740,7 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     gitStatus = null;
   }
   const visibility = buildAutomationVisibility(projectDb, task);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
 
   res.json({
     task: serializeTask(projectDb, task),
@@ -753,10 +749,21 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
   });
+});
+
+tasksRouter.get("/tasks/:taskId/dependency-diagnostics", (req, res) => {
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
+  if (!scopedTask) return;
+  const diagnostics = buildDependencyDiagnostics({ projectDb: scopedTask.projectDb, task: scopedTask.task });
+  res.json({ diagnostics });
 });
 
 tasksRouter.patch("/tasks/:taskId", (req, res) => {

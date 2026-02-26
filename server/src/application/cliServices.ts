@@ -19,10 +19,17 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
+import {
+  buildDependencyDiagnostics,
+  partitionDependenciesByTier,
+  resolveAndValidateNodeDependencies,
+  validateProposedNodeGraph
+} from "../services/orchestration/dependencyGraph.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import type {
   IdeInstanceRow,
   MergeRecordRow,
+  NodeDependencyRef,
   PlanRevisionItemDependencyRow,
   PlanRevisionItemRow,
   PlanRevisionRow,
@@ -374,33 +381,6 @@ function latestIde(projectDb: Database.Database, taskId: string): IdeInstanceRow
   return projectDb
     .prepare("SELECT * FROM ide_instances WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1")
     .get(taskId) as IdeInstanceRow | undefined;
-}
-
-function resolveTaskDependencies(params: {
-  projectDb: Database.Database;
-  projectId: string;
-  dependencyTaskIds: string[];
-  taskId?: string;
-}): TaskRow[] {
-  const unique = [...new Set(params.dependencyTaskIds)];
-  if (unique.length !== params.dependencyTaskIds.length) {
-    throw new CliServiceError("VALIDATION", "Duplicate dependency ids are not allowed");
-  }
-  if (params.taskId && unique.includes(params.taskId)) {
-    throw new CliServiceError("VALIDATION", "A task cannot depend on itself");
-  }
-  if (unique.length === 0) {
-    return [];
-  }
-
-  const placeholders = unique.map(() => "?").join(", ");
-  const rows = params.projectDb
-    .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
-    .all(params.projectId, ...unique) as TaskRow[];
-  if (rows.length !== unique.length) {
-    throw new CliServiceError("VALIDATION", "One or more dependencies were not found in this project");
-  }
-  return rows;
 }
 
 function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
@@ -780,6 +760,7 @@ export async function createTask(params: {
   aiCommand?: string;
   autoMerge?: boolean;
   dependencyTaskIds?: string[];
+  dependencyNodeRefs?: NodeDependencyRef[];
 }) {
   const project = projectForUser(params.projectId, params.userId);
   if (!project) {
@@ -803,9 +784,23 @@ export async function createTask(params: {
   const effectivePrompt = buildEffectivePrompt(project, params.taskPrompt);
   const dependencyTaskIds = params.dependencyTaskIds ?? [];
   const autoMerge = Boolean(params.autoMerge);
-  const dependencies = resolveTaskDependencies({ projectDb, projectId: project.id, dependencyTaskIds, taskId: id });
-  const unresolvedDependencies = dependencies.filter((x) => x.status !== "merged");
+  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
+  try {
+    dependencyResolution = resolveAndValidateNodeDependencies({
+      projectDb,
+      projectId: project.id,
+      nodeId: id,
+      nodeTier: "task",
+      dependencyTaskIds,
+      dependencyNodeRefs: params.dependencyNodeRefs
+    });
+  } catch (error: any) {
+    throw new CliServiceError("VALIDATION", String(error?.message ?? "Invalid dependencies"));
+  }
+  const dependencies = dependencyResolution.taskDependencies;
+  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
   const isBlocked = unresolvedDependencies.length > 0;
+  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, "task");
 
   let baseCommitSha: string;
   try {
@@ -834,7 +829,9 @@ export async function createTask(params: {
           source_plan_item_key: null
         },
         dependencyTaskIds: dependencies.map((dependency) => dependency.id),
-        tier: "task"
+        tier: "task",
+        sameTierDependencies: partitionedDeps.sameTierDependencies,
+        crossTierDependencies: partitionedDeps.crossTierDependencies
       })
     );
     projectDb.prepare(
@@ -883,6 +880,7 @@ export async function createTask(params: {
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha,
       dependencyTaskIds: dependencies.map((x) => x.id),
+      dependencyNodeRefs: dependencyResolution.normalizedDependencies,
       blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
       blocked: isBlocked
     }
@@ -913,6 +911,7 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     gitStatus = null;
   }
   const visibility = buildAutomationVisibility(projectDb, task);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
 
   return {
     task: serializeTask(projectDb, task),
@@ -921,6 +920,7 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
@@ -1959,6 +1959,7 @@ export async function approvePlan(params: {
     taskId: string;
     workspacePath: string;
     dependencyTaskIds: string[];
+    dependencyNodeRefs: NodeDependencyRef[];
     mode: "execution" | "plan";
     parentPlanTaskId: string | null;
     autoStart: boolean;
@@ -2023,6 +2024,7 @@ export async function approvePlan(params: {
       taskId,
       workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
       dependencyTaskIds: [],
+      dependencyNodeRefs: [],
       mode,
       parentPlanTaskId,
       autoStart,
@@ -2043,27 +2045,29 @@ export async function approvePlan(params: {
       }
       return depTaskId;
     });
+    row.dependencyNodeRefs = depKeys.map((depKey, idx) => {
+      const depTaskId = row.dependencyTaskIds[idx];
+      const depRow = taskRows.find((candidate) => candidate.taskId === depTaskId);
+      const depTier = depRow?.mode === "plan" ? "plan" : "exec";
+      return {
+        id: depTaskId,
+        tier: depTier,
+        reason: `plan_item:${depKey}`
+      };
+    });
   }
-  const rowByTaskId = new Map(taskRows.map((row) => [row.taskId, row]));
-  for (const row of taskRows) {
-    for (const dependencyTaskId of row.dependencyTaskIds) {
-      const dependencyRow = rowByTaskId.get(dependencyTaskId);
-      if (!dependencyRow) {
-        throw new CliServiceError("CONFLICT", "Revision dependency resolution failed");
-      }
-      if (row.parentPlanTaskId !== dependencyRow.parentPlanTaskId) {
-        throw new CliServiceError(
-          "VALIDATION",
-          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different parent plans`
-        );
-      }
-      if (row.sourcePath !== dependencyRow.sourcePath || row.sourceBranch !== dependencyRow.sourceBranch) {
-        throw new CliServiceError(
-          "VALIDATION",
-          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different merge targets`
-        );
-      }
-    }
+  try {
+    validateProposedNodeGraph({
+      projectDb,
+      projectId: project.id,
+      proposedNodes: taskRows.map((row) => ({
+        id: row.taskId,
+        tier: row.mode === "plan" ? "plan" : "exec",
+        dependencies: row.dependencyNodeRefs
+      }))
+    });
+  } catch (error: any) {
+    throw new CliServiceError("VALIDATION", String(error?.message ?? "Invalid dependency graph"));
   }
 
   try {
@@ -2095,6 +2099,12 @@ export async function approvePlan(params: {
       const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
       const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, params.userId);
+      const nodeTier = row.mode === "plan" ? "plan" : "exec";
+      const materializedDependencies = [
+        ...row.dependencyNodeRefs,
+        { id: plan.id, tier: "plan" as const, reason: "created_from_plan_revision" }
+      ];
+      const partitionedDeps = partitionDependenciesByTier(materializedDependencies, nodeTier);
       const metadataJson = serializeNodeMetadata(
         buildInitialNodeMetadata({
           task: {
@@ -2110,8 +2120,9 @@ export async function approvePlan(params: {
             source_plan_item_key: row.item.item_key
           },
           dependencyTaskIds: row.dependencyTaskIds,
-          tier: row.mode === "plan" ? "plan" : "exec",
-          crossTierDependencies: [{ id: plan.id, tier: "plan", reason: "created_from_plan_revision" }]
+          tier: nodeTier,
+          sameTierDependencies: partitionedDeps.sameTierDependencies,
+          crossTierDependencies: partitionedDeps.crossTierDependencies
         })
       );
 
