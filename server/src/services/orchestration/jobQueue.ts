@@ -16,7 +16,9 @@ export type OrchestrationJobType =
   | "evaluate_readiness"
   | "decompose"
   | "re_review"
-  | "delta_plan";
+  | "delta_plan"
+  | "synthesize"
+  | "verify";
 
 type PendingJobPayload = {
   schemaVersion: 1;

@@ -19,6 +19,7 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
+import { runParentCompletionFeedbackLoop } from "../services/orchestration/completion.js";
 import {
   buildDependencyDiagnostics,
   partitionDependenciesByTier,
@@ -502,6 +503,27 @@ async function maybeAdvanceParentPlanAfterChildMerge(params: {
   }
 
   if (latestParent.status !== "merge_ready") {
+    const completion = await runParentCompletionFeedbackLoop({
+      projectDb: params.projectDb,
+      projectId: latestParent.project_id,
+      parentTaskId: latestParent.id
+    });
+    if (!completion?.verified) {
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.parent_completion.blocked",
+        payload: {
+          reason: completion?.budgetExhausted ? "verification_failed_budget_exhausted" : "verification_failed_delta_planned"
+        },
+        database: params.projectDb
+      });
+      return;
+    }
+
+    latestParent = refreshTaskRow(params.projectDb, latestParent.id);
+    if (!latestParent) return;
+
     try {
       latestParent = setTaskStatus(
         params.projectDb,

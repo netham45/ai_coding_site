@@ -94,7 +94,7 @@ export function buildEffectivePrompt(project: ProjectRow, taskPrompt: string, de
 
 export function buildTierOrchestrationPrompt(params: {
   tier: NodeTier;
-  action: "decompose" | "evaluate_readiness";
+  action: "decompose" | "evaluate_readiness" | "synthesize" | "verify";
   nodeId: string;
   nodeTitle: string;
   nodePrompt: string;

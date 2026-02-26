@@ -11,7 +11,15 @@ export type OrchestrationHookName =
   | "on_timer_tick";
 
 export type OrchestrationJobRequest = {
-  jobType: "task_queue_dispatch" | "plan_orchestration_pass" | "evaluate_readiness" | "decompose" | "re_review" | "delta_plan";
+  jobType:
+    | "task_queue_dispatch"
+    | "plan_orchestration_pass"
+    | "evaluate_readiness"
+    | "decompose"
+    | "re_review"
+    | "delta_plan"
+    | "synthesize"
+    | "verify";
   idempotencyKey: string;
   debounceMs?: number;
   dedupeWindowMs?: number;
@@ -75,6 +83,14 @@ function isCompletionStatusChange(context: EventContext): boolean {
   return toStatus === "merged" || toStatus === "merge_ready" || toStatus === "failed" || toStatus === "merge_conflict" || toStatus === "cancelled";
 }
 
+function isChildWorkFinishedChange(context: EventContext): boolean {
+  if (context.eventType !== "task.status_changed") return false;
+  const payload = asObject(context.payload);
+  if (!payload) return false;
+  const toStatus = typeof payload.toStatus === "string" ? payload.toStatus : "";
+  return toStatus === "merged" || toStatus === "failed" || toStatus === "merge_conflict" || toStatus === "cancelled";
+}
+
 function jobsForHook(hookName: OrchestrationHookName, context: EventContext): OrchestrationJobRequest[] {
   const taskScopedJobs: OrchestrationJobRequest[] =
     context.taskId && context.projectId
@@ -107,6 +123,27 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
     taskScopedJobs.push({
       jobType: "re_review",
       idempotencyKey: buildKey(`hook:${hookName}:re_review`, context),
+      debounceMs: COMPLETION_CHANGE_DEBOUNCE_MS,
+      dedupeWindowMs: COMPLETION_CHANGE_DEDUPE_MS,
+      projectId: context.projectId,
+      taskId: context.taskId,
+      payload: { hookName, eventType: context.eventType }
+    });
+  }
+
+  if (hookName === "on_status_changed" && context.taskId && context.projectId && isChildWorkFinishedChange(context)) {
+    taskScopedJobs.push({
+      jobType: "synthesize",
+      idempotencyKey: buildKey(`hook:${hookName}:synthesize`, context),
+      debounceMs: COMPLETION_CHANGE_DEBOUNCE_MS,
+      dedupeWindowMs: COMPLETION_CHANGE_DEDUPE_MS,
+      projectId: context.projectId,
+      taskId: context.taskId,
+      payload: { hookName, eventType: context.eventType }
+    });
+    taskScopedJobs.push({
+      jobType: "verify",
+      idempotencyKey: buildKey(`hook:${hookName}:verify`, context),
       debounceMs: COMPLETION_CHANGE_DEBOUNCE_MS,
       dedupeWindowMs: COMPLETION_CHANGE_DEDUPE_MS,
       projectId: context.projectId,
