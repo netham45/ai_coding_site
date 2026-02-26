@@ -377,6 +377,7 @@ function setTaskStatus(
   }
 
   projectDb.transaction(() => {
+    const fromStatus = task.status;
     if (nextStatus === "merged") {
       projectDb
         .prepare(
@@ -391,11 +392,23 @@ function setTaskStatus(
     recordTaskTransition({
       projectDb,
       taskId: task.id,
-      fromStatus: task.status,
+      fromStatus,
       toStatus: nextStatus,
       reasonCode,
       reasonDetail: `lifecycle ${transitionLifecycles.fromLifecycle}->${transitionLifecycles.toLifecycle}`,
       actorUserId
+    });
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "task.status_changed",
+      payload: {
+        fromStatus,
+        toStatus: nextStatus,
+        reasonCode,
+        lifecycle: transitionLifecycles
+      },
+      database: projectDb
     });
   })();
   return projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
