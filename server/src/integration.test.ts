@@ -1195,9 +1195,81 @@ describe("integration: CLI subcommands", () => {
       .get(parentPlanId) as { status: string };
     assert.equal(parentMergeRecord.status, "conflict");
 
+    const mergeConflictEvent = projectDb
+      .prepare("SELECT payload FROM events WHERE task_id = ? AND event_type = 'plan.merge_conflict' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { payload: string } | undefined;
+    assert.equal(Boolean(mergeConflictEvent), true);
+    const mergeConflictPayload = JSON.parse(String(mergeConflictEvent?.payload ?? "{}")) as {
+      conflictResolution?: {
+        prompt_template_path?: string;
+        conflict_resolution?: {
+          patch_plan?: unknown[];
+          escalation?: { required?: boolean };
+        };
+      };
+    };
+    assert.equal(
+      mergeConflictPayload.conflictResolution?.prompt_template_path,
+      "prompts/intent-preserving-conflict-resolution.md"
+    );
+    assert.equal(
+      Array.isArray(mergeConflictPayload.conflictResolution?.conflict_resolution?.patch_plan),
+      true
+    );
+    assert.equal(
+      Boolean(mergeConflictPayload.conflictResolution?.conflict_resolution?.escalation?.required),
+      true
+    );
+
+    const mergeFailedHookEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'orchestration.hook.on_merge_failed' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { event_type: string } | undefined;
+    assert.equal(mergeFailedHookEvent?.event_type, "orchestration.hook.on_merge_failed");
+
     const recoverReady = runCli(["ready_merge", "plan", parentPlanId, "--json"]);
     assert.equal(recoverReady.code, 0);
     assert.equal(recoverReady.json?.plan?.status, "merge_ready");
+  });
+
+  test("merge plan enforces verification gate even when status is merge_ready", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-merge-gate-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Plan Missing Verification",
+      mode: "plan",
+      status: "merge_ready"
+    });
+    const planPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string }).workspace_path;
+
+    runGit(["clone", "--branch", "main", basePath, planPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], planPath);
+    runGit(["config", "user.name", "Tests"], planPath);
+    runGit(["switch", "-c", `task/${planId}`], planPath);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: false } }),
+      nowIso(),
+      planId
+    );
+
+    const mergePlanAttempt = runCli(["merge", "plan", planId, "--json"]);
+    assert.equal(mergePlanAttempt.code, 4);
+    assert.match(mergePlanAttempt.stderr, /Merge gates failed/);
+    assert.match(mergePlanAttempt.stderr, /plan_verification_passed/);
   });
 
   test("help output includes command examples for new subcommands", () => {
