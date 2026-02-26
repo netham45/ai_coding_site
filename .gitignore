@@ -12,3 +12,4 @@ repos/*
 .ai-plan/
 
 server/.tmp/
+.ai-task-summary.md
