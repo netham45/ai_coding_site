@@ -715,6 +715,202 @@ describe("integration: CLI subcommands", () => {
     assert.match(mergePlan.stderr, /Plan has child tasks that are not merged/);
   });
 
+  test("merging the last child auto-marks parent plan merge-ready and auto-merges when enabled", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-auto-merge-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const grandPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Grand Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const parentPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Parent Plan",
+      mode: "plan",
+      status: "awaiting_children",
+      parentPlanTaskId: grandPlanId
+    });
+    const childAId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Child A",
+      status: "merge_ready",
+      parentPlanTaskId: parentPlanId
+    });
+    const childBId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Child B",
+      status: "merge_ready",
+      parentPlanTaskId: parentPlanId
+    });
+    projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+
+    const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
+    const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;
+    const childAPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(childAId) as { workspace_path: string }).workspace_path;
+    const childBPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(childBId) as { workspace_path: string }).workspace_path;
+
+    runGit(["clone", "--branch", "main", basePath, grandPlanPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], grandPlanPath);
+    runGit(["config", "user.name", "Tests"], grandPlanPath);
+    runGit(["switch", "-c", `task/${grandPlanId}`], grandPlanPath);
+
+    runGit(["clone", "--branch", `task/${grandPlanId}`, grandPlanPath, parentPlanPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], parentPlanPath);
+    runGit(["config", "user.name", "Tests"], parentPlanPath);
+    runGit(["switch", "-c", `task/${parentPlanId}`], parentPlanPath);
+
+    runGit(["clone", "--branch", `task/${parentPlanId}`, parentPlanPath, childAPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], childAPath);
+    runGit(["config", "user.name", "Tests"], childAPath);
+    runGit(["switch", "-c", `task/${childAId}`], childAPath);
+    fs.writeFileSync(path.join(childAPath, "child-a.txt"), "child a\n", "utf8");
+    runGit(["add", "."], childAPath);
+    runGit(["commit", "-m", "child a"], childAPath);
+
+    runGit(["clone", "--branch", `task/${parentPlanId}`, parentPlanPath, childBPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], childBPath);
+    runGit(["config", "user.name", "Tests"], childBPath);
+    runGit(["switch", "-c", `task/${childBId}`], childBPath);
+    fs.writeFileSync(path.join(childBPath, "child-b.txt"), "child b\n", "utf8");
+    runGit(["add", "."], childBPath);
+    runGit(["commit", "-m", "child b"], childBPath);
+
+    const mergeChildA = runCli(["merge", "task", childAId, "--json"]);
+    assert.equal(mergeChildA.code, 0);
+    const parentAfterFirst = projectDb.prepare("SELECT status FROM tasks WHERE id = ?").get(parentPlanId) as { status: string };
+    assert.equal(parentAfterFirst.status, "awaiting_children");
+
+    const mergeChildB = runCli(["merge", "task", childBId, "--json"]);
+    assert.equal(mergeChildB.code, 0);
+    const parentAutoMergeFailure = projectDb
+      .prepare("SELECT payload FROM events WHERE task_id = ? AND event_type = 'plan.auto_merge_on_complete.failed' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { payload: string } | undefined;
+    assert.equal(parentAutoMergeFailure, undefined, parentAutoMergeFailure?.payload ?? "");
+
+    const parentAfterSecond = projectDb.prepare("SELECT status FROM tasks WHERE id = ?").get(parentPlanId) as { status: string };
+    assert.equal(parentAfterSecond.status, "merged");
+
+    const parentMergeRecord = projectDb
+      .prepare("SELECT status FROM merge_records WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { status: string };
+    assert.equal(parentMergeRecord.status, "merged");
+
+    const grandAfterParentMerged = projectDb.prepare("SELECT status FROM tasks WHERE id = ?").get(grandPlanId) as { status: string };
+    assert.equal(grandAfterParentMerged.status, "merge_ready");
+  });
+
+  test("plan auto-merge on completion records conflict and supports merge-ready recovery", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-auto-merge-conflict-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "shared.txt"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const grandPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Grand Plan Conflict",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const parentPlanId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Parent Plan Conflict",
+      mode: "plan",
+      status: "awaiting_children",
+      parentPlanTaskId: grandPlanId
+    });
+    const childId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Child Conflict",
+      status: "merge_ready",
+      parentPlanTaskId: parentPlanId
+    });
+    projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+
+    const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
+    const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;
+    const childPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(childId) as { workspace_path: string }).workspace_path;
+
+    runGit(["clone", "--branch", "main", basePath, grandPlanPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], grandPlanPath);
+    runGit(["config", "user.name", "Tests"], grandPlanPath);
+    runGit(["switch", "-c", `task/${grandPlanId}`], grandPlanPath);
+
+    runGit(["clone", "--branch", `task/${grandPlanId}`, grandPlanPath, parentPlanPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], parentPlanPath);
+    runGit(["config", "user.name", "Tests"], parentPlanPath);
+    runGit(["switch", "-c", `task/${parentPlanId}`], parentPlanPath);
+
+    fs.writeFileSync(path.join(grandPlanPath, "shared.txt"), "grand version\n", "utf8");
+    runGit(["add", "shared.txt"], grandPlanPath);
+    runGit(["commit", "-m", "grand conflict change"], grandPlanPath);
+
+    runGit(["clone", "--branch", `task/${parentPlanId}`, parentPlanPath, childPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], childPath);
+    runGit(["config", "user.name", "Tests"], childPath);
+    runGit(["switch", "-c", `task/${childId}`], childPath);
+    fs.writeFileSync(path.join(childPath, "shared.txt"), "parent version\n", "utf8");
+    runGit(["add", "shared.txt"], childPath);
+    runGit(["commit", "-m", "child conflict change"], childPath);
+
+    const mergeChild = runCli(["merge", "task", childId, "--json"]);
+    assert.equal(mergeChild.code, 0);
+    const parentAutoMergeFailure = projectDb
+      .prepare("SELECT payload FROM events WHERE task_id = ? AND event_type = 'plan.auto_merge_on_complete.failed' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { payload: string } | undefined;
+    assert.equal(parentAutoMergeFailure, undefined, parentAutoMergeFailure?.payload ?? "");
+
+    const parentAfterAutoMerge = projectDb.prepare("SELECT status FROM tasks WHERE id = ?").get(parentPlanId) as { status: string };
+    assert.equal(parentAfterAutoMerge.status, "merge_conflict");
+
+    const parentMergeRecord = projectDb
+      .prepare("SELECT status FROM merge_records WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { status: string };
+    assert.equal(parentMergeRecord.status, "conflict");
+
+    const recoverReady = runCli(["ready_merge", "plan", parentPlanId, "--json"]);
+    assert.equal(recoverReady.code, 0);
+    assert.equal(recoverReady.json?.plan?.status, "merge_ready");
+  });
+
   test("help output includes command examples for new subcommands", () => {
     const help = runCli(["--help"]);
     assert.equal(help.code, 0);

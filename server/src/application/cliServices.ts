@@ -35,7 +35,7 @@ import { nowIso } from "../utils/time.js";
 
 const mergeLocks = new Set<string>();
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
-const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "merge_conflict", "merge_ready"]);
+const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "awaiting_children", "merge_conflict", "merge_ready"]);
 
 export type CliServiceErrorCode = "VALIDATION" | "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE";
 
@@ -412,6 +412,95 @@ function hasUnmergedPlanChildren(projectDb: Database.Database, planTaskId: strin
     .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' LIMIT 1")
     .get(planTaskId) as { id: string } | undefined;
   return Boolean(row?.id);
+}
+
+function refreshTaskRow(projectDb: Database.Database, taskId: string): TaskRow | undefined {
+  return projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+}
+
+async function maybeAdvanceParentPlanAfterChildMerge(params: {
+  project: ProjectRow;
+  projectDb: Database.Database;
+  mergedTask: TaskRow;
+  actorUserId: string;
+}): Promise<void> {
+  if (!params.mergedTask.parent_plan_task_id) {
+    return;
+  }
+
+  const parentPlan = planTaskInProject(params.projectDb, params.project.id, params.mergedTask.parent_plan_task_id);
+  if (!parentPlan) {
+    return;
+  }
+
+  if (hasUnmergedPlanChildren(params.projectDb, parentPlan.id)) {
+    if (["queued", "in_progress", "waiting_input"].includes(parentPlan.status)) {
+      const awaitingChildren = setTaskStatus(
+        params.projectDb,
+        parentPlan,
+        "awaiting_children",
+        "plan_waiting_for_children",
+        params.actorUserId
+      );
+      recordEvent({
+        projectId: awaitingChildren.project_id,
+        taskId: awaitingChildren.id,
+        eventType: "plan.awaiting_children",
+        payload: {},
+        database: params.projectDb
+      });
+    }
+    return;
+  }
+
+  let latestParent = refreshTaskRow(params.projectDb, parentPlan.id);
+  if (!latestParent || ["merged", "cancelled", "failed"].includes(latestParent.status)) {
+    return;
+  }
+
+  if (latestParent.status === "merge_conflict") {
+    recordEvent({
+      projectId: latestParent.project_id,
+      taskId: latestParent.id,
+      eventType: "plan.auto_merge_on_complete.blocked",
+      payload: { reason: "merge_conflict" },
+      database: params.projectDb
+    });
+    return;
+  }
+
+  if (latestParent.status !== "merge_ready") {
+    latestParent = setTaskStatus(
+      params.projectDb,
+      latestParent,
+      "merge_ready",
+      "plan_children_merged_auto_merge_ready",
+      params.actorUserId
+    );
+    recordEvent({
+      projectId: latestParent.project_id,
+      taskId: latestParent.id,
+      eventType: "plan.mark_merge_ready",
+      payload: { auto: true, reason: "children_merged" },
+      database: params.projectDb
+    });
+  }
+
+  if (!latestParent.auto_merge_on_complete) {
+    return;
+  }
+
+  try {
+    await mergePlan({ userId: params.actorUserId, planId: latestParent.id });
+  } catch (error: any) {
+    recordEvent({
+      projectId: latestParent.project_id,
+      taskId: latestParent.id,
+      eventType: "plan.auto_merge_on_complete.failed",
+      payload: { error: String(error?.message ?? "plan auto-merge failed") },
+      database: params.projectDb
+    });
+  }
 }
 
 type TaskGitTopology = {
@@ -1023,6 +1112,14 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
       .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
       .all(task.id) as MergeRecordRow[];
     const latestMergeRecord = mergeRecords[0];
+    if (updatedTask.status === "merged") {
+      await maybeAdvanceParentPlanAfterChildMerge({
+        project,
+        projectDb,
+        mergedTask: updatedTask,
+        actorUserId: params.userId
+      });
+    }
     if (queueKickNeeded) {
       kickTaskQueueProcessing();
     }
@@ -1091,7 +1188,8 @@ export async function mergePlan(params: { userId: string; planId: string }) {
     throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
   }
 
-  const topology = resolveTaskGitTopology({ task: plan, project });
+  const parentPlanTask = parentPlanTaskFor(projectDb, plan);
+  const topology = resolveTaskGitTopology({ task: plan, project, parentPlanTask });
   const lockKey = topology.mergeLockKey;
   if (mergeLocks.has(lockKey)) {
     throw new CliServiceError("CONFLICT", "Another merge is currently running for this merge target");
@@ -1195,6 +1293,14 @@ export async function mergePlan(params: { userId: string; planId: string }) {
       .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
       .all(plan.id) as MergeRecordRow[];
     const latestMergeRecord = mergeRecords[0];
+    if (updatedPlan.status === "merged") {
+      await maybeAdvanceParentPlanAfterChildMerge({
+        project,
+        projectDb,
+        mergedTask: updatedPlan,
+        actorUserId: params.userId
+      });
+    }
     if (queueKickNeeded) {
       kickTaskQueueProcessing();
     }
