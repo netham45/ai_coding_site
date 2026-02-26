@@ -11,7 +11,7 @@ export type OrchestrationHookName =
   | "on_timer_tick";
 
 export type OrchestrationJobRequest = {
-  jobType: "task_queue_dispatch" | "plan_orchestration_pass" | "evaluate_readiness" | "decompose";
+  jobType: "task_queue_dispatch" | "plan_orchestration_pass" | "evaluate_readiness" | "decompose" | "re_review" | "delta_plan";
   idempotencyKey: string;
   debounceMs?: number;
   dedupeWindowMs?: number;
@@ -33,6 +33,8 @@ const TIMER_TICK_DEBOUNCE_MS = 1_000;
 const TIMER_TICK_DEDUPE_MS = 8_000;
 const OUTPUT_UPDATE_DEBOUNCE_MS = 1_500;
 const OUTPUT_UPDATE_DEDUPE_MS = 6_000;
+const COMPLETION_CHANGE_DEBOUNCE_MS = 900;
+const COMPLETION_CHANGE_DEDUPE_MS = 4_000;
 
 function digest(input: string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -60,6 +62,19 @@ function buildKey(seed: string, context: EventContext): string {
   );
 }
 
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function isCompletionStatusChange(context: EventContext): boolean {
+  if (context.eventType !== "task.status_changed") return false;
+  const payload = asObject(context.payload);
+  if (!payload) return false;
+  const toStatus = typeof payload.toStatus === "string" ? payload.toStatus : "";
+  return toStatus === "merged" || toStatus === "merge_ready" || toStatus === "failed" || toStatus === "merge_conflict" || toStatus === "cancelled";
+}
+
 function jobsForHook(hookName: OrchestrationHookName, context: EventContext): OrchestrationJobRequest[] {
   const taskScopedJobs: OrchestrationJobRequest[] =
     context.taskId && context.projectId
@@ -85,6 +100,18 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
       projectId: context.projectId,
       taskId: context.taskId,
       payload: { hookName, eventType: context.eventType, autoMode: true }
+    });
+  }
+
+  if (hookName === "on_status_changed" && context.taskId && context.projectId && isCompletionStatusChange(context)) {
+    taskScopedJobs.push({
+      jobType: "re_review",
+      idempotencyKey: buildKey(`hook:${hookName}:re_review`, context),
+      debounceMs: COMPLETION_CHANGE_DEBOUNCE_MS,
+      dedupeWindowMs: COMPLETION_CHANGE_DEDUPE_MS,
+      projectId: context.projectId,
+      taskId: context.taskId,
+      payload: { hookName, eventType: context.eventType }
     });
   }
 

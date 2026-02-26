@@ -34,7 +34,9 @@ import {
 } from "./services/orchestration/jobQueue.js";
 import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
 import { runDecomposeForTask } from "./services/orchestration/jobs/decompose.js";
+import { runDeltaPlanForTask } from "./services/orchestration/jobs/deltaPlan.js";
 import { runEvaluateReadinessForTask } from "./services/orchestration/jobs/evaluateReadiness.js";
+import { runReReviewForTask } from "./services/orchestration/jobs/reReview.js";
 import { observeNodeOutputMaterialChange } from "./services/orchestration/outputMonitor.js";
 import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
@@ -2116,13 +2118,13 @@ describe("integration: orchestration hooks and job queue", () => {
     const staleIso = new Date(Date.now() - 8 * 60_000).toISOString();
     projectDb.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?, ?)").run(staleIso, blockerId, blockedTaskId, staleRunningTaskId);
 
-    let queueDispatchCount = 0;
-    let planPassCount = 0;
-    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
-      queueDispatchCount += 1;
+    let readinessCount = 0;
+    let reviewCount = 0;
+    registerOrchestrationJobHandler("evaluate_readiness", async () => {
+      readinessCount += 1;
     });
-    registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
-      planPassCount += 1;
+    registerOrchestrationJobHandler("re_review", async () => {
+      reviewCount += 1;
     });
 
     const watchdogResult = runOrchestrationWatchdog({
@@ -2136,8 +2138,8 @@ describe("integration: orchestration hooks and job queue", () => {
     await runOrchestrationJobQueuePassForTests();
     await new Promise((resolve) => setTimeout(resolve, 350));
     await runOrchestrationJobQueuePassForTests();
-    assert.equal(queueDispatchCount > 0, true);
-    assert.equal(planPassCount > 0, true);
+    assert.equal(readinessCount > 0, true);
+    assert.equal(reviewCount > 0, true);
 
     const watchdogEvents = projectDb
       .prepare(
@@ -2335,5 +2337,187 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     assert.ok(latest?.payload);
     const latestPayload = JSON.parse(latest?.payload ?? "{}");
     assert.equal(latestPayload?.readiness?.idempotency_key, firstKey);
+  });
+
+  test("re_review coalesces rapid completion bursts and re-evaluates unblocked dependents", async () => {
+    const userId = createUser();
+    const basePath = randomPath("re-review-burst");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Burst Blocker",
+      mode: "execution",
+      status: "in_progress"
+    });
+    const dependentId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Burst Dependent",
+      mode: "execution",
+      status: "queued"
+    });
+    projectDb
+      .prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)")
+      .run(dependentId, blockerId, nowIso());
+    projectDb.prepare("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?").run(nowIso(), blockerId);
+
+    for (let idx = 0; idx < 5; idx += 1) {
+      recordEvent({
+        projectId,
+        taskId: blockerId,
+        eventType: "task.status_changed",
+        payload: {
+          fromStatus: "in_progress",
+          toStatus: "merged",
+          reasonCode: "burst_completion"
+        },
+        database: projectDb
+      });
+    }
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+
+    const reReviewResult = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: blockerId
+    });
+    assert.equal(reReviewResult.impactedTaskIds.includes(dependentId), true);
+
+    const readinessEvent = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.readiness.evaluated'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(dependentId) as { payload: string } | undefined;
+    assert.ok(readinessEvent?.payload);
+    const readinessPayload = JSON.parse(readinessEvent?.payload ?? "{}");
+    assert.equal(readinessPayload?.readiness?.blockers?.length ?? 1, 0);
+  });
+
+  test("delta_plan enforces max replan budget unless explicit override is set", async () => {
+    const userId = createUser();
+    const basePath = randomPath("delta-plan-budget");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Delta Plan Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "plan",
+        budgets: { max_replans: 1 }
+      }),
+      nowIso(),
+      planId
+    );
+
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Initial Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+
+    const first = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((first?.createdChildIds.length ?? 0) > 0, true);
+
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Second Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+    const second = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal(second?.budgetExceeded, true);
+    assert.equal(second?.createdChildIds.length, 0);
+
+    const parentBeforeOverride = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(planId) as TaskRow;
+    const parsed = JSON.parse(parentBeforeOverride.metadata_json ?? "{}");
+    parsed.custom = {
+      ...(parsed.custom ?? {}),
+      replan_budget_override: true
+    };
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify(parsed),
+      nowIso(),
+      planId
+    );
+
+    const third = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((third?.createdChildIds.length ?? 0) > 0, true);
+    assert.equal(third?.budgetExceeded, false);
+  });
+
+  test("re_review triggers delta_plan from child completion changes without infinite replanning loops", async () => {
+    const userId = createUser();
+    const basePath = randomPath("re-review-delta");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Review Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 3 } }),
+      nowIso(),
+      planId
+    );
+    const failedChildId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Review Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+
+    const firstReview = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: failedChildId
+    });
+    assert.equal(firstReview.deltaPlanEnqueued.includes(planId), true);
+    const firstDelta = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((firstDelta?.createdChildIds.length ?? 0) > 0, true);
+
+    const secondReview = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: failedChildId
+    });
+    assert.equal(secondReview.deltaPlanEnqueued.includes(planId), true);
+    const secondDelta = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal(secondDelta?.createdChildIds.length, 0);
   });
 });

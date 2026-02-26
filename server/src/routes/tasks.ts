@@ -38,6 +38,7 @@ const createTaskSchema = z.object({
   taskPrompt: z.string().min(1).max(12000),
   aiCommand: z.string().min(1).max(500).optional(),
   autoMerge: z.boolean().optional(),
+  allowReplanBudgetOverride: z.boolean().optional(),
   dependencyTaskIds: z.array(z.string().uuid()).max(200).optional(),
   dependencyNodeRefs: z.array(z.object({
     id: z.string().min(1).max(200),
@@ -45,6 +46,17 @@ const createTaskSchema = z.object({
     reason: z.string().min(1).max(500).optional()
   })).max(200).optional()
 });
+
+function withReplanBudgetOverride(metadata: any, enabled: boolean) {
+  if (!enabled) return metadata;
+  return {
+    ...metadata,
+    custom: {
+      ...(metadata.custom ?? {}),
+      replan_budget_override: true
+    }
+  };
+}
 
 const patchTaskSchema = z.object({
   aiCommand: z.string().min(1).max(500).optional()
@@ -589,6 +601,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
   const autoMerge = Boolean(input.autoMerge);
+  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
 
   let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
   try {
@@ -625,7 +638,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
 
   projectDb.transaction(() => {
     const metadataJson = serializeNodeMetadata(
-      buildInitialNodeMetadata({
+      withReplanBudgetOverride(buildInitialNodeMetadata({
         task: {
           id,
           project_id: project.id,
@@ -642,7 +655,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
         tier: "task",
         sameTierDependencies: partitionedDeps.sameTierDependencies,
         crossTierDependencies: partitionedDeps.crossTierDependencies
-      })
+      }), allowReplanBudgetOverride)
     );
     projectDb.prepare(
       `INSERT INTO tasks (
@@ -694,7 +707,8 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       dependencyTaskIds: dependencies.map((x) => x.id),
       dependencyNodeRefs: dependencyResolution.normalizedDependencies,
       blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
-      blocked: isBlocked
+      blocked: isBlocked,
+      allowReplanBudgetOverride
     }
   });
 
