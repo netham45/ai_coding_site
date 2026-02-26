@@ -15,8 +15,11 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-generate.md` - plan-generation runtime template.
 - `plan-extract.md` - extraction/runtime normalization template.
 - `plan-approve.md` - approval/materialization template.
+- `phase-to-plans.md` - phase decomposition template for generating plan children.
+- `plan-to-subplans-and-tasks.md` - plan decomposition template for sub-plan/task DAG generation.
 - `task-execution.md` - execution-task runtime template.
 - `readiness-evaluation.md` - deterministic readiness state/transition template.
+- `synthesis.md` - parent synthesis template for requirement-to-evidence coverage aggregation.
 
 ## Usage
 

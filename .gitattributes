@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep task summaries from blocking auto-merge flows on cross-branch updates.
+.ai-task-summary.md merge=union
+prompts/README.md merge=union
