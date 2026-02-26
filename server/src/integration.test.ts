@@ -22,7 +22,7 @@ import {
 } from "./db/index.js";
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
-import { projectBaselineMigration } from "./db/migrations.js";
+import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
@@ -48,6 +48,12 @@ function tableExists(database: Database.Database, table: string): boolean {
     .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
     .get(table) as { ok: number } | undefined;
   return Boolean(row?.ok);
+}
+
+function tableHasColumn(database: Database.Database, table: string, column: string): boolean {
+  if (!tableExists(database, table)) return false;
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
 }
 
 function resetAppDatabaseState(): void {
@@ -366,6 +372,132 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     });
     assert.equal(resolved.backend, "project");
     process.env.SPLIT_PERSISTENCE_PHASE = previousPhase;
+  });
+
+  test("project DB schema upgrade adds tasks.metadata_json and bumps metadata version", () => {
+    const userId = createUser();
+    const basePath = randomPath("schema-upgrade");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, ".ai-coding");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const dbPath = path.join(dbDir, "project.sqlite");
+
+    const legacyDb = resolveProjectDatabase({
+      appDb,
+      projectId,
+      basePath,
+      intent: "write"
+    }).database;
+    legacyDb.exec(projectBaselineMigration);
+    legacyDb.exec("ALTER TABLE tasks RENAME TO tasks_with_metadata");
+    legacyDb.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
+        auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','awaiting_children','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    legacyDb.exec("DROP TABLE tasks_with_metadata");
+    legacyDb.pragma("user_version = 1");
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS project_metadata (
+        project_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    const now = nowIso();
+    legacyDb
+      .prepare(
+        `INSERT OR REPLACE INTO project_metadata (project_id, schema_version, created_at, updated_at)
+         VALUES (?, 1, ?, ?)`
+      )
+      .run(projectId, now, now);
+    closeAllProjectDbs();
+
+    const upgraded = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    assert.equal(tableHasColumn(upgraded, "tasks", "metadata_json"), true);
+    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 2);
+    const projectMetadata = upgraded
+      .prepare("SELECT schema_version FROM project_metadata WHERE project_id = ?")
+      .get(projectId) as { schema_version: number };
+    assert.equal(projectMetadata.schema_version, 2);
+  });
+
+  test("tasks metadata migration rolls back cleanly on transaction failure", () => {
+    const userId = createUser();
+    const basePath = randomPath("schema-rollback");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, ".ai-coding");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = resolveProjectDatabase({
+      appDb,
+      projectId,
+      basePath,
+      intent: "write"
+    }).database;
+    db.exec(projectBaselineMigration);
+    db.exec("ALTER TABLE tasks RENAME TO tasks_with_metadata");
+    db.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
+        auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','awaiting_children','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    db.exec("DROP TABLE tasks_with_metadata");
+    assert.equal(tableHasColumn(db, "tasks", "metadata_json"), false);
+
+    assert.throws(() => {
+      db.transaction(() => {
+        db.exec(projectTaskMetadataMigration);
+        throw new Error("force rollback");
+      })();
+    }, /force rollback/);
+    assert.equal(tableHasColumn(db, "tasks", "metadata_json"), false);
   });
 
   test("missing/corrupt project DB responses are surfaced and reflected in health diagnostics", async () => {

@@ -23,6 +23,7 @@ import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
@@ -204,6 +205,11 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
        ORDER BY dep.created_at ASC`
     )
     .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata: nodeMetadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
+  });
 
   return {
     id: task.id,
@@ -217,6 +223,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     autoStart: Boolean(task.auto_start),
     autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
+    nodeMetadata,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
     sourcePlanItemKey: task.source_plan_item_key,
@@ -625,14 +632,32 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "execution",
+          metadata_json: null,
+          auto_merge: autoMerge ? 1 : 0,
+          auto_start: 0,
+          auto_merge_on_complete: 0,
+          parent_plan_task_id: null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: dependencies.map((dependency) => dependency.id),
+        tier: "task"
+      })
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge,
+        auto_merge, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -641,6 +666,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       effectivePrompt,
       aiCommand,
       autoMerge ? 1 : 0,
+      metadataJson,
       workspacePath,
       baseCommitSha,
       req.user.id,

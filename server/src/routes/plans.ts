@@ -9,6 +9,7 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
@@ -230,6 +231,11 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
        ORDER BY dep.created_at ASC`
     )
     .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata: nodeMetadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
+  });
 
   return {
     id: task.id,
@@ -243,6 +249,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     autoStart: Boolean(task.auto_start),
     autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
+    nodeMetadata,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
     sourcePlanItemKey: task.source_plan_item_key,
@@ -416,14 +423,33 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "plan",
+          metadata_json: null,
+          auto_merge: 0,
+          auto_start: autoStart ? 1 : 0,
+          auto_merge_on_complete: autoMergeOnComplete ? 1 : 0,
+          parent_plan_task_id: parentPlanTask?.id ?? null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: [],
+        tier: "plan",
+        crossTierDependencies: parentPlanTask ? [{ id: parentPlanTask.id, tier: "plan", reason: "parent_plan" }] : []
+      })
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge, auto_start, auto_merge_on_complete,
+        auto_merge, auto_start, auto_merge_on_complete, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -433,6 +459,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
       aiCommand,
       autoStart ? 1 : 0,
       autoMergeOnComplete ? 1 : 0,
+      metadataJson,
       parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitSha,
@@ -913,15 +940,34 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
       const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, req.user.id);
+      const metadataJson = serializeNodeMetadata(
+        buildInitialNodeMetadata({
+          task: {
+            id: row.taskId,
+            project_id: project.id,
+            mode: row.mode,
+            metadata_json: null,
+            auto_merge: row.autoMerge ? 1 : 0,
+            auto_start: row.autoStart ? 1 : 0,
+            auto_merge_on_complete: row.autoMergeOnComplete ? 1 : 0,
+            parent_plan_task_id: row.parentPlanTaskId,
+            source_plan_revision_id: latestRevision.id,
+            source_plan_item_key: row.item.item_key
+          },
+          dependencyTaskIds: row.dependencyTaskIds,
+          tier: row.mode === "plan" ? "plan" : "exec",
+          crossTierDependencies: [{ id: plan.id, tier: "plan", reason: "created_from_plan_revision" }]
+        })
+      );
 
       projectDb.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-          auto_merge, auto_start, auto_merge_on_complete,
+          auto_merge, auto_start, auto_merge_on_complete, metadata_json,
           mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
           status, workspace_path, base_commit_sha_at_create, head_commit_sha,
           cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
       ).run(
         row.taskId,
         project.id,
@@ -932,6 +978,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
         row.autoMerge ? 1 : 0,
         row.autoStart ? 1 : 0,
         row.autoMergeOnComplete ? 1 : 0,
+        metadataJson,
         row.mode,
         row.parentPlanTaskId,
         latestRevision.id,
