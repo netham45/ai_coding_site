@@ -56,6 +56,10 @@ export async function createSession(params: {
 
   try {
     await execFileAsync("tmux", tmuxArgs, { timeout: 20000, env: params.env ?? process.env });
+    // Ensure wheel events scroll tmux history/copy-mode instead of being sent as arrow keys.
+    await execFileAsync("tmux", ["-S", params.socketPath, "set-option", "-t", params.sessionName, "mouse", "on"], {
+      timeout: 5000
+    });
   } catch (error: any) {
     const stderr = String(error?.stderr || "").trim();
     throw new Error(stderr || "failed to create tmux session");
