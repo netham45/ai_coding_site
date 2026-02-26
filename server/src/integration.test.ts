@@ -26,8 +26,15 @@ import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/mig
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
 import { assertTaskStatusTransition, canTransitionLifecycle, evaluateParentCompletionGuards } from "./services/orchestration/stateMachine.js";
+import {
+  enqueueOrchestrationJob,
+  registerOrchestrationJobHandler,
+  resetOrchestrationJobQueueForTests,
+  runOrchestrationJobQueuePassForTests
+} from "./services/orchestration/jobQueue.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
+import { recordEvent } from "./services/events.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
 import type { TaskRow, TaskStatus } from "./types.js";
 import { nowIso } from "./utils/time.js";
@@ -63,6 +70,7 @@ function resetAppDatabaseState(): void {
   closeAllProjectDbs();
   resetProjectDbDiagnosticsForTests();
   resetSplitPersistenceCachesForTests();
+  resetOrchestrationJobQueueForTests();
 
   const tables = appDb
     .prepare(
@@ -1899,5 +1907,117 @@ tasks:
     assert.equal(diagnostics.unresolved[0]?.reason, "await_blocker_merge");
     assert.equal(diagnostics.lineage[0]?.fromId, taskId);
     assert.equal(diagnostics.lineage[0]?.toId, blockerId);
+  });
+});
+
+describe("integration: orchestration hooks and job queue", () => {
+  beforeEach(() => {
+    resetAppDatabaseState();
+  });
+
+  test("duplicate hook events do not produce duplicate effective work", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-dedupe");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Hook Dedupe Task",
+      status: "queued"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    recordEvent({
+      projectId,
+      taskId,
+      eventType: "task.status_changed",
+      payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "manual_test" },
+      database: projectDb
+    });
+    recordEvent({
+      projectId,
+      taskId,
+      eventType: "task.status_changed",
+      payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "manual_test" },
+      database: projectDb
+    });
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("burst updates are debounced and coalesced", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-debounce");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Hook Debounce Task",
+      status: "queued"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    for (let idx = 0; idx < 4; idx += 1) {
+      recordEvent({
+        projectId,
+        taskId,
+        eventType: "task.status_changed",
+        payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "burst_test" },
+        database: projectDb
+      });
+    }
+
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 0);
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("queue restart does not violate idempotency", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-restart");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    enqueueOrchestrationJob({
+      projectId,
+      taskId: null,
+      jobType: "task_queue_dispatch",
+      idempotencyKey: "restart-safe-job",
+      debounceMs: 0,
+      dedupeWindowMs: 5_000,
+      database: projectDb
+    });
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+
+    resetOrchestrationJobQueueForTests();
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
   });
 });

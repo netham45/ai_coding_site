@@ -1,10 +1,18 @@
 import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "./events.js";
+import {
+  enqueueOrchestrationJob,
+  kickOrchestrationJobQueueProcessing,
+  registerOrchestrationJobHandler,
+  type OrchestrationJobType
+} from "./orchestration/jobQueue.js";
 import { startTaskRuntimeWorker } from "./runtimeWorker.js";
 
-const QUEUE_INTERVAL_MS = 10_000;
 const MAX_TASKS_PER_PASS = 8;
 const startingTaskIds = new Set<string>();
+const TASK_QUEUE_JOB_TYPE: OrchestrationJobType = "task_queue_dispatch";
+const TASK_QUEUE_IDEMPOTENCY_KEY = "task-queue:global";
+let queueJobRegistered = false;
 
 type QueuedTaskRow = {
   id: string;
@@ -143,12 +151,38 @@ async function runQueuePass(): Promise<void> {
 }
 
 export function kickTaskQueueProcessing(): void {
-  void runQueuePass();
+  const projects = appDb
+    .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
+    .all() as Array<{ id: string; base_path: string }>;
+  for (const project of projects) {
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    enqueueOrchestrationJob({
+      projectId: project.id,
+      jobType: TASK_QUEUE_JOB_TYPE,
+      idempotencyKey: `${TASK_QUEUE_IDEMPOTENCY_KEY}:${project.id}`,
+      debounceMs: 300,
+      dedupeWindowMs: 2_000,
+      database: scoped.database
+    });
+  }
+  kickOrchestrationJobQueueProcessing();
 }
 
 export function startTaskQueueWorker(): void {
-  void runQueuePass();
-  setInterval(() => {
-    void runQueuePass();
-  }, QUEUE_INTERVAL_MS);
+  if (!queueJobRegistered) {
+    registerOrchestrationJobHandler(TASK_QUEUE_JOB_TYPE, async () => {
+      await runQueuePass();
+    });
+    queueJobRegistered = true;
+  }
+  kickTaskQueueProcessing();
+}
+
+export async function runTaskQueuePassForTests(): Promise<void> {
+  await runQueuePass();
 }

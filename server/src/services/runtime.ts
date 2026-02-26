@@ -446,6 +446,18 @@ function transitionTaskIfNeeded(
     reason: params.reason,
     actorUserId: params.actorUserId
   });
+  recordEvent({
+    projectId: row.project_id,
+    taskId: row.id,
+    eventType: "task.status_changed",
+    payload: {
+      fromStatus: row.status,
+      toStatus: params.toStatus,
+      reasonCode: params.reason,
+      source: "runtime.transitionTaskIfNeeded"
+    },
+    database: projectDb
+  });
 }
 
 function sleep(ms: number): Promise<void> {
@@ -588,6 +600,18 @@ function updateTaskStatus(
     toStatus: params.toStatus,
     reason: params.reason,
     actorUserId: params.actorUserId
+  });
+  recordEvent({
+    projectId: row.project_id,
+    taskId: row.id,
+    eventType: "task.status_changed",
+    payload: {
+      fromStatus: row.status,
+      toStatus: params.toStatus,
+      reasonCode: params.reason,
+      source: "runtime.updateTaskStatus"
+    },
+    database: projectDb
   });
 }
 
