@@ -21,6 +21,12 @@ import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
 import { runParentCompletionFeedbackLoop } from "../services/orchestration/completion.js";
 import {
+  buildConflictResolutionArtifact,
+  buildMergeGateChecklist,
+  describeFailedMergeGates,
+  requiredMergeGatesPassed
+} from "../services/orchestration/conflictResolution.js";
+import {
   buildDependencyDiagnostics,
   partitionDependenciesByTier,
   resolveAndValidateNodeDependencies,
@@ -445,6 +451,10 @@ function hasUnmergedPlanChildren(projectDb: Database.Database, planTaskId: strin
     .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' LIMIT 1")
     .get(planTaskId) as { id: string } | undefined;
   return Boolean(row?.id);
+}
+
+function workspaceIsClean(status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>): boolean {
+  return status.untracked === 0 && status.staged === 0 && status.unstaged === 0 && status.conflicted === 0;
 }
 
 function refreshTaskRow(projectDb: Database.Database, taskId: string): TaskRow | undefined {
@@ -1188,6 +1198,22 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
   if (task.status !== "merge_ready") {
     throw new CliServiceError("CONFLICT", "Task must be merge_ready before merge");
   }
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
+  try {
+    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to read task git status"));
+  }
+  const mergeGateChecklist = buildMergeGateChecklist({
+    task,
+    hasBlockingDependencies: taskIsBlocked(projectDb, task.id),
+    hasPendingChildren: false,
+    workspaceClean: workspaceIsClean(gitStatus),
+    parentGuards: evaluateParentCompletionGuards(projectDb, task)
+  });
+  if (!requiredMergeGatesPassed(mergeGateChecklist)) {
+    throw new CliServiceError("CONFLICT", `Merge gates failed: ${describeFailedMergeGates(mergeGateChecklist)}`);
+  }
 
   const parentPlanTask = parentPlanTaskFor(projectDb, task);
   const topology = resolveTaskGitTopology({ task, project, parentPlanTask });
@@ -1221,6 +1247,15 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
       const completedAt = nowIso();
 
       if (mergeResult.conflicted) {
+        const resolutionArtifact = buildConflictResolutionArtifact({
+          task,
+          parentTask: parentPlanTask,
+          conflictFiles: mergeResult.conflictFiles,
+          mergeGateChecklist,
+          mergeTargetBranch: topology.mergeTargetBranch,
+          sourceCommitSha,
+          targetBaseCommitSha
+        });
         const conflictSummary = mergeResult.conflictFiles.join("\n");
         projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
           conflictSummary || "conflicts detected",
@@ -1234,7 +1269,8 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
           eventType: "task.merge_conflict",
           database: projectDb,
           payload: {
-            conflictFiles: mergeResult.conflictFiles
+            conflictFiles: mergeResult.conflictFiles,
+            conflictResolution: resolutionArtifact
           }
         });
       } else {
@@ -1263,12 +1299,20 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
       }
     } catch (error: any) {
       const completedAt = nowIso();
+      const message = String(error?.message ?? "merge failed");
       projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
-        String(error?.message ?? "merge failed"),
+        message,
         completedAt,
         mergeRecordId
       );
-      throw new CliServiceError("CONFLICT", String(error?.message ?? "Merge failed"));
+      recordEvent({
+        projectId: project.id,
+        taskId: task.id,
+        eventType: "task.merge_failed",
+        database: projectDb,
+        payload: { error: message }
+      });
+      throw new CliServiceError("CONFLICT", message);
     }
 
     const updatedTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
@@ -1360,6 +1404,22 @@ export async function mergePlan(params: { userId: string; planId: string }) {
   if (hasUnmergedPlanChildren(projectDb, plan.id)) {
     throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
   }
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
+  try {
+    gitStatus = await getWorkspaceGitStatus(plan.workspace_path);
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to read plan git status"));
+  }
+  const mergeGateChecklist = buildMergeGateChecklist({
+    task: plan,
+    hasBlockingDependencies: taskIsBlocked(projectDb, plan.id),
+    hasPendingChildren: hasUnmergedPlanChildren(projectDb, plan.id),
+    workspaceClean: workspaceIsClean(gitStatus),
+    parentGuards: evaluateParentCompletionGuards(projectDb, plan)
+  });
+  if (!requiredMergeGatesPassed(mergeGateChecklist)) {
+    throw new CliServiceError("CONFLICT", `Merge gates failed: ${describeFailedMergeGates(mergeGateChecklist)}`);
+  }
 
   const parentPlanTask = parentPlanTaskFor(projectDb, plan);
   const topology = resolveTaskGitTopology({ task: plan, project, parentPlanTask });
@@ -1393,6 +1453,15 @@ export async function mergePlan(params: { userId: string; planId: string }) {
       const completedAt = nowIso();
 
       if (mergeResult.conflicted) {
+        const resolutionArtifact = buildConflictResolutionArtifact({
+          task: plan,
+          parentTask: parentPlanTask,
+          conflictFiles: mergeResult.conflictFiles,
+          mergeGateChecklist,
+          mergeTargetBranch: topology.mergeTargetBranch,
+          sourceCommitSha,
+          targetBaseCommitSha
+        });
         const conflictSummary = mergeResult.conflictFiles.join("\n");
         projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
           conflictSummary || "conflicts detected",
@@ -1406,7 +1475,8 @@ export async function mergePlan(params: { userId: string; planId: string }) {
           eventType: "plan.merge_conflict",
           database: projectDb,
           payload: {
-            conflictFiles: mergeResult.conflictFiles
+            conflictFiles: mergeResult.conflictFiles,
+            conflictResolution: resolutionArtifact
           }
         });
       } else {
@@ -1435,12 +1505,20 @@ export async function mergePlan(params: { userId: string; planId: string }) {
       }
     } catch (error: any) {
       const completedAt = nowIso();
+      const message = String(error?.message ?? "merge failed");
       projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
-        String(error?.message ?? "merge failed"),
+        message,
         completedAt,
         mergeRecordId
       );
-      throw new CliServiceError("CONFLICT", String(error?.message ?? "Merge failed"));
+      recordEvent({
+        projectId: project.id,
+        taskId: plan.id,
+        eventType: "plan.merge_failed",
+        database: projectDb,
+        payload: { error: message }
+      });
+      throw new CliServiceError("CONFLICT", message);
     }
 
     const updatedPlan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(plan.id) as TaskRow;

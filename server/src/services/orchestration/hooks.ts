@@ -244,6 +244,8 @@ function mapEventToHooks(eventType: string): OrchestrationHookName[] {
   if (
     eventType === "task.merge_conflict" ||
     eventType === "plan.merge_conflict" ||
+    eventType === "task.merge_failed" ||
+    eventType === "plan.merge_failed" ||
     eventType === "task.auto_merge.failed" ||
     eventType === "plan.auto_merge_on_complete.failed"
   ) {
