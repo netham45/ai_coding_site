@@ -30,6 +30,62 @@ export type TaskStatus =
 
 export type TaskMode = "execution" | "plan";
 
+export type CompletionEvidence = {
+  child_task_id: string;
+  artifact_ref: string;
+  snippet: string;
+  repo_path: string | null;
+  module_ref: string | null;
+  test_ref: string | null;
+};
+
+export type CompletionCoverageRow = {
+  requirement_id: string;
+  requirement_text: string;
+  coverage_status: "covered" | "partial" | "uncovered";
+  evidence: CompletionEvidence[];
+  gap_reason: string | null;
+};
+
+export type SynthesisArtifact = {
+  template: { id: string; path: string };
+  summary: string;
+  coverage_matrix: CompletionCoverageRow[];
+  uncovered_requirements: string[];
+  generated_at: string;
+};
+
+export type VerificationArtifact = {
+  template: { id: string; path: string };
+  verdict: "pass" | "fail";
+  failing_requirements: string[];
+  reasons: string[];
+  delta_plan_enqueued: boolean;
+  budget_exhausted: boolean;
+  generated_at: string;
+};
+
+export type DeltaLoopHistoryEntry = {
+  generated_at: string;
+  verdict: "pass" | "fail";
+  reasons: string[];
+  failing_requirements: string[];
+  delta_plan_enqueued: boolean;
+  budget_exhausted: boolean;
+  verification_artifact_event_id: string;
+  synthesis_artifact_event_id?: string;
+};
+
+export type CompletionSummary = {
+  synthesisArtifactEventId: string | null;
+  verificationArtifactEventId: string | null;
+  verificationVerdict: "pass" | "fail" | null;
+  summary: string | null;
+  synthesisArtifact: SynthesisArtifact | null;
+  verificationArtifact: VerificationArtifact | null;
+  deltaLoopHistory: DeltaLoopHistoryEntry[];
+};
+
 export type Task = {
   id: string;
   projectId: string;
@@ -55,6 +111,7 @@ export type Task = {
   dependencyTaskIds: string[];
   blockedByTaskIds: string[];
   isBlocked: boolean;
+  completion?: CompletionSummary;
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;

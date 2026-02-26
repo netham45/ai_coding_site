@@ -20,6 +20,9 @@ type CoverageEvidence = {
   child_task_id: string;
   artifact_ref: string;
   snippet: string;
+  repo_path: string | null;
+  module_ref: string | null;
+  test_ref: string | null;
 };
 
 type CoverageRow = {
@@ -48,6 +51,17 @@ type VerificationArtifact = {
   budget_exhausted: boolean;
   idempotency_key: string;
   generated_at: string;
+};
+
+type DeltaLoopHistoryEntry = {
+  generated_at: string;
+  verdict: "pass" | "fail";
+  reasons: string[];
+  failing_requirements: string[];
+  delta_plan_enqueued: boolean;
+  budget_exhausted: boolean;
+  verification_artifact_event_id: string;
+  synthesis_artifact_event_id: string;
 };
 
 const STOPWORDS = new Set([
@@ -125,6 +139,26 @@ function truncate(input: string, max = 140): string {
   return `${normalized.slice(0, max - 3)}...`;
 }
 
+function extractRepoPath(input: string): string | null {
+  const match = input.match(/\b(?:[a-zA-Z0-9._-]+\/)+[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+\b/);
+  return match?.[0] ?? null;
+}
+
+function inferModuleRef(repoPath: string | null): string | null {
+  if (!repoPath) return null;
+  const parts = repoPath.split("/").filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]}/${parts[1]}`;
+}
+
+function extractTestRef(input: string): string | null {
+  const explicit = input.match(/\b[a-zA-Z0-9._/-]*?(?:test|spec)[a-zA-Z0-9._/-]*\b/i);
+  if (explicit?.[0]) return explicit[0];
+  const fnMatch = input.match(/\b(?:it|test|describe)\s*\(\s*["'`][^"'`]{3,120}["'`]\s*\)/i);
+  return fnMatch?.[0] ?? null;
+}
+
 function digestStable(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -154,10 +188,14 @@ function toCoverageRow(requirement: Requirement, mergedChildren: TaskRow[]): Cov
     const overlap = reqTokens.filter((token) => sourceTokens.includes(token));
     if (overlap.length === 0 && reqTokens.length > 0) continue;
     if (!result.trim() && !title.trim()) continue;
+    const repoPath = extractRepoPath(source);
     evidence.push({
       child_task_id: child.id,
       artifact_ref: result.trim() ? `task:${child.id}#result` : `task:${child.id}#title`,
-      snippet: truncate(result.trim() || title.trim())
+      snippet: truncate(result.trim() || title.trim()),
+      repo_path: repoPath,
+      module_ref: inferModuleRef(repoPath),
+      test_ref: extractTestRef(source)
     });
     if (evidence.length >= 3) break;
   }
@@ -185,14 +223,17 @@ function toCoverageRow(requirement: Requirement, mergedChildren: TaskRow[]): Cov
 function writeCompletionMetadata(params: {
   projectDb: Database.Database;
   task: TaskRow;
-  updates: {
-    synthesisPassed?: boolean;
-    verificationPassed?: boolean;
-    reasonCode: string;
-    synthesisArtifactEventId?: string;
-    verificationArtifactEventId?: string;
-    verificationVerdict?: "pass" | "fail";
-  };
+    updates: {
+      synthesisPassed?: boolean;
+      verificationPassed?: boolean;
+      reasonCode: string;
+      synthesisArtifactEventId?: string;
+      verificationArtifactEventId?: string;
+      verificationVerdict?: "pass" | "fail";
+      synthesisArtifact?: SynthesisArtifact;
+      verificationArtifact?: VerificationArtifact;
+      deltaLoopHistoryEntry?: DeltaLoopHistoryEntry;
+    };
 }): NodeMetadata {
   const metadataRead = readNodeMetadata({
     projectDb: params.projectDb,
@@ -215,6 +256,23 @@ function writeCompletionMetadata(params: {
   if (params.updates.verificationVerdict) {
     custom.verification_verdict = params.updates.verificationVerdict;
   }
+  const completionArtifacts =
+    custom.completion_artifacts && typeof custom.completion_artifacts === "object"
+      ? { ...(custom.completion_artifacts as Record<string, unknown>) }
+      : {};
+  if (params.updates.synthesisArtifact) {
+    completionArtifacts.synthesis = params.updates.synthesisArtifact;
+  }
+  if (params.updates.verificationArtifact) {
+    completionArtifacts.verification = params.updates.verificationArtifact;
+  }
+  if (params.updates.deltaLoopHistoryEntry) {
+    const historyRaw = Array.isArray(completionArtifacts.delta_loop_history)
+      ? (completionArtifacts.delta_loop_history as DeltaLoopHistoryEntry[])
+      : [];
+    completionArtifacts.delta_loop_history = [...historyRaw, params.updates.deltaLoopHistoryEntry].slice(-20);
+  }
+  custom.completion_artifacts = completionArtifacts;
   metadata.custom = custom;
   writeNodeMetadata({
     projectDb: params.projectDb,
@@ -296,7 +354,8 @@ export async function runSynthesizeForParent(params: {
       synthesisPassed: true,
       verificationPassed: false,
       reasonCode: "orchestration.synthesize.completed",
-      synthesisArtifactEventId: eventWrite.eventId
+      synthesisArtifactEventId: eventWrite.eventId,
+      synthesisArtifact: artifact
     }
   });
 
@@ -408,7 +467,19 @@ export async function runVerifyForParent(params: {
       reasonCode: verdict === "pass" ? "orchestration.verify.pass" : "orchestration.verify.fail",
       synthesisArtifactEventId: synthesis.eventId,
       verificationArtifactEventId: eventWrite.eventId,
-      verificationVerdict: verdict
+      verificationVerdict: verdict,
+      synthesisArtifact: synthesis.artifact,
+      verificationArtifact: artifact,
+      deltaLoopHistoryEntry: {
+        generated_at: artifact.generated_at,
+        verdict,
+        reasons,
+        failing_requirements: uncovered,
+        delta_plan_enqueued: deltaPlanEnqueued,
+        budget_exhausted: budgetExhausted,
+        verification_artifact_event_id: eventWrite.eventId,
+        synthesis_artifact_event_id: synthesis.eventId
+      }
     }
   });
 
