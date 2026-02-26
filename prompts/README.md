@@ -15,8 +15,12 @@ This directory contains runtime prompt templates and shared contract sections fo
 - `plan-generate.md` - plan-generation runtime template.
 - `plan-extract.md` - extraction/runtime normalization template.
 - `plan-approve.md` - approval/materialization template.
+<<<<<<< HEAD
+- `epoch-to-phases.md` - epoch-tier decomposition template for generating phase children.
+=======
 - `phase-to-plans.md` - phase decomposition template for generating plan children.
 - `plan-to-subplans-and-tasks.md` - plan decomposition template for sub-plan/task DAG generation.
+>>>>>>> origin/task/925c8bf5-af1e-4a0b-aa9a-5ad190818b5b
 - `task-execution.md` - execution-task runtime template.
 - `readiness-evaluation.md` - deterministic readiness state/transition template.
 - `synthesis.md` - parent synthesis template for requirement-to-evidence coverage aggregation.
