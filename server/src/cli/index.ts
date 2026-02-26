@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { getWorkspaceRootOrThrow } from "../utils/workspaceRoot.js";
 
 enum ExitCode {
   Success = 0,
@@ -210,6 +211,13 @@ function printResult(result: unknown, asJson: boolean, hint: OutputHint): void {
 function helpText(): string {
   return [
     "Usage: acs <command> [subcommand] [options]",
+    "",
+    "Location and root discovery:",
+    "  Run from the repository root or any nested directory inside an ai-coding-site workspace.",
+    "  Fallback: npm run cli -w server -- <command>",
+    "  If root discovery fails, acs exits with:",
+    "    Error: Could not locate the ai-coding-site workspace root from <path>.",
+    "  Fix: run the command from within this workspace (for example, <workspace>/server).",
     "",
     "Commands:",
     "  tasks list [--project-id <projectId>] [--plan-id <planId>]",
@@ -472,6 +480,8 @@ function parseEntityId(
 }
 
 async function run(): Promise<void> {
+  getWorkspaceRootOrThrow(process.cwd());
+
   const argv = process.argv.slice(2);
   const parsed = parseArgv(argv);
   if (argv.length === 0 || parsed.flags.has("help") || parsed.positionals[0] === "help") {

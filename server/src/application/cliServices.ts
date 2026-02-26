@@ -482,9 +482,10 @@ function nextRevisionNumber(projectDb: Database.Database, planTaskId: string): n
 function planningFormatInstructions(): string {
   return [
     "CLI Usage Context:",
-    "- Run commands from /server.",
-    "- First run `npm run cli -- --help` to view all available commands and options.",
-    "- Execute commands with `npm run cli -- <command>`.",
+    "- Run commands with `acs <command>` from the repository root or any nested directory in this ai-coding-site workspace (for example: /server, /server/src/cli, /web).",
+    "- First run `acs --help` to view all available commands and options.",
+    "- Backward compatible fallback: `npm run cli -- <command>`.",
+    "- If you see `Could not locate the ai-coding-site workspace root`, run the command from within this workspace (for example, <workspace>/server).",
     "- Available commands:",
     "  - tasks list [--project-id <projectId>] [--plan-id <planId>]",
     "  - tasks all [--project-id <projectId>] [--plan-id <planId>]",

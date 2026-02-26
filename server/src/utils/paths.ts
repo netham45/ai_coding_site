@@ -1,8 +1,7 @@
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getWorkspaceRootOrThrow } from "./workspaceRoot.js";
 
-const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-export const workspaceRoot = path.resolve(moduleDir, "..", "..", "..");
+export const workspaceRoot = getWorkspaceRootOrThrow();
 
 function resolveRootFromEnv(envValue: string | undefined, fallback: string): string {
   const raw = (envValue ?? "").trim();

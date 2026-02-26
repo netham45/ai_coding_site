@@ -173,7 +173,11 @@ Needs extraction before clean CLI reuse (currently route-scoped/private):
 
 2. Add CLI entrypoint and parser.
 - `server/src/cli/index.ts`
-- Add npm script, for example `npm run cli -w server -- ...`.
+- Add PATH-friendly `acs` executable, while keeping npm script fallback (`npm run cli -w server -- ...`).
+- Ensure root discovery works from nested directories inside the workspace (not only repo root).
+- Keep help/error copy explicit for root-not-found failures:
+  - `Error: Could not locate the ai-coding-site workspace root from <path>.`
+  - `Run this command from within an ai-coding-site workspace (for example, <workspace>/server).`
 
 3. Implement command handlers as thin adapters.
 - Each command calls exactly one application service operation.

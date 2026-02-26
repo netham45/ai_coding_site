@@ -36,6 +36,7 @@ type ApiResponse = {
 let server: http.Server;
 let apiBaseUrl = "";
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const acsBinPath = path.join(serverRoot, "bin", "acs.js");
 
 function randomPath(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ai-coding-site-${prefix}-`));
@@ -74,9 +75,44 @@ type CliRunResult = {
 };
 
 function runCli(args: string[]): CliRunResult {
+  return runCliFromCwd(args, serverRoot);
+}
+
+function runCliFromCwd(args: string[], cwd: string): CliRunResult {
   const result = spawnSync("npm", ["run", "-s", "cli", "--", ...args], {
-    cwd: serverRoot,
+    cwd,
     env: process.env,
+    encoding: "utf8"
+  });
+
+  const stdout = result.stdout ?? "";
+  let json: any = null;
+  try {
+    json = stdout.trim().length ? JSON.parse(stdout) : null;
+  } catch {
+    json = null;
+  }
+
+  return {
+    code: result.status,
+    stdout,
+    stderr: result.stderr ?? "",
+    json
+  };
+}
+
+function runAcsFromCwd(args: string[], cwd: string): CliRunResult {
+  const env = { ...process.env };
+  if (env.AI_CODING_DATA_ROOT && !path.isAbsolute(env.AI_CODING_DATA_ROOT)) {
+    env.AI_CODING_DATA_ROOT = path.resolve(serverRoot, env.AI_CODING_DATA_ROOT);
+  }
+  if (env.AI_CODING_REPOS_ROOT && !path.isAbsolute(env.AI_CODING_REPOS_ROOT)) {
+    env.AI_CODING_REPOS_ROOT = path.resolve(serverRoot, env.AI_CODING_REPOS_ROOT);
+  }
+
+  const result = spawnSync("node", [acsBinPath, ...args], {
+    cwd,
+    env,
     encoding: "utf8"
   });
 
@@ -714,6 +750,8 @@ describe("integration: CLI subcommands", () => {
   test("help output includes command examples for new subcommands", () => {
     const help = runCli(["--help"]);
     assert.equal(help.code, 0);
+    assert.match(help.stdout, /Location and root discovery:/);
+    assert.match(help.stdout, /Run from the repository root or any nested directory inside an ai-coding-site workspace/);
     assert.match(help.stdout, /tasks all \[--project-id <projectId>] \[--plan-id <planId>]/);
     assert.match(help.stdout, /tasks summary <taskId> \[--project-id <projectId>] \[--plan-id <planId>]/);
     assert.match(help.stdout, /plans review <planId>/);
@@ -721,5 +759,52 @@ describe("integration: CLI subcommands", () => {
     assert.match(help.stdout, /merge plan <planId>/);
     assert.match(help.stdout, /Examples:/);
     assert.match(help.stdout, /acs tasks active --project-id <projectId> --json/);
+  });
+
+  test("cli commands work from nested server directories", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-nested-cwd-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Nested cwd task",
+      status: "queued"
+    });
+
+    const nestedServerDir = path.join(serverRoot, "src", "cli");
+    const allTasks = runCliFromCwd(["tasks", "all", "--json"], nestedServerDir);
+    assert.equal(allTasks.code, 0);
+    assert.equal(Array.isArray(allTasks.json?.tasks), true);
+    assert.equal(allTasks.json.tasks.length, 1);
+  });
+
+  test("acs wrapper works from nested server directories", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("acs-nested-cwd-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "acs nested cwd task",
+      status: "queued"
+    });
+
+    const nestedServerDir = path.join(serverRoot, "src", "cli");
+    const allTasks = runAcsFromCwd(["tasks", "all", "--json"], nestedServerDir);
+    assert.equal(allTasks.code, 0);
+    assert.equal(Array.isArray(allTasks.json?.tasks), true);
+    assert.equal(allTasks.json.tasks.length, 1);
+  });
+
+  test("acs wrapper fails clearly outside the workspace", () => {
+    const outsideDir = randomPath("acs-outside-workspace");
+    const result = runAcsFromCwd(["--help"], outsideDir);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Could not locate the ai-coding-site workspace root/);
   });
 });
