@@ -1,0 +1,195 @@
+{
+  "scenario_id": "webrtc-remote-desktop-epoch-001",
+  "epoch_id": "ep-webrtc-rd-001",
+  "events": [
+    {
+      "ts": "2026-02-24T15:00:00Z",
+      "job": "readiness",
+      "node_id": "ep-webrtc-rd-001",
+      "from_status": "queued",
+      "to_status": "in_progress",
+      "reason_codes": ["deps_satisfied", "children_not_materialized"],
+      "idempotency_key": "readiness:ep-webrtc-rd-001:v1"
+    },
+    {
+      "ts": "2026-02-24T15:00:03Z",
+      "job": "decompose",
+      "node_id": "ep-webrtc-rd-001",
+      "created_children": [
+        "ph-platform-spike-001",
+        "ph-streaming-core-001",
+        "ph-hardening-release-001"
+      ],
+      "idempotency_key": "decompose:ep-webrtc-rd-001:sha256:ep-out-01"
+    },
+    {
+      "ts": "2026-02-24T15:00:10Z",
+      "job": "readiness",
+      "node_id": "pl-host-capture-pipeline-001",
+      "from_status": "queued",
+      "to_status": "blocked",
+      "reason_codes": ["deps_incomplete"],
+      "blockers": [
+        {
+          "id": "tsk-toolkit-selection-adr-001",
+          "hash": "sha256:blocker:tsk-toolkit-selection-adr-001:not_merged"
+        }
+      ],
+      "idempotency_key": "readiness:pl-host-capture-pipeline-001:v1"
+    },
+    {
+      "ts": "2026-02-24T15:12:00Z",
+      "job": "merge",
+      "node_id": "tsk-toolkit-selection-adr-001",
+      "from_status": "merge_ready",
+      "to_status": "merged",
+      "outcome": "success"
+    },
+    {
+      "ts": "2026-02-24T15:12:02Z",
+      "job": "dependency_hook",
+      "node_id": "tsk-toolkit-selection-adr-001",
+      "triggered_jobs": [
+        {
+          "job": "re_review",
+          "target_node_id": "pl-host-capture-pipeline-001"
+        }
+      ]
+    },
+    {
+      "ts": "2026-02-24T15:12:03Z",
+      "job": "re_review",
+      "node_id": "pl-host-capture-pipeline-001",
+      "from_status": "blocked",
+      "to_status": "ready",
+      "action": "unblocked",
+      "reason_codes": ["blocking_deps_resolved"],
+      "previous_blocker_hash": "sha256:blocker:tsk-toolkit-selection-adr-001:not_merged",
+      "current_blocker_hash": "sha256:blocker:none",
+      "idempotency_key": "re_review:pl-host-capture-pipeline-001:sha256:blocker:none"
+    },
+    {
+      "ts": "2026-02-24T15:12:04Z",
+      "job": "decompose",
+      "node_id": "pl-host-capture-pipeline-001",
+      "created_children": [
+        "tsk-capture-service-001",
+        "tsk-encode-adapter-001",
+        "tsk-host-webrtc-publisher-001"
+      ],
+      "auto_merge_defaults": {
+        "auto_merge": true,
+        "auto_merge_on_complete": true
+      }
+    },
+    {
+      "ts": "2026-02-24T16:10:00Z",
+      "job": "synthesize",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "artifact_event_id": "evt-synth-1001",
+      "summary": {
+        "status": "partial",
+        "covered": 2,
+        "uncovered": 1
+      }
+    },
+    {
+      "ts": "2026-02-24T16:10:02Z",
+      "job": "verify",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "artifact_event_id": "evt-verify-1001",
+      "verdict": "fail",
+      "deterministic_fail_reasons": ["missing_definition_of_done_coverage"],
+      "uncovered_gaps": [
+        {
+          "requirement_id": "REQ-PUB-002",
+          "gap_hash": "sha256:req=REQ-PUB-002|kind=behavior|scope=tsk-host-webrtc-publisher-001",
+          "severity": "high"
+        }
+      ],
+      "delta_planning_enqueued": true,
+      "iteration": {
+        "max_iterations": 3,
+        "max_replans": 2,
+        "iteration_index": 1,
+        "replan_index": 0
+      }
+    },
+    {
+      "ts": "2026-02-24T16:10:03Z",
+      "job": "delta_plan",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "proposed_children": [
+        {
+          "id": "exec-reconnect-state-machine-001",
+          "item_type": "execution_task",
+          "depends_on": ["exec-peer-connection-publish-001"],
+          "gap_hash": "sha256:req=REQ-PUB-002|kind=behavior|scope=tsk-host-webrtc-publisher-001"
+        }
+      ],
+      "dedupe": {
+        "gap_hashes_seen_before": [],
+        "duplicate_suppressed": false
+      },
+      "idempotency_key": "delta:tsk-host-webrtc-publisher-001:sha256:in-verify-1001"
+    },
+    {
+      "ts": "2026-02-24T16:20:00Z",
+      "job": "merge_override",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "from_strategy": "auto_merge_on_complete",
+      "to_strategy": "manual",
+      "actor": "user"
+    },
+    {
+      "ts": "2026-02-24T16:32:00Z",
+      "job": "merge",
+      "node_id": "exec-reconnect-state-machine-001",
+      "from_status": "merge_ready",
+      "to_status": "merged",
+      "outcome": "success"
+    },
+    {
+      "ts": "2026-02-24T16:32:10Z",
+      "job": "synthesize",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "artifact_event_id": "evt-synth-1002",
+      "summary": {
+        "status": "complete",
+        "covered": 3,
+        "uncovered": 0
+      }
+    },
+    {
+      "ts": "2026-02-24T16:32:12Z",
+      "job": "verify",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "artifact_event_id": "evt-verify-1002",
+      "verdict": "pass",
+      "deterministic_fail_reasons": [],
+      "iteration": {
+        "max_iterations": 3,
+        "max_replans": 2,
+        "iteration_index": 2,
+        "replan_index": 1,
+        "budget_exhausted": false
+      }
+    },
+    {
+      "ts": "2026-02-24T16:33:00Z",
+      "job": "ready_merge",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "eligible": true,
+      "required_checks": ["unit", "integration", "lint"]
+    },
+    {
+      "ts": "2026-02-24T16:33:30Z",
+      "job": "merge",
+      "node_id": "tsk-host-webrtc-publisher-001",
+      "from_status": "merge_ready",
+      "to_status": "merged",
+      "outcome": "success",
+      "actor": "user"
+    }
+  ]
+}
