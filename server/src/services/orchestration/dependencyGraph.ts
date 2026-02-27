@@ -10,6 +10,13 @@ type GraphNode = {
   dependencies: NodeDependencyRef[];
 };
 
+type ProjectGraphSnapshot = {
+  taskDeps: Map<string, string[]>;
+  taskTierById: Map<string, NodeTier>;
+  taskStatusById: Map<string, string>;
+  nodes: Map<string, GraphNode>;
+};
+
 export type ProposedNode = {
   id: string;
   tier: NodeTier;
@@ -59,10 +66,20 @@ function dedupeRefs(refs: NodeDependencyRef[]): NodeDependencyRef[] {
   return out;
 }
 
-function buildTaskDependencyMap(projectDb: Database.Database): Map<string, string[]> {
-  const rows = projectDb
-    .prepare("SELECT task_id, dependency_task_id FROM task_dependencies ORDER BY created_at ASC")
-    .all() as Array<{ task_id: string; dependency_task_id: string }>;
+function buildTaskDependencyMap(projectDb: Database.Database, projectId?: string): Map<string, string[]> {
+  const rows = (projectId
+    ? projectDb
+      .prepare(
+        `SELECT td.task_id, td.dependency_task_id
+         FROM task_dependencies td
+         JOIN tasks owner ON owner.id = td.task_id
+         WHERE owner.project_id = ?
+         ORDER BY td.created_at ASC`
+      )
+      .all(projectId)
+    : projectDb
+      .prepare("SELECT task_id, dependency_task_id FROM task_dependencies ORDER BY created_at ASC")
+      .all()) as Array<{ task_id: string; dependency_task_id: string }>;
   const out = new Map<string, string[]>();
   for (const row of rows) {
     if (!out.has(row.task_id)) {
@@ -77,22 +94,35 @@ function resolveTaskTier(projectDb: Database.Database, task: TaskRow, dependency
   return readNodeMetadata({ projectDb, task, dependencyTaskIds }).metadata.tier;
 }
 
-function loadExistingGraphNodes(params: {
+const GRAPH_CACHE_TTL_MS = Math.max(0, Number(process.env.AI_CODING_DEP_GRAPH_CACHE_TTL_MS ?? 3000));
+const graphSnapshotCache = new WeakMap<Database.Database, Map<string, { expiresAt: number; snapshot: ProjectGraphSnapshot }>>();
+
+function loadProjectGraphSnapshot(params: {
   projectDb: Database.Database;
   projectId: string;
-}): Map<string, GraphNode> {
+}): ProjectGraphSnapshot {
+  if (GRAPH_CACHE_TTL_MS > 0) {
+    const cachedByProject = graphSnapshotCache.get(params.projectDb);
+    const cached = cachedByProject?.get(params.projectId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.snapshot;
+    }
+  }
+
   const tasks = params.projectDb
     .prepare("SELECT * FROM tasks WHERE project_id = ?")
     .all(params.projectId) as TaskRow[];
-  const taskDeps = buildTaskDependencyMap(params.projectDb);
-
+  const taskDeps = buildTaskDependencyMap(params.projectDb, params.projectId);
   const taskTierById = new Map<string, NodeTier>();
+  const taskStatusById = new Map<string, string>();
+
   for (const task of tasks) {
     const depTaskIds = taskDeps.get(task.id) ?? [];
     taskTierById.set(task.id, resolveTaskTier(params.projectDb, task, depTaskIds));
+    taskStatusById.set(task.id, task.status);
   }
 
-  const out = new Map<string, GraphNode>();
+  const nodes = new Map<string, GraphNode>();
   for (const task of tasks) {
     const depTaskIds = taskDeps.get(task.id) ?? [];
     const tier = taskTierById.get(task.id) ?? resolveTaskTier(params.projectDb, task, depTaskIds);
@@ -103,9 +133,41 @@ function loadExistingGraphNodes(params: {
       refs.push({ id: depTaskId, tier: depTier });
     }
     const normalized = dedupeRefs(refs).filter((ref) => ref.id.length > 0);
-    out.set(keyFor({ id: task.id, tier }), { id: task.id, tier, dependencies: normalized });
+    nodes.set(keyFor({ id: task.id, tier }), { id: task.id, tier, dependencies: normalized });
   }
 
+  const snapshot: ProjectGraphSnapshot = {
+    taskDeps,
+    taskTierById,
+    taskStatusById,
+    nodes
+  };
+
+  if (GRAPH_CACHE_TTL_MS > 0) {
+    const cachedByProject = graphSnapshotCache.get(params.projectDb) ?? new Map<string, { expiresAt: number; snapshot: ProjectGraphSnapshot }>();
+    cachedByProject.set(params.projectId, {
+      expiresAt: Date.now() + GRAPH_CACHE_TTL_MS,
+      snapshot
+    });
+    graphSnapshotCache.set(params.projectDb, cachedByProject);
+  }
+
+  return snapshot;
+}
+
+function loadExistingGraphNodes(params: {
+  projectDb: Database.Database;
+  projectId: string;
+}): Map<string, GraphNode> {
+  const snapshot = loadProjectGraphSnapshot(params);
+  const out = new Map<string, GraphNode>();
+  for (const [nodeKey, node] of snapshot.nodes.entries()) {
+    out.set(nodeKey, {
+      id: node.id,
+      tier: node.tier,
+      dependencies: node.dependencies.map((dep) => ({ ...dep }))
+    });
+  }
   return out;
 }
 
@@ -215,7 +277,7 @@ export function resolveAndValidateNodeDependencies(params: {
       .all(params.projectId, ...taskLikeIds) as TaskRow[]);
   const taskRowById = new Map(taskRows.map((row) => [row.id, row]));
 
-  const taskDeps = buildTaskDependencyMap(params.projectDb);
+  const taskDeps = buildTaskDependencyMap(params.projectDb, params.projectId);
   const rowTierById = new Map<string, NodeTier>();
   for (const row of taskRows) {
     rowTierById.set(row.id, resolveTaskTier(params.projectDb, row, taskDeps.get(row.id) ?? []));
@@ -318,22 +380,18 @@ export function buildDependencyDiagnostics(params: {
   unresolved: Array<{ id: string; tier: NodeTier; reason: string | null; status: string | null }>;
   lineage: Array<{ fromId: string; fromTier: NodeTier; toId: string; toTier: NodeTier; reason: string | null }>;
 } {
-  const allDeps = buildTaskDependencyMap(params.projectDb);
-  const nodeTier = resolveTaskTier(params.projectDb, params.task, allDeps.get(params.task.id) ?? []);
-  const metadata = readNodeMetadata({
+  const snapshot = loadProjectGraphSnapshot({
     projectDb: params.projectDb,
-    task: params.task,
-    dependencyTaskIds: allDeps.get(params.task.id) ?? []
-  }).metadata;
-  const direct = dedupeRefs(normalizeMetadataDependencies(metadata.dependencies, nodeTier));
-  const taskRows = params.projectDb
-    .prepare("SELECT id, status FROM tasks WHERE project_id = ?")
-    .all(params.task.project_id) as Array<{ id: string; status: string }>;
-  const taskStatusById = new Map(taskRows.map((row) => [row.id, row.status]));
+    projectId: params.task.project_id
+  });
+  const allDeps = snapshot.taskDeps;
+  const nodeTier = snapshot.taskTierById.get(params.task.id)
+    ?? resolveTaskTier(params.projectDb, params.task, allDeps.get(params.task.id) ?? []);
+  const direct = snapshot.nodes.get(keyFor({ id: params.task.id, tier: nodeTier }))?.dependencies ?? [];
   const unresolved = direct
     .map((ref) => {
       const tier = ref.tier ?? "task";
-      const status = taskStatusById.get(ref.id) ?? null;
+      const status = snapshot.taskStatusById.get(ref.id) ?? null;
       const resolved = status === "merged";
       return {
         id: ref.id,
@@ -344,7 +402,7 @@ export function buildDependencyDiagnostics(params: {
     })
     .filter((row) => row.status !== "merged");
 
-  const existing = loadExistingGraphNodes({ projectDb: params.projectDb, projectId: params.task.project_id });
+  const existing = snapshot.nodes;
   const lineage: Array<{ fromId: string; fromTier: NodeTier; toId: string; toTier: NodeTier; reason: string | null }> = [];
   const start = keyFor({ id: params.task.id, tier: nodeTier });
   const queue = [start];

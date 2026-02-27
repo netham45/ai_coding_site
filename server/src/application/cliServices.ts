@@ -13,7 +13,7 @@ import {
   pullRemoteRefIntoTaskWorkspace,
   taskBranchName
 } from "../services/git.js";
-import { ideSessionRunning, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
+import { buildIdeResumeCommand, ideSessionRunning, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
@@ -36,6 +36,7 @@ import {
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
 import { assertTaskStatusTransition, evaluateParentCompletionGuards } from "../services/orchestration/stateMachine.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
+import { hasSession } from "../services/tmux.js";
 import type {
   IdeInstanceRow,
   MergeRecordRow,
@@ -828,13 +829,33 @@ function issueIdeLaunchUrl(params: {
 async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, ideId: string): Promise<string> {
   try {
     const session = latestSession(projectDb, task.id);
-    const attachableSession = session && ["starting", "running", "waiting_input"].includes(session.status) ? session : null;
+    let attachableSession: TaskSessionRow | null = null;
+    let resumeCommand: string | null = session
+      ? buildIdeResumeCommand({
+          detectedTool: session.detected_tool,
+          backendCommand: session.backend_command
+        })
+      : null;
+    if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
+      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+      if (alive) {
+        attachableSession = session;
+      } else {
+        const now = nowIso();
+        projectDb
+          .prepare(
+            "UPDATE task_sessions SET status = 'crashed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'ide_open_missing_tmux') WHERE id = ?"
+          )
+          .run(now, now, session.id);
+      }
+    }
     const openPath = await prepareIdeWorkspace({
       taskId: task.id,
       workspacePath: task.workspace_path,
       hasSessionHistory: Boolean(session),
       tmuxSocketPath: attachableSession?.tmux_socket_path,
-      tmuxSessionName: attachableSession?.tmux_session_name
+      tmuxSessionName: attachableSession?.tmux_session_name,
+      resumeCommand
     });
     if (openPath.endsWith(".code-workspace")) {
       return issueIdeLaunchUrl({ projectDb, taskId: task.id, ideId, workspacePath: openPath });

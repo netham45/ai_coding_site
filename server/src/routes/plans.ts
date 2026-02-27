@@ -27,6 +27,7 @@ import type {
 } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
+import { logEndpoint } from "../utils/backendLogger.js";
 
 const createPlanSchema = z.object({
   title: z.string().min(2).max(160),
@@ -78,6 +79,48 @@ function withReplanBudgetOverride(metadata: any, enabled: boolean) {
 }
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
+const PLAN_DETAIL_INCLUDE_HEAVY_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_PLAN_DETAIL_INCLUDE_HEAVY_DEFAULT ?? "");
+
+function queryBoolFlag(input: unknown, fallback: boolean): boolean {
+  if (typeof input !== "string") return fallback;
+  const normalized = input.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function durationFrom(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+}
+
+function logRouteStage(route: string, stage: string, startedAt: bigint, fields?: Record<string, unknown>): void {
+  logEndpoint("http.route.stage", {
+    route,
+    stage,
+    durationMs: durationFrom(startedAt),
+    ...(fields ?? {})
+  });
+}
+
+function parseTime(value: string | null | undefined): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+type ChronoTaskRow = TaskRow & { __rowid?: number };
+
+function compareTaskRowsChronological(a: ChronoTaskRow, b: ChronoTaskRow): number {
+  const createdDiff = parseTime(b.created_at) - parseTime(a.created_at);
+  if (createdDiff !== 0) return createdDiff;
+  const updatedDiff = parseTime(b.updated_at) - parseTime(a.updated_at);
+  if (updatedDiff !== 0) return updatedDiff;
+  const rowidDiff = (b.__rowid ?? Number.NEGATIVE_INFINITY) - (a.__rowid ?? Number.NEGATIVE_INFINITY);
+  if (rowidDiff !== 0) return rowidDiff;
+  const titleDiff = a.title.localeCompare(b.title);
+  if (titleDiff !== 0) return titleDiff;
+  return a.id.localeCompare(b.id);
+}
 
 function planningFormatInstructions(): string {
   return [
@@ -236,7 +279,14 @@ function planForUser(
   return undefined;
 }
 
-function serializeTask(projectDb: Database.Database, task: TaskRow) {
+function serializeTask(
+  projectDb: Database.Database,
+  task: TaskRow,
+  options: {
+    includeCompletion?: boolean;
+  } = {}
+) {
+  const includeCompletion = options.includeCompletion ?? true;
   const dependencyTaskIds = projectDb
     .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as Array<{ dependency_task_id: string }>;
@@ -258,7 +308,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
   const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
     ? Boolean(nodeMetadata.custom?.auto_mode)
     : true;
-  const completion = buildCompletionEvidence(projectDb, task, nodeMetadata);
+  const completion = includeCompletion ? buildCompletionEvidence(projectDb, task, nodeMetadata) : undefined;
 
   return {
     id: task.id,
@@ -296,7 +346,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
         gapHashesSeen: replan.gapHashesSeen
       }
     },
-    completion,
+    ...(completion ? { completion } : {}),
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
@@ -557,6 +607,8 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
 });
 
 plansRouter.get("/plans/:planId", (req, res) => {
+  const includeHeavy = queryBoolFlag(req.query.includeHeavy, PLAN_DETAIL_INCLUDE_HEAVY_DEFAULT);
+  const startedAt = process.hrtime.bigint();
   const scopedPlan = getPlanAccessOrRespond(
     { planId: req.params.planId, userId: req.user.id, notFoundMessage: "Plan not found", intent: "read" },
     res
@@ -622,14 +674,21 @@ plansRouter.get("/plans/:planId", (req, res) => {
     });
   }
 
-  const approvedTasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-    .all(plan.id) as TaskRow[];
+  const approvedTasks = (projectDb
+    .prepare("SELECT *, rowid AS __rowid FROM tasks WHERE parent_plan_task_id = ?")
+    .all(plan.id) as ChronoTaskRow[]).sort(compareTaskRowsChronological);
   const visibility = buildAutomationVisibility(projectDb, plan);
-  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task: plan });
+  const serializeStartedAt = process.hrtime.bigint();
+  const serializedPlan = serializeTask(projectDb, plan, { includeCompletion: includeHeavy });
+  const serializedApproved = approvedTasks.map((task) => serializeTask(projectDb, task, { includeCompletion: includeHeavy }));
+  logRouteStage("/plans/:planId", "serialize", serializeStartedAt, {
+    planId: plan.id,
+    approvedTaskCount: approvedTasks.length,
+    includeHeavy
+  });
 
   res.json({
-    plan: serializeTask(projectDb, plan),
+    plan: serializedPlan,
     transitions: transitions.map(serializeTransition),
     revisions: revisions.map((revision) => ({
       id: revision.id,
@@ -644,11 +703,15 @@ plansRouter.get("/plans/:planId", (req, res) => {
       approvedAt: revision.approved_at,
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
-    approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)),
-    dependencyDiagnostics,
+    approvedTasks: serializedApproved,
+    dependencyDiagnostics: visibility.dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
+  });
+  logRouteStage("/plans/:planId", "response", startedAt, {
+    planId: plan.id,
+    includeHeavy
   });
 });
 
@@ -814,9 +877,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     .get(latestRevision.id, plan.id) as { id: string } | undefined;
 
   if (alreadyApproved) {
-    const approvedTasks = projectDb
-      .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-      .all(plan.id) as TaskRow[];
+    const approvedTasks = (projectDb
+      .prepare("SELECT *, rowid AS __rowid FROM tasks WHERE parent_plan_task_id = ?")
+      .all(plan.id) as ChronoTaskRow[]).sort(compareTaskRowsChronological);
     res.json({ approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) });
     return;
   }
@@ -1119,9 +1182,9 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
 
   kickTaskQueueProcessing();
 
-  const approvedTasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-    .all(plan.id) as TaskRow[];
+  const approvedTasks = (projectDb
+    .prepare("SELECT *, rowid AS __rowid FROM tasks WHERE parent_plan_task_id = ?")
+    .all(plan.id) as ChronoTaskRow[]).sort(compareTaskRowsChronological);
 
   res.json({ approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)) });
 });

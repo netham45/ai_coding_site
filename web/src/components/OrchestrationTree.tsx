@@ -1,6 +1,6 @@
 import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from "@chakra-ui/icons";
 import { Badge, Box, Button, Flex, Heading, HStack, Link, Stack, Text } from "@chakra-ui/react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link as RouterLink } from "react-router-dom";
 import type { HierarchyNode, HierarchyNodeRow, NodeTier, TaskStatus } from "../api/types";
 
@@ -27,6 +27,38 @@ function nodeRoute(node: HierarchyNode) {
   return `/plans/${node.task.id}?tab=ide`;
 }
 
+type ChildStatusKey = TaskStatus | "blocked";
+
+const CHILD_STATUS_ORDER: ChildStatusKey[] = [
+  "blocked",
+  "awaiting_children",
+  "queued",
+  "in_progress",
+  "waiting_input",
+  "merge_ready",
+  "merged",
+  "failed",
+  "cancelled",
+  "merge_conflict"
+];
+
+const CHILD_STATUS_LABELS: Record<ChildStatusKey, string> = {
+  blocked: "blocked",
+  awaiting_children: "awaiting children",
+  queued: "queued",
+  in_progress: "in progress",
+  waiting_input: "waiting input",
+  merge_ready: "merge ready",
+  merged: "merged",
+  failed: "failed",
+  cancelled: "cancelled",
+  merge_conflict: "merge conflict"
+};
+
+function childStatusKey(node: HierarchyNode): ChildStatusKey {
+  return node.task.isBlocked || node.waiting.waiting ? "blocked" : node.task.status;
+}
+
 function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
   const byId = new Map<string, HierarchyNode>();
   rows.forEach((row) => {
@@ -46,6 +78,7 @@ function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
     }
   });
 
+  // Order is backend-defined; do not re-sort client-side.
   return roots;
 }
 
@@ -61,17 +94,12 @@ export function OrchestrationTree({
   selectedNodeId?: string | null;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
-}) {
-  const treeRoots = useMemo(() => (roots.length ? roots : buildFallbackTree(fallbackRows)), [fallbackRows, roots]);
-  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set(treeRoots.map((node) => node.task.id)));
-
-  useEffect(() => {
-    setExpandedNodeIds((previous) => {
-      const next = new Set(previous);
-      treeRoots.forEach((root) => next.add(root.task.id));
-      return next;
-    });
-  }, [treeRoots]);
+  }) {
+  const treeRoots = useMemo(
+    () => (roots.length ? roots : buildFallbackTree(fallbackRows)),
+    [fallbackRows, roots]
+  );
+  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set());
 
   function toggleNode(nodeId: string) {
     setExpandedNodeIds((previous) => {
@@ -163,6 +191,16 @@ function TreeRow({
   const unresolvedDependencyCount = node.waiting.unresolvedDependencyDetails.length;
   const dependencyCount = node.task.dependencyTaskIds.length;
   const isBlocked = node.task.isBlocked || node.waiting.waiting;
+  const childStatusSummary = hasChildren
+    ? CHILD_STATUS_ORDER
+      .map((status) => {
+        const count = node.children.reduce((sum, child) => {
+          return sum + (childStatusKey(child) === status ? 1 : 0);
+        }, 0);
+        return count > 0 ? `${count} ${CHILD_STATUS_LABELS[status]}` : null;
+      })
+      .filter((value): value is string => Boolean(value))
+    : [];
 
   return (
     <Box>
@@ -207,15 +245,14 @@ function TreeRow({
           <Flex mt={1} wrap="wrap" gap={1}>
             <Badge colorScheme={tierColor(node.tier)}>{node.tier}</Badge>
             <Badge colorScheme={statusColor(node.task.status)}>{node.task.status}</Badge>
-            <Badge colorScheme={node.task.autoMerge ? "green" : "gray"}>auto-merge: {node.task.autoMerge ? "on" : "off"}</Badge>
-            {node.task.mode === "plan" ? (
-              <Badge colorScheme={node.task.autoMergeOnComplete ? "green" : "gray"}>
-                auto-merge on complete: {node.task.autoMergeOnComplete ? "on" : "off"}
-              </Badge>
-            ) : null}
             {isBlocked ? <Badge colorScheme="orange">blocked</Badge> : null}
             {unresolvedDependencyCount > 0 ? <Badge colorScheme="red">deps {unresolvedDependencyCount}</Badge> : null}
             {unresolvedDependencyCount === 0 && dependencyCount > 0 ? <Badge colorScheme="gray">deps {dependencyCount}</Badge> : null}
+            {childStatusSummary.length ? (
+              <Badge colorScheme="blue" variant="subtle">
+                children: {childStatusSummary.join(" ")}
+              </Badge>
+            ) : null}
           </Flex>
         </Box>
       </HStack>

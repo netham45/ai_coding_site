@@ -16,6 +16,22 @@ function taskStatusLabel(task: Task): string {
   return task.status;
 }
 
+function parseTime(value: string | null | undefined): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function compareByChronology(a: Task, b: Task): number {
+  const createdDiff = parseTime(a.createdAt) - parseTime(b.createdAt);
+  if (createdDiff !== 0) return createdDiff;
+  const updatedDiff = parseTime(a.updatedAt) - parseTime(b.updatedAt);
+  if (updatedDiff !== 0) return updatedDiff;
+  const titleDiff = a.title.localeCompare(b.title);
+  if (titleDiff !== 0) return titleDiff;
+  return a.id.localeCompare(b.id);
+}
+
 export function TaskSidebar({
   tasks,
   selectedTaskId,
@@ -27,6 +43,8 @@ export function TaskSidebar({
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
 }) {
+  const orderedTasks = [...tasks].sort(compareByChronology);
+
   if (isCollapsed) {
     return (
       <Box
@@ -67,7 +85,7 @@ export function TaskSidebar({
         ) : null}
       </Flex>
       <Stack spacing={2}>
-        {tasks.map((task) => (
+        {orderedTasks.map((task) => (
           <Box
             key={task.id}
             border="1px solid"
