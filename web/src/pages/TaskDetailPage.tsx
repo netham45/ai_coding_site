@@ -122,6 +122,8 @@ export function TaskDetailPage() {
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>([DEFAULT_AI_COMMAND]);
 
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
+  const latestFailedTransition = transitions.find((item) => item.toStatus === "failed");
+  const runtimeFailureReason = session?.failureReason || latestFailedTransition?.reason || null;
 
   async function loadTask() {
     if (!entityId) return;
@@ -749,6 +751,27 @@ export function TaskDetailPage() {
                     {task.workspacePath}
                   </Code>
                 </Box>
+
+                {!!runtimeFailureReason && (
+                  <Box border="1px solid" borderColor="red.300" bg="red.50" borderRadius="md" p={4}>
+                    <Heading size="sm" mb={2} color="red.700">
+                      Runtime Failure
+                    </Heading>
+                    {!!session && (
+                      <Text fontSize="sm" color="red.800" mb={2}>
+                        Session status: {session.status}
+                      </Text>
+                    )}
+                    <Code display="block" whiteSpace="pre-wrap" width="full" p={3} borderRadius="md">
+                      {runtimeFailureReason}
+                    </Code>
+                    {!session?.failureReason && !!latestFailedTransition && (
+                      <Text fontSize="xs" color="red.800" mt={2}>
+                        Derived from last task transition at {new Date(latestFailedTransition.createdAt).toLocaleString()}.
+                      </Text>
+                    )}
+                  </Box>
+                )}
 
                 {!!completionSummary && (
                   <Box>

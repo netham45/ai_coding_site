@@ -79,6 +79,7 @@ type SessionActivityCache = {
 };
 
 const sessionActivityById = new Map<string, SessionActivityCache>();
+const sessionStartupTmuxCommandById = new Map<string, string>();
 
 type TaskGitTopology = {
   pullRemoteRef: string;
@@ -893,6 +894,22 @@ function buildRuntimeEnv(): { env: Record<string, string>; cleanup?: () => void 
   return { env };
 }
 
+function quoteShellArg(value: string): string {
+  if (value.length === 0) return "''";
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function renderShellCommand(tokens: string[]): string {
+  return tokens.map(quoteShellArg).join(" ");
+}
+
+async function writePromptToTempFile(prompt: string): Promise<string> {
+  const filePath = path.join(os.tmpdir(), `ai-coding-site-prompt-${makeId()}.txt`);
+  await fs.promises.writeFile(filePath, prompt, { encoding: "utf8", mode: 0o600 });
+  return filePath;
+}
+
 export async function startTaskRuntime(taskId: string, actorUserId: string, context?: RuntimeTaskContext): Promise<void> {
   const taskContext = resolveTaskProjectContext(taskId, context);
   const projectDb = taskContext.projectDb;
@@ -944,8 +961,23 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
 
   const existingSessions = getActiveSessions(projectDb, taskId);
   if (existingSessions.length) {
-    // Runtime sessions are never force-stopped by server-side start requests.
-    return;
+    let hasLiveSession = false;
+    for (const session of existingSessions) {
+      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+      if (alive) {
+        hasLiveSession = true;
+        break;
+      }
+      projectDb
+        .prepare(
+          "UPDATE task_sessions SET status = 'crashed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'stale_session_missing_tmux') WHERE id = ?"
+        )
+        .run(nowIso(), nowIso(), session.id);
+    }
+    if (hasLiveSession) {
+      // Runtime sessions are never force-stopped by server-side start requests.
+      return;
+    }
   }
 
   // Re-check task status after cleanup to avoid racing with cancel/merge actions.
@@ -965,7 +997,7 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
   const effectivePrompt = buildEffectivePrompt(project, task.task_prompt, dependencySummaries);
   projectDb.prepare("UPDATE tasks SET effective_prompt = ?, updated_at = ? WHERE id = ?").run(effectivePrompt, nowIso(), task.id);
 
-  const built = buildCommand(task.ai_command, effectivePrompt);
+  const built = buildCommand(task.ai_command);
   const sessionId = makeId();
   const sessionName = buildSessionName(task.id, sessionId);
   const socketPath = buildSocketPath(tmuxRoot, task.id);
@@ -990,23 +1022,47 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
     });
   }
 
-  recordEvent({
-    projectId: task.project_id,
-    taskId: task.id,
-    sessionId,
-    eventType: "session.starting",
-    payload: { sessionName, socketPath, tool: built.detectedTool },
-    database: projectDb
-  });
-
   const runtimeEnv = buildRuntimeEnv();
+  let promptFilePath: string | null = null;
   try {
+    promptFilePath = await writePromptToTempFile(effectivePrompt);
+    const startupCommand = "bash";
+    const codexInstruction = quoteShellArg(`read the prompt from ${promptFilePath} and execute it`);
+    const startupScript = `codex --yolo ${codexInstruction}`;
+    const startupArgs = ["-lc", startupScript];
+    const tmuxStartupCommand = renderShellCommand([
+      "tmux",
+      "-S",
+      socketPath,
+      "new-session",
+      "-d",
+      "-s",
+      sessionName,
+      "-c",
+      task.workspace_path,
+      startupCommand,
+      ...startupArgs
+    ]);
+    sessionStartupTmuxCommandById.set(sessionId, tmuxStartupCommand);
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      sessionId,
+      eventType: "session.starting",
+      payload: {
+        sessionName,
+        socketPath,
+        tool: built.detectedTool,
+        startupTmuxCommand: tmuxStartupCommand
+      },
+      database: projectDb
+    });
     await createSession({
       socketPath,
       sessionName,
       cwd: task.workspace_path,
-      command: built.command,
-      args: built.args,
+      command: startupCommand,
+      args: startupArgs,
       env: runtimeEnv.env
     });
     const paneId = await getPaneId(socketPath, sessionName);
@@ -1025,7 +1081,14 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
       database: projectDb
     });
   } catch (error: any) {
+    sessionStartupTmuxCommandById.delete(sessionId);
+    if (promptFilePath) {
+      await fs.promises.rm(promptFilePath, { force: true }).catch(() => {
+        // best effort cleanup; shell path also removes the file on success.
+      });
+    }
     const reason = String(error?.message ?? "failed to start runtime");
+    const failureMeta = error?.meta && typeof error.meta === "object" ? error.meta : undefined;
     projectDb.prepare("UPDATE task_sessions SET status = 'failed', ended_at = ?, failure_reason = ? WHERE id = ?").run(nowIso(), reason, sessionId);
     transitionTaskIfNeeded(projectDb, { taskId: task.id, toStatus: "failed", reason: "runtime_start_failed", actorUserId });
     recordEvent({
@@ -1033,7 +1096,10 @@ export async function startTaskRuntime(taskId: string, actorUserId: string, cont
       taskId: task.id,
       sessionId,
       eventType: "session.failed",
-      payload: { reason },
+      payload: {
+        reason,
+        startupContext: failureMeta
+      },
       database: projectDb
     });
     throw new Error(reason);
@@ -1105,6 +1171,9 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
   const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
   if (!alive) {
     sessionActivityById.delete(session.id);
+    const hasSessionCommand = `tmux -S ${session.tmux_socket_path} has-session -t ${session.tmux_session_name}`;
+    const startupTmuxCommand = sessionStartupTmuxCommandById.get(session.id) ?? session.backend_command;
+    const missingTmuxReason = `runtime_session_missing_tmux (check: ${hasSessionCommand}; launch: ${startupTmuxCommand})`;
     if (hasNewerActiveSession(projectDb, session.task_id, session.started_at, session.id)) {
       projectDb
         .prepare(
@@ -1113,11 +1182,12 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
         .run(nowIso(), nowIso(), session.id);
       return;
     }
-    projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ? AND ended_at IS NULL").run(
-      nowIso(),
-      nowIso(),
-      session.id
-    );
+    sessionStartupTmuxCommandById.delete(session.id);
+    projectDb
+      .prepare(
+        "UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, ?) WHERE id = ? AND ended_at IS NULL"
+      )
+      .run(nowIso(), nowIso(), missingTmuxReason, session.id);
     transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "failed", reason: "runtime_crashed" });
     return;
   }
@@ -1125,14 +1195,15 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
   const paneStatus = await paneExitStatus(session.tmux_socket_path, session.tmux_session_name);
   if (paneStatus.dead) {
     sessionActivityById.delete(session.id);
+    sessionStartupTmuxCommandById.delete(session.id);
     const stopStatus = "crashed";
-    projectDb.prepare("UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ? WHERE id = ?").run(
-      stopStatus,
-      nowIso(),
-      paneStatus.status,
-      nowIso(),
-      session.id
-    );
+    const nonZeroReason =
+      paneStatus.status && paneStatus.status !== 0 ? `runtime_exited_nonzero_exit_code_${paneStatus.status}` : null;
+    projectDb
+      .prepare(
+        "UPDATE task_sessions SET status = ?, ended_at = ?, exit_code = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, ?) WHERE id = ?"
+      )
+      .run(stopStatus, nowIso(), paneStatus.status, nowIso(), nonZeroReason, session.id);
 
     if (paneStatus.status === 0) {
       transitionTaskIfNeeded(projectDb, { taskId: session.task_id, toStatus: "merge_ready", reason: "runtime_exited_cleanly" });
@@ -1208,11 +1279,15 @@ export async function recoverRuntimeSessions(): Promise<void> {
     for (const row of rows) {
       const alive = await hasSession(row.tmux_socket_path, row.tmux_session_name);
       if (!alive) {
-        context.projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(
-          nowIso(),
-          nowIso(),
-          row.id
-        );
+        const hasSessionCommand = `tmux -S ${row.tmux_socket_path} has-session -t ${row.tmux_session_name}`;
+        const startupTmuxCommand = sessionStartupTmuxCommandById.get(row.id) ?? row.backend_command;
+        const missingTmuxReason = `recovery_missing_tmux (check: ${hasSessionCommand}; launch: ${startupTmuxCommand})`;
+        sessionStartupTmuxCommandById.delete(row.id);
+        context.projectDb
+          .prepare(
+            "UPDATE task_sessions SET status = 'crashed', ended_at = ?, last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, ?) WHERE id = ?"
+          )
+          .run(nowIso(), nowIso(), missingTmuxReason, row.id);
         transitionTaskIfNeeded(context.projectDb, { taskId: row.task_id, toStatus: "failed", reason: "recovery_missing_tmux" });
       }
     }
@@ -1238,6 +1313,7 @@ export async function startRuntimeHeartbeat(): Promise<void> {
           await monitorSession(context, session);
         } catch (error: any) {
           if (hasNewerActiveSession(context.projectDb, session.task_id, session.started_at, session.id)) {
+            sessionStartupTmuxCommandById.delete(session.id);
             context.projectDb
               .prepare(
                 "UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = COALESCE(failure_reason, 'superseded_by_newer_session'), last_heartbeat_at = ? WHERE id = ?"
@@ -1245,6 +1321,7 @@ export async function startRuntimeHeartbeat(): Promise<void> {
               .run(nowIso(), nowIso(), nowIso(), session.id);
             continue;
           }
+          sessionStartupTmuxCommandById.delete(session.id);
           context.projectDb.prepare("UPDATE task_sessions SET status = 'crashed', ended_at = ?, failure_reason = ?, last_heartbeat_at = ? WHERE id = ?").run(
             nowIso(),
             String(error?.message ?? "heartbeat failure"),

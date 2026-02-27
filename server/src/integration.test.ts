@@ -542,6 +542,74 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.equal(updated.base_commit_sha_at_create, latestSha);
   });
 
+  test("task rerun clears active runtime session records so restart uses a new session", async () => {
+    const userId = createUser();
+    const basePath = randomPath("rerun-clears-runtime");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "one\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+    const initialSha = gitHead(basePath);
+
+    const taskId = randomUUID();
+    const workspacePath = path.join(path.dirname(basePath), "tasks", taskId);
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO tasks (
+           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+           auto_merge, mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+           status, workspace_path, base_commit_sha_at_create, head_commit_sha, cancel_reason,
+           merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      )
+      .run(
+        taskId,
+        projectId,
+        "Rerun Runtime Reset",
+        "prompt",
+        "done",
+        "effective",
+        "codex --yolo {prompt}",
+        0,
+        "execution",
+        "failed",
+        workspacePath,
+        initialSha,
+        userId,
+        now,
+        now
+      );
+
+    const sessionId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO task_sessions (
+           id, task_id, tmux_session_name, tmux_socket_path, pane_id, detected_tool,
+           backend_command, status, started_at, ended_at, last_heartbeat_at, last_output, exit_code, failure_reason
+         ) VALUES (?, ?, ?, ?, NULL, NULL, ?, 'running', ?, NULL, ?, '', NULL, NULL)`
+      )
+      .run(sessionId, taskId, `task_${taskId}_oldrun`, path.join(os.tmpdir(), `${taskId}.sock`), "codex --yolo prompt", now, now);
+
+    const rerun = await callApi(`/api/tasks/${taskId}/rerun`, { method: "POST", userId });
+    assert.equal(rerun.status, 200);
+    assert.equal(rerun.json?.task?.status, "queued");
+
+    const session = projectDb
+      .prepare("SELECT status, failure_reason, ended_at FROM task_sessions WHERE id = ?")
+      .get(sessionId) as { status: string; failure_reason: string | null; ended_at: string | null };
+    assert.equal(session.status, "stopped");
+    assert.equal(session.failure_reason, "rerun_reset");
+    assert.ok(Boolean(session.ended_at));
+  });
+
   test("cached project DB handle reuse does not rerun baseline migrations", () => {
     const projectId = randomUUID();
     const basePath = randomPath("cached-no-migrate");

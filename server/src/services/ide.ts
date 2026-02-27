@@ -243,13 +243,15 @@ export async function prepareIdeWorkspace(params: {
   }
 
   const workspaceFilePath = path.join(params.workspacePath, `.ai-coding-site-${compactId(params.taskId)}.code-workspace`);
-  const resumeCommand = `cd ${shellSingleQuote(params.workspacePath)} && codex resume --last`;
-  let attachCommand = resumeCommand;
+  let attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && true`;
   if (hasTmuxTarget) {
     const tmuxSocketPath = params.tmuxSocketPath as string;
     const tmuxSessionName = params.tmuxSessionName as string;
-    const tmuxAttachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
-    attachCommand = hasSessionHistory ? `${tmuxAttachCommand} || ${resumeCommand}` : tmuxAttachCommand;
+    const tmuxAttachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} set-option -g mouse on \\; attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+    attachCommand = tmuxAttachCommand;
+  } else if (hasSessionHistory) {
+    // Preserve workspace-task shape for historical sessions, but never auto-resume.
+    attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && echo \"No active tmux session to attach.\"`;
   }
 
   const workspaceSpec = {

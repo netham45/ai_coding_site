@@ -21,6 +21,7 @@ import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSessi
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
+import { hasSession, killSession } from "../services/tmux.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
@@ -177,12 +178,6 @@ function latestSession(projectDb: Database.Database, taskId: string): TaskSessio
   return projectDb
     .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
     .get(taskId) as TaskSessionRow | undefined;
-}
-
-function activeSessions(projectDb: Database.Database, taskId: string): TaskSessionRow[] {
-  return projectDb
-    .prepare("SELECT * FROM task_sessions WHERE task_id = ? AND status IN ('starting','running','waiting_input')")
-    .all(taskId) as TaskSessionRow[];
 }
 
 function latestIde(projectDb: Database.Database, taskId: string): IdeInstanceRow | undefined {
@@ -372,7 +367,7 @@ async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, id
     const openPath = await prepareIdeWorkspace({
       taskId: task.id,
       workspacePath: task.workspace_path,
-      hasSessionHistory: Boolean(session),
+      hasSessionHistory: Boolean(session) && task.status !== "queued",
       tmuxSocketPath: attachableSession?.tmux_socket_path,
       tmuxSessionName: attachableSession?.tmux_session_name
     });
@@ -1046,11 +1041,26 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
       projectDb.prepare("UPDATE ide_instances SET status = 'stopped', ended_at = ?, last_heartbeat_at = ? WHERE id = ?").run(now, now, ide.id);
     }
 
-    const sessions = activeSessions(projectDb, task.id);
-    if (sessions.length) {
-      res.status(409).json({ error: "Cannot rerun while runtime session is active" });
-      return;
+    const sessions = projectDb
+      .prepare("SELECT * FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC")
+      .all(task.id) as TaskSessionRow[];
+    projectDb
+      .prepare(
+        `UPDATE task_sessions
+         SET status = 'stopped',
+             ended_at = COALESCE(ended_at, ?),
+             last_heartbeat_at = ?
+         WHERE task_id = ?
+           AND status IN ('starting','running','waiting_input')`
+      )
+      .run(now, now, task.id);
+    for (const session of sessions) {
+      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+      if (alive) {
+        await killSession(session.tmux_socket_path, session.tmux_session_name);
+      }
     }
+    projectDb.prepare("DELETE FROM task_sessions WHERE task_id = ?").run(task.id);
 
     if (!isSafeTaskWorkspacePath(task.workspace_path, project.base_path)) {
       throw new Error("Unsafe task workspace path; refusing to reset outside task workspace directory");
@@ -1066,7 +1076,12 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
     }
     const baseCommitSha = await getHeadCommitSha(sourcePath);
 
-    await fs.promises.rm(task.workspace_path, { recursive: true, force: true });
+    await fs.promises.rm(task.workspace_path, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 150
+    });
     await fs.promises.mkdir(task.workspace_path, { recursive: true });
 
     const latestTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
@@ -1105,7 +1120,9 @@ tasksRouter.post("/tasks/:taskId/rerun", async (req, res) => {
         previousStatus: latestTask.status
       }
     });
-    res.json({ task: serializeTask(projectDb, updated) });
+    kickTaskQueueProcessing();
+    const refreshedTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+    res.json({ task: serializeTask(projectDb, refreshedTask), session: serializeSession(latestSession(projectDb, task.id)) });
   } catch (error: any) {
     res.status(409).json({ error: String(error?.message ?? "Failed to re-run task") });
   }

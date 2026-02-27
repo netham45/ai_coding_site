@@ -31,7 +31,7 @@ export function classifyTool(aiCommand: string): DetectedTool {
   return "custom";
 }
 
-export function buildCommand(aiCommand: string, effectivePrompt: string): AdapterExecution {
+export function buildCommand(aiCommand: string): AdapterExecution {
   const tokens = tokenize(aiCommand);
   if (!tokens.length) {
     throw new Error("ai_command cannot be empty");
@@ -40,11 +40,20 @@ export function buildCommand(aiCommand: string, effectivePrompt: string): Adapte
     throw new Error("ai_command contains blocked shell metacharacters");
   }
 
-  const args = tokens.slice(1).map((token) => token.replaceAll("{prompt}", effectivePrompt));
+  const detectedTool = classifyTool(aiCommand);
+  const normalizedTokens = [...tokens];
+  if (detectedTool === "codex" && normalizedTokens[1]?.toLowerCase() === "resume") {
+    normalizedTokens.splice(1, normalizedTokens.length - 1, "--yolo");
+  }
+
+  const args = normalizedTokens
+    .slice(1)
+    .map((token) => token.replaceAll("{prompt}", ""))
+    .filter((token) => token.length > 0);
 
   return {
-    detectedTool: classifyTool(aiCommand),
-    command: tokens[0],
+    detectedTool,
+    command: normalizedTokens[0],
     args,
     supportsInteractiveInput: true
   };
