@@ -28,15 +28,22 @@ import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
 import {
   api,
+  cancelWorkflowRun,
   approveNodeBudgetOverride,
   forceNodeReReview,
   getNode,
+  getNodeWorkflowStatus,
+  listWorkflowDefinitions,
   setNodeAutoMerge,
   setNodeAutoMode,
-  startNode
+  setNodeWorkflowAssignment,
+  startWorkflowRun,
+  startNode,
+  tickWorkflowRun
 } from "../api/client";
 import { NodeActionsPanel, type NodeActionLoadingState } from "../components/NodeActionsPanel";
 import { TaskSidebar } from "../components/TaskSidebar";
+import { WorkflowPanel } from "../components/WorkflowPanel";
 import type {
   GitStatusSummary,
   IdeInstance,
@@ -47,7 +54,9 @@ import type {
   Task,
   TaskSession,
   TaskTransition,
-  UserSettings
+  UserSettings,
+  WorkflowDefinition,
+  WorkflowRunState
 } from "../api/types";
 
 type TaskDetailResponse = {
@@ -143,6 +152,15 @@ export function TaskDetailPage() {
   const [nodeDetail, setNodeDetail] = useState<OrchestrationNodeDetail | null>(null);
   const [nodeDetailLoading, setNodeDetailLoading] = useState(false);
   const [nodeDetailError, setNodeDetailError] = useState<string | null>(null);
+  const [workflowDefinitions, setWorkflowDefinitions] = useState<WorkflowDefinition[]>([]);
+  const [workflowState, setWorkflowState] = useState<WorkflowRunState | null>(null);
+  const [workflowLoading, setWorkflowLoading] = useState(false);
+  const [workflowActionLoading, setWorkflowActionLoading] = useState({
+    assignment: false,
+    continue: false,
+    retry: false,
+    cancel: false
+  });
   const [nodeActionLoading, setNodeActionLoading] = useState<NodeActionLoadingState>({
     start: false,
     autoMode: false,
@@ -214,6 +232,26 @@ export function TaskDetailPage() {
     }
   }
 
+  async function loadWorkflowDefinitions(currentProjectId: string) {
+    const response = await listWorkflowDefinitions(currentProjectId);
+    setWorkflowDefinitions(response.definitions ?? []);
+  }
+
+  async function loadWorkflowStatus(currentNodeId: string, suppressError = false) {
+    setWorkflowLoading(true);
+    try {
+      const response = await getNodeWorkflowStatus(currentNodeId);
+      setWorkflowState(response.workflow ?? null);
+    } catch (error: any) {
+      setWorkflowState(null);
+      if (!suppressError) {
+        toast({ status: "warning", title: "Workflow status unavailable", description: error.message });
+      }
+    } finally {
+      setWorkflowLoading(false);
+    }
+  }
+
   function updatePlanItemDraft(itemKey: string, updates: Partial<PlanItemDraft>, defaults: Pick<PlanItemDraft, "title" | "description">) {
     setPlanItemDrafts((current) => {
       const key = itemKey.toLowerCase();
@@ -258,6 +296,17 @@ export function TaskDetailPage() {
   }, [entityId]);
 
   useEffect(() => {
+    if (!entityId || !task?.projectId) return;
+    loadWorkflowDefinitions(task.projectId).catch((error: Error) => {
+      toast({ status: "error", title: "Failed to load workflow definitions", description: error.message });
+    });
+    loadWorkflowStatus(entityId).catch(() => {
+      // handled in helper
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entityId, task?.projectId]);
+
+  useEffect(() => {
     if (!task?.projectId) return;
     loadProjectContext(task.projectId).catch((error: Error) => {
       toast({ status: "error", title: "Failed to load task list", description: error.message });
@@ -276,7 +325,8 @@ export function TaskDetailPage() {
     const interval = setInterval(() => {
       Promise.all([
         loadTask(),
-        entityId ? loadNodeDetails(entityId, true) : Promise.resolve()
+        entityId ? loadNodeDetails(entityId, true) : Promise.resolve(),
+        entityId ? loadWorkflowStatus(entityId, true) : Promise.resolve()
       ]).catch((error: Error) => {
         console.error("Failed to poll task", error);
       });
@@ -643,6 +693,57 @@ export function TaskDetailPage() {
         ...(reason?.trim() ? { reason: reason.trim() } : {})
       });
     }, "Budget override updated");
+  }
+
+  async function runWorkflowAction(
+    action: keyof typeof workflowActionLoading,
+    actionFn: () => Promise<void>,
+    successTitle: string
+  ) {
+    setWorkflowActionLoading((current) => ({ ...current, [action]: true }));
+    try {
+      await actionFn();
+      if (entityId) {
+        await Promise.all([loadTask(), loadNodeDetails(entityId, true), loadWorkflowStatus(entityId, true)]);
+      }
+      toast({ status: "success", title: successTitle });
+    } catch (error: any) {
+      toast({ status: "error", title: "Workflow action failed", description: error.message });
+    } finally {
+      setWorkflowActionLoading((current) => ({ ...current, [action]: false }));
+    }
+  }
+
+  function handleSaveWorkflowAssignment(mode: "builtin" | "custom", workflowDefinitionId: string | null) {
+    if (!entityId) return;
+    runWorkflowAction("assignment", async () => {
+      await setNodeWorkflowAssignment(entityId, { mode, workflowDefinitionId });
+    }, "Workflow assignment saved");
+  }
+
+  function handleContinueWorkflow() {
+    if (!task?.projectId || !workflowState) return;
+    runWorkflowAction("continue", async () => {
+      await tickWorkflowRun(task.projectId, workflowState.run.id);
+    }, "Workflow tick requested");
+  }
+
+  function handleRetryWorkflow() {
+    if (!task?.projectId || !entityId || !workflowState?.definition?.id) return;
+    runWorkflowAction("retry", async () => {
+      await startWorkflowRun(task.projectId, {
+        workflowDefinitionId: workflowState.definition.id,
+        taskId: entityId
+      });
+    }, "Workflow run restarted");
+  }
+
+  function handleCancelWorkflow() {
+    if (!task?.projectId || !workflowState) return;
+    const reason = window.prompt("Cancel workflow reason (optional):");
+    runWorkflowAction("cancel", async () => {
+      await cancelWorkflowRun(task.projectId, workflowState.run.id, reason?.trim() ? { reason: reason.trim() } : {});
+    }, "Workflow run cancelled");
   }
 
   const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
@@ -1216,6 +1317,20 @@ export function TaskDetailPage() {
                     onSetAutoMerge={handleSetNodeAutoMerge}
                     onForceReReview={handleForceNodeReReview}
                     onApproveBudgetOverride={handleApproveNodeBudgetOverride}
+                  />
+                </Box>
+
+                <Box>
+                  <WorkflowPanel
+                    task={task}
+                    workflow={workflowState}
+                    definitions={workflowDefinitions}
+                    isLoading={workflowLoading}
+                    actionLoading={workflowActionLoading}
+                    onSaveAssignment={handleSaveWorkflowAssignment}
+                    onContinue={handleContinueWorkflow}
+                    onRetry={handleRetryWorkflow}
+                    onCancel={handleCancelWorkflow}
                   />
                 </Box>
 

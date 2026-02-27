@@ -210,6 +210,75 @@ CREATE TABLE IF NOT EXISTS plan_orchestration_state (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_orchestration_state_lock_expires_at ON plan_orchestration_state(lock_expires_at);
 
+CREATE TABLE IF NOT EXISTS workflow_definitions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  definition_yaml TEXT NOT NULL,
+  created_by_user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_definitions_project_id ON workflow_definitions(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_definitions_project_name_version
+  ON workflow_definitions(project_id, name, version);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY,
+  workflow_definition_id TEXT NOT NULL REFERENCES workflow_definitions(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','cancelled')),
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_definition_id ON workflow_runs(workflow_definition_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_project_id ON workflow_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status);
+
+CREATE TABLE IF NOT EXISTS workflow_stage_runs (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+  stage_key TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','failed','skipped','cancelled')),
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (workflow_run_id, stage_key)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_stage_runs_workflow_run_id ON workflow_stage_runs(workflow_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_stage_runs_status ON workflow_stage_runs(status);
+
+CREATE TABLE IF NOT EXISTS workflow_check_results (
+  id TEXT PRIMARY KEY,
+  workflow_stage_run_id TEXT NOT NULL REFERENCES workflow_stage_runs(id) ON DELETE CASCADE,
+  check_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pass','fail','error')),
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_check_results_stage_run_id ON workflow_check_results(workflow_stage_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_check_results_status ON workflow_check_results(status);
+
+CREATE TABLE IF NOT EXISTS workflow_events (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT REFERENCES workflow_runs(id) ON DELETE CASCADE,
+  workflow_stage_run_id TEXT REFERENCES workflow_stage_runs(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_run_id ON workflow_events(workflow_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_stage_run_id ON workflow_events(workflow_stage_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_event_type ON workflow_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at ON workflow_events(created_at);
+
 CREATE TABLE IF NOT EXISTS ide_instances (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

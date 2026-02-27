@@ -6,7 +6,9 @@ import {
   registerOrchestrationJobHandler,
   type OrchestrationJobType
 } from "./orchestration/jobQueue.js";
+import { readNodeMetadata } from "./orchestration/metadata.js";
 import { startTaskRuntimeWorker } from "./runtimeWorker.js";
+import { startBuiltinWorkflowForTierTask, type BuiltinWorkflowTier } from "./workflowBuiltins.js";
 
 const MAX_TASKS_PER_PASS = 8;
 const startingTaskIds = new Set<string>();
@@ -19,6 +21,12 @@ type QueuedTaskRow = {
   project_id: string;
   parent_plan_task_id: string | null;
   mode: "execution" | "plan";
+  metadata_json: string;
+  auto_merge: number;
+  auto_start: number;
+  auto_merge_on_complete: number;
+  source_plan_revision_id: string | null;
+  source_plan_item_key: string | null;
   created_by_user_id: string;
   created_at: string;
 };
@@ -38,7 +46,8 @@ async function processQueuedTasksPass(): Promise<void> {
     });
     const rows = scoped.database
       .prepare(
-        `SELECT t.id, t.project_id, t.parent_plan_task_id, t.mode, t.created_by_user_id, t.created_at
+        `SELECT t.id, t.project_id, t.parent_plan_task_id, t.mode, t.metadata_json, t.auto_merge, t.auto_start, t.auto_merge_on_complete,
+                t.source_plan_revision_id, t.source_plan_item_key, t.created_by_user_id, t.created_at
          FROM tasks t
          WHERE t.project_id = ?
            AND t.status = 'queued'
@@ -84,16 +93,38 @@ async function processQueuedTasksPass(): Promise<void> {
         intent: "write"
       }).database;
       try {
-        await startTaskRuntimeWorker(row.task.id, row.task.created_by_user_id, {
-          projectId: row.projectId,
-          basePath: row.basePath
-        });
+        const dependencyTaskIds = (
+          projectDb.prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ?").all(row.task.id) as Array<{
+            dependency_task_id: string;
+          }>
+        ).map((entry) => entry.dependency_task_id);
+        const tier = readNodeMetadata({
+          projectDb,
+          task: row.task,
+          dependencyTaskIds
+        }).metadata.tier;
+
+        if (tier === "epoch" || tier === "phase" || tier === "plan") {
+          startBuiltinWorkflowForTierTask({
+            db: projectDb,
+            projectId: row.projectId,
+            taskId: row.task.id,
+            tier: tier as BuiltinWorkflowTier,
+            createdByUserId: row.task.created_by_user_id
+          });
+        } else {
+          await startTaskRuntimeWorker(row.task.id, row.task.created_by_user_id, {
+            projectId: row.projectId,
+            basePath: row.basePath
+          });
+        }
         recordEvent({
           projectId: row.task.project_id,
           taskId: row.task.id,
           eventType: "task.queue.dispatch.succeeded",
           payload: {
             mode: row.task.mode,
+            strategy: tier === "epoch" || tier === "phase" || tier === "plan" ? "workflow_engine" : "runtime_session",
             parentPlanTaskId: row.task.parent_plan_task_id
           },
           database: projectDb

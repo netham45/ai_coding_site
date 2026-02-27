@@ -3,6 +3,8 @@ import type Database from "better-sqlite3";
 import { db as appDb, resolveProjectDatabase } from "../../db/index.js";
 import { runInKeyedAsyncWorker } from "../asyncWorker.js";
 import { nowIso } from "../../utils/time.js";
+import { legacyPlanOrchestrationPassOwnershipEnabled } from "../../config/featureFlags.js";
+import { legacyJobSuppressedByWorkflowOwnership } from "./ownership.js";
 
 const JOB_EVENT_TYPE = "orchestration.job.pending";
 const JOB_DONE_EVENT_TYPE = "orchestration.job.completed";
@@ -229,6 +231,24 @@ async function processProjectJobs(params: { projectId: string; basePath: string 
       });
       continue;
     }
+    const hintTaskId = typeof payload.hintTaskId === "string" ? payload.hintTaskId : null;
+    if (
+      legacyJobSuppressedByWorkflowOwnership({
+        projectDb,
+        jobType: payload.jobType,
+        hintTaskId
+      })
+    ) {
+      markCompleted({
+        projectDb,
+        pendingEventId: row.id,
+        projectId: row.project_id,
+        taskId: row.task_id,
+        status: "skipped",
+        message: `workflow-ownership suppresses ${payload.jobType}`
+      });
+      continue;
+    }
 
     await runInKeyedAsyncWorker(`orchestration-job:${row.id}`, async () => {
       try {
@@ -299,6 +319,7 @@ export function startOrchestrationJobQueueWorker(): void {
   }, JOB_POLL_INTERVAL_MS);
 
   timerTickInterval = setInterval(() => {
+    const includeLegacyPlanOwnership = legacyPlanOrchestrationPassOwnershipEnabled();
     const timerBucket = Math.floor(Date.now() / JOB_TIMER_TICK_MS);
     const projects = appDb
       .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
@@ -319,15 +340,17 @@ export function startOrchestrationJobQueueWorker(): void {
         metadata: { hookName: "on_timer_tick", timerBucket },
         database: scoped.database
       });
-      enqueueOrchestrationJob({
-        projectId: project.id,
-        jobType: "plan_orchestration_pass",
-        idempotencyKey: `timer_tick:plan_orchestrator:${project.id}:${timerBucket}`,
-        debounceMs: 1_000,
-        dedupeWindowMs: JOB_TIMER_TICK_MS,
-        metadata: { hookName: "on_timer_tick", timerBucket },
-        database: scoped.database
-      });
+      if (includeLegacyPlanOwnership) {
+        enqueueOrchestrationJob({
+          projectId: project.id,
+          jobType: "plan_orchestration_pass",
+          idempotencyKey: `timer_tick:plan_orchestrator:${project.id}:${timerBucket}`,
+          debounceMs: 1_000,
+          dedupeWindowMs: JOB_TIMER_TICK_MS,
+          metadata: { hookName: "on_timer_tick", timerBucket },
+          database: scoped.database
+        });
+      }
     }
     void runJobQueuePass();
   }, JOB_TIMER_TICK_MS);
