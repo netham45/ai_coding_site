@@ -383,6 +383,12 @@ export function listWorkflowEventsByRun(db: Database.Database, workflowRunId: st
     .all(workflowRunId) as WorkflowEventRow[];
 }
 
+export function listWorkflowEventsByStageRun(db: Database.Database, workflowStageRunId: string): WorkflowEventRow[] {
+  return db
+    .prepare("SELECT * FROM workflow_events WHERE workflow_stage_run_id = ? ORDER BY created_at ASC")
+    .all(workflowStageRunId) as WorkflowEventRow[];
+}
+
 export function deleteWorkflowEvent(db: Database.Database, id: string): boolean {
   const result = db.prepare("DELETE FROM workflow_events WHERE id = ?").run(id);
   return result.changes > 0;
