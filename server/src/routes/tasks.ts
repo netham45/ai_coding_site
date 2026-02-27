@@ -1329,54 +1329,28 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
     return;
   }
 
-  const metadata = readNodeMetadata({
-    projectDb,
-    task,
-    dependencyTaskIds: (
+  try {
+    await startTaskRuntimeWorker(task.id, req.user.id, {
+      projectId: project.id,
+      basePath: project.base_path,
       projectDb
-        .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
-        .all(task.id) as Array<{ dependency_task_id: string }>
-    ).map((row) => row.dependency_task_id)
-  }).metadata;
-  const autoMode = parsed.data.autoMode
-    ?? (typeof metadata.custom?.auto_mode === "boolean" ? Boolean(metadata.custom?.auto_mode) : true);
-
-  if (depState.nodeTier === "exec") {
-    try {
-      await startTaskRuntimeWorker(task.id, req.user.id, {
-        projectId: project.id,
-        basePath: project.base_path,
-        projectDb
-      });
-    } catch (error: any) {
-      res.status(409).json({ error: String(error?.message ?? "Failed to start node") });
-      return;
-    }
-  } else {
-    const { pendingEventId } = enqueueOrchestrationJob({
-      database: projectDb,
-      projectId: task.project_id,
-      taskId: task.id,
-      jobType: "decompose",
-      idempotencyKey: `manual_start:${task.id}:${makeId()}`,
-      debounceMs: 0,
-      dedupeWindowMs: 250,
-      metadata: {
-        source: "api.manual_start",
-        actorUserId: req.user.id,
-        autoMode
-      }
     });
-    kickOrchestrationJobQueueProcessing();
+  } catch (error: any) {
+    res.status(409).json({ error: String(error?.message ?? "Failed to start node") });
+    return;
+  }
+
+  if (depState.nodeTier !== "exec") {
+    const requestedAutoMode = typeof parsed.data.autoMode === "boolean" ? parsed.data.autoMode : null;
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
       eventType: "orchestration.manual_start",
       database: projectDb,
       payload: {
-        pendingEventId,
-        autoMode,
-        actorUserId: req.user.id
+        requestedAutoMode,
+        actorUserId: req.user.id,
+        strategy: "runtime_session"
       }
     });
   }
