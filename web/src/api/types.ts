@@ -141,7 +141,7 @@ export type CreateNodePayload = {
 };
 
 export type CreateNodeResponse = {
-  task: Task;
+  node: Task;
 };
 
 export type HierarchyWaitingState = {
