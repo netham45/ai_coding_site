@@ -27,7 +27,7 @@ import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
 import { openSqliteDatabase } from "./db/sqlite.js";
-import { CliServiceError, approvePlan } from "./application/cliServices.js";
+import { CliServiceError, approvePlan, extractPlan, reviewPlan, startNode } from "./application/cliServices.js";
 import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
 import { assertTaskStatusTransition, canTransitionLifecycle, evaluateParentCompletionGuards } from "./services/orchestration/stateMachine.js";
 import {
@@ -37,7 +37,6 @@ import {
   runOrchestrationJobQueuePassForTests
 } from "./services/orchestration/jobQueue.js";
 import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
-import { runDecomposeForTask } from "./services/orchestration/jobs/decompose.js";
 import { runDeltaPlanForTask } from "./services/orchestration/jobs/deltaPlan.js";
 import { runEvaluateReadinessForTask } from "./services/orchestration/jobs/evaluateReadiness.js";
 import { runReReviewForTask } from "./services/orchestration/jobs/reReview.js";
@@ -141,6 +140,20 @@ function gitHead(cwd: string): string {
     throw new Error(`git rev-parse HEAD failed: ${result.stderr || result.stdout}`);
   }
   return result.stdout.trim();
+}
+
+async function waitForLatestSessionId(projectDb: Database.Database, taskId: string, timeoutMs = 12_000): Promise<string> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const row = projectDb
+      .prepare("SELECT id FROM task_sessions WHERE task_id = ? ORDER BY started_at DESC LIMIT 1")
+      .get(taskId) as { id: string } | undefined;
+    if (row?.id) {
+      return row.id;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for task session for task ${taskId}`);
 }
 
 function createUser(userId = randomUUID()): string {
@@ -2649,76 +2662,158 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     startHierarchicalOrchestrationJobs();
   });
 
-  test("decompose does not synthesize placeholder descendants from epoch", async () => {
+  test("start triggers runtime session for non-exec and extract surfaces YAML proposed children", async () => {
     const userId = createUser();
-    const basePath = randomPath("decompose-epoch");
+    const basePath = randomPath("runtime-decompose-session");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
     const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
 
-    const epochId = insertTask({
+    const planId = insertTask({
       projectDb,
       projectId,
       userId,
-      title: "Epoch Node",
+      title: "Runtime Plan Node",
       mode: "plan",
       status: "queued"
     });
+
+    const plan = projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "runtime decomposition workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
+
     projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
-      JSON.stringify({ schema_version: 1, tier: "epoch" }),
+      JSON.stringify({ schema_version: 1, tier: "phase" }),
       nowIso(),
-      epochId
+      planId
     );
 
-    await runDecomposeForTask({
-      projectDb,
-      projectId,
-      taskId: epochId,
-      autoMode: true
-    });
+    const started = await startNode({ userId, nodeId: planId, autoMode: true });
+    assert.equal(started.tier, "phase");
 
-    const childrenCount = projectDb
-      .prepare("SELECT COUNT(1) as count FROM tasks WHERE parent_plan_task_id = ?")
-      .get(epochId) as { count: number };
-    assert.equal(childrenCount.count, 0);
+    const sessionId = await waitForLatestSessionId(projectDb, planId);
+    const runtimeYaml = [
+      "```yaml",
+      "tasks:",
+      "  - id: build_exec",
+      "    title: Build execution task",
+      "    prompt: Implement execution behavior",
+      "  - id: follow_up_plan",
+      "    item_type: sub_plan",
+      "    title: Follow-up plan",
+      "    prompt: Plan remaining work",
+      "    depends_on: [build_exec]",
+      "```",
+      ""
+    ].join("\n");
+    projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(runtimeYaml, nowIso(), sessionId);
+
+    const extracted = await extractPlan({ userId, planId });
+    assert.equal(extracted.ok, true);
+    assert.equal(extracted.source, "session_output");
+    assert.equal(extracted.tasksExtracted, 2);
+
+    const planArtifact = path.join(plan.workspace_path, ".ai-plan", "latest-plan.yaml");
+    assert.equal(fs.existsSync(planArtifact), true);
+    const artifactYaml = fs.readFileSync(planArtifact, "utf8");
+    assert.equal(artifactYaml.includes("id: build_exec"), true);
+    assert.equal(artifactYaml.includes("id: follow_up_plan"), true);
+
+    const reviewed = await reviewPlan({ userId, planId });
+    const proposed = reviewed.revisions.find((revision: { status: string }) => revision.status === "proposed");
+    assert.ok(proposed);
+    assert.deepEqual(
+      proposed.items.map((item: { itemKey: string }) => item.itemKey),
+      ["build_exec", "follow_up_plan"]
+    );
+
+    const manualStartEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'orchestration.manual_start' LIMIT 1")
+      .get(planId) as { event_type: string } | undefined;
+    assert.equal(manualStartEvent?.event_type, "orchestration.manual_start");
   });
 
-  test("decompose does not synthesize placeholder descendants from phase/plan/task starts", async () => {
-    const fixtures: Array<{ tier: "phase" | "plan" | "task"; mode: "plan" | "execution"; expected: string[] }> = [
-      { tier: "phase", mode: "plan", expected: ["plan", "task", "exec"] },
-      { tier: "plan", mode: "plan", expected: ["task", "exec"] },
-      { tier: "task", mode: "execution", expected: ["exec"] }
-    ];
+  test("approve creates children from extracted YAML without mirrored placeholder children", async () => {
+    const userId = createUser();
+    const basePath = randomPath("runtime-approve-children");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
 
-    for (const fixture of fixtures) {
-      const userId = createUser();
-      const basePath = randomPath(`decompose-${fixture.tier}`);
-      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
-      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Approve Plan Node",
+      mode: "plan",
+      status: "queued"
+    });
+    const plan = projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    fs.mkdirSync(plan.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], plan.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], plan.workspace_path);
+    runGit(["config", "user.name", "Tests"], plan.workspace_path);
+    fs.writeFileSync(path.join(plan.workspace_path, "README.md"), "approve flow workspace\n", "utf8");
+    runGit(["add", "."], plan.workspace_path);
+    runGit(["commit", "-m", "init"], plan.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], plan.workspace_path);
 
-      const rootId = insertTask({
-        projectDb,
-        projectId,
-        userId,
-        title: `Root ${fixture.tier}`,
-        mode: fixture.mode,
-        status: "queued"
-      });
-      projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
-        JSON.stringify({ schema_version: 1, tier: fixture.tier }),
-        nowIso(),
-        rootId
-      );
-      await runDecomposeForTask({
-        projectDb,
-        projectId,
-        taskId: rootId,
-        autoMode: true
-      });
-      const childrenCount = projectDb
-        .prepare("SELECT COUNT(1) as count FROM tasks WHERE parent_plan_task_id = ?")
-        .get(rootId) as { count: number };
-      assert.equal(childrenCount.count, 0, `unexpected synthesized child for ${fixture.tier}`);
-    }
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "phase" }),
+      nowIso(),
+      planId
+    );
+
+    await startNode({ userId, nodeId: planId, autoMode: true });
+    const sessionId = await waitForLatestSessionId(projectDb, planId);
+    const runtimeYaml = [
+      "```yaml",
+      "tasks:",
+      "  - id: implement_feature",
+      "    title: Implement feature",
+      "    prompt: Build the feature",
+      "  - id: validate_feature",
+      "    title: Validate feature",
+      "    prompt: Test the feature",
+      "    depends_on: [implement_feature]",
+      "```",
+      ""
+    ].join("\n");
+    projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(runtimeYaml, nowIso(), sessionId);
+
+    const extracted = await extractPlan({ userId, planId });
+    assert.equal(extracted.ok, true);
+
+    const reviewed = await reviewPlan({ userId, planId });
+    const proposed = reviewed.revisions.find((revision: { status: string }) => revision.status === "proposed");
+    assert.ok(proposed);
+
+    const approved = await approvePlan({ userId, planId });
+    assert.equal(approved.approvedTasks.length, 2);
+
+    const children = projectDb
+      .prepare(
+        `SELECT source_plan_item_key, source_plan_revision_id
+         FROM tasks
+         WHERE parent_plan_task_id = ?
+         ORDER BY created_at ASC`
+      )
+      .all(planId) as Array<{ source_plan_item_key: string | null; source_plan_revision_id: string | null }>;
+    assert.equal(children.length, 2);
+    assert.deepEqual(
+      children.map((row) => row.source_plan_item_key),
+      ["implement_feature", "validate_feature"]
+    );
+    assert.equal(children.every((row) => row.source_plan_revision_id === proposed.id), true);
+
+    const mirroredPlaceholderCount = projectDb
+      .prepare("SELECT COUNT(*) AS count FROM tasks WHERE parent_plan_task_id = ? AND source_plan_item_key IS NULL")
+      .get(planId) as { count: number };
+    assert.equal(mirroredPlaceholderCount.count, 0);
   });
 
   test("evaluate_readiness emits deterministic structured decisions", async () => {
