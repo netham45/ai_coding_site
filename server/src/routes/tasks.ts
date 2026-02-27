@@ -22,6 +22,7 @@ import { buildIdeResumeCommand, ideSessionRunning, ideSessionTarget, prepareIdeW
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
+import { startBuiltinWorkflowForTierTask, type BuiltinWorkflowTier } from "../services/workflowBuiltins.js";
 import { hasSession, killSession } from "../services/tmux.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
@@ -2023,18 +2024,19 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
     return;
   }
 
-  try {
-    await startTaskRuntimeWorker(task.id, req.user.id, {
-      projectId: project.id,
-      basePath: project.base_path,
-      projectDb
-    });
-  } catch (error: any) {
-    res.status(409).json({ error: String(error?.message ?? "Failed to start node") });
-    return;
-  }
-
-  if (depState.nodeTier !== "exec") {
+  if (depState.nodeTier === "epoch" || depState.nodeTier === "phase" || depState.nodeTier === "plan") {
+    try {
+      startBuiltinWorkflowForTierTask({
+        db: projectDb,
+        projectId: project.id,
+        taskId: task.id,
+        tier: depState.nodeTier as BuiltinWorkflowTier,
+        createdByUserId: req.user.id
+      });
+    } catch (error: any) {
+      res.status(409).json({ error: String(error?.message ?? "Failed to start node workflow") });
+      return;
+    }
     const requestedAutoMode = typeof parsed.data.autoMode === "boolean" ? parsed.data.autoMode : null;
     recordEvent({
       projectId: task.project_id,
@@ -2044,9 +2046,34 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
       payload: {
         requestedAutoMode,
         actorUserId: req.user.id,
-        strategy: "runtime_session"
+        strategy: "workflow_engine"
       }
     });
+  } else {
+    try {
+      await startTaskRuntimeWorker(task.id, req.user.id, {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb
+      });
+    } catch (error: any) {
+      res.status(409).json({ error: String(error?.message ?? "Failed to start node") });
+      return;
+    }
+    if (depState.nodeTier !== "exec") {
+      const requestedAutoMode = typeof parsed.data.autoMode === "boolean" ? parsed.data.autoMode : null;
+      recordEvent({
+        projectId: task.project_id,
+        taskId: task.id,
+        eventType: "orchestration.manual_start",
+        database: projectDb,
+        payload: {
+          requestedAutoMode,
+          actorUserId: req.user.id,
+          strategy: "runtime_session"
+        }
+      });
+    }
   }
 
   const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;

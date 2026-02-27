@@ -36,6 +36,7 @@ import {
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
 import { assertTaskStatusTransition, evaluateParentCompletionGuards } from "../services/orchestration/stateMachine.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
+import { startBuiltinWorkflowForTierTask, type BuiltinWorkflowTier } from "../services/workflowBuiltins.js";
 import { hasSession } from "../services/tmux.js";
 import type {
   IdeInstanceRow,
@@ -1164,17 +1165,18 @@ export async function startNode(params: { userId: string; nodeId: string; autoMo
   }
   const tier = nodeTierForTask(projectDb, task);
 
-  try {
-    await startTaskRuntimeWorker(task.id, params.userId, {
-      projectId: project.id,
-      basePath: project.base_path,
-      projectDb
-    });
-  } catch (error: any) {
-    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
-  }
-
-  if (tier !== "exec") {
+  if (tier === "epoch" || tier === "phase" || tier === "plan") {
+    try {
+      startBuiltinWorkflowForTierTask({
+        db: projectDb,
+        projectId: project.id,
+        taskId: task.id,
+        tier: tier as BuiltinWorkflowTier,
+        createdByUserId: params.userId
+      });
+    } catch (error: any) {
+      throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node workflow"));
+    }
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
@@ -1184,9 +1186,33 @@ export async function startNode(params: { userId: string; nodeId: string; autoMo
         source: "cli",
         requestedAutoMode: typeof params.autoMode === "boolean" ? params.autoMode : null,
         actorUserId: params.userId,
-        strategy: "runtime_session"
+        strategy: "workflow_engine"
       }
     });
+  } else {
+    try {
+      await startTaskRuntimeWorker(task.id, params.userId, {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb
+      });
+    } catch (error: any) {
+      throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
+    }
+    if (tier !== "exec") {
+      recordEvent({
+        projectId: task.project_id,
+        taskId: task.id,
+        eventType: "orchestration.manual_start",
+        database: projectDb,
+        payload: {
+          source: "cli",
+          requestedAutoMode: typeof params.autoMode === "boolean" ? params.autoMode : null,
+          actorUserId: params.userId,
+          strategy: "runtime_session"
+        }
+      });
+    }
   }
 
   const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
