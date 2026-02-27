@@ -4,6 +4,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { db as appDb, resolveProjectDatabase } from "../db/index.js";
 import { approvePlan, extractPlan } from "../application/cliServices.js";
+import { legacyPlanOrchestrationPassOwnershipEnabled } from "../config/featureFlags.js";
 import type { PlanOrchestrationStateRow, PlanRevisionRow, TaskRow } from "../types.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
@@ -400,6 +401,9 @@ async function runPlanOrchestrationPass(): Promise<void> {
 }
 
 export function kickPlanOrchestrationProcessing(): void {
+  if (!legacyPlanOrchestrationPassOwnershipEnabled()) {
+    return;
+  }
   const projects = appDb
     .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
     .all() as Array<{ id: string; base_path: string }>;
@@ -423,6 +427,9 @@ export function kickPlanOrchestrationProcessing(): void {
 }
 
 export function startPlanOrchestrationWorker(): void {
+  if (!legacyPlanOrchestrationPassOwnershipEnabled()) {
+    return;
+  }
   if (!planJobRegistered) {
     registerOrchestrationJobHandler(PLAN_ORCHESTRATION_JOB_TYPE, async (context) => {
       if (context.payload.metadata?.hookName === "on_timer_tick") {
