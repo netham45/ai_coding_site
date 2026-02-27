@@ -583,7 +583,7 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     }
   });
 
-  test("unified nodes endpoint creates epoch/phase/plan/task tiers with expected mode and dependencies", async () => {
+  test("legacy and unified create endpoints produce expected tiers, modes, and dependencies", async () => {
     const userId = createUser();
     const basePath = randomPath("nodes-endpoint");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
@@ -595,6 +595,35 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     fs.writeFileSync(path.join(basePath, "README.md"), "seed\n", "utf8");
     runGit(["add", "."], basePath);
     runGit(["commit", "-m", "initial"], basePath);
+
+    const legacyPlanCreate = await callApi(`/api/projects/${projectId}/plans`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Legacy Plan",
+        taskPrompt: "Draft a legacy plan prompt.",
+        autoStart: true
+      }
+    });
+    assert.equal(legacyPlanCreate.status, 201);
+    const legacyPlanId = legacyPlanCreate.json?.plan?.id;
+    assert.equal(legacyPlanCreate.json?.plan?.mode, "plan");
+    assert.equal(legacyPlanCreate.json?.plan?.nodeMetadata?.tier, "plan");
+
+    const legacyTaskCreate = await callApi(`/api/projects/${projectId}/tasks`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Legacy Task",
+        taskPrompt: "Implement legacy task changes.",
+        dependencyNodeRefs: [{ id: legacyPlanId, tier: "plan", reason: "legacy_plan_dependency" }]
+      }
+    });
+    assert.equal(legacyTaskCreate.status, 201);
+    const legacyTaskId = legacyTaskCreate.json?.task?.id;
+    assert.equal(legacyTaskCreate.json?.task?.mode, "execution");
+    assert.equal(legacyTaskCreate.json?.task?.nodeMetadata?.tier, "task");
+    assert.equal(legacyTaskCreate.json?.task?.dependencyTaskIds.includes(legacyPlanId), true);
 
     const epochCreate = await callApi(`/api/projects/${projectId}/nodes`, {
       method: "POST",
@@ -663,14 +692,20 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.equal(taskCreate.json?.node?.parentPlanTaskId, planId);
 
     const storedRows = projectDb
-      .prepare("SELECT id, mode, metadata_json FROM tasks WHERE id IN (?, ?, ?, ?)")
-      .all(epochId, phaseId, planId, taskId) as Array<{ id: string; mode: string; metadata_json: string | null }>;
+      .prepare("SELECT id, mode, metadata_json FROM tasks WHERE id IN (?, ?, ?, ?, ?, ?)")
+      .all(legacyPlanId, legacyTaskId, epochId, phaseId, planId, taskId) as Array<{ id: string; mode: string; metadata_json: string | null }>;
     const rowById = new Map(storedRows.map((row) => [row.id, row]));
+    assert.equal(rowById.get(legacyPlanId)?.mode, "plan");
+    assert.equal(rowById.get(legacyTaskId)?.mode, "execution");
     assert.equal(rowById.get(epochId)?.mode, "plan");
     assert.equal(rowById.get(phaseId)?.mode, "plan");
     assert.equal(rowById.get(planId)?.mode, "plan");
     assert.equal(rowById.get(taskId)?.mode, "execution");
 
+    const legacyPlanMetadata = JSON.parse(rowById.get(legacyPlanId)?.metadata_json ?? "{}");
+    assert.equal(legacyPlanMetadata?.tier, "plan");
+    const legacyTaskMetadata = JSON.parse(rowById.get(legacyTaskId)?.metadata_json ?? "{}");
+    assert.equal(legacyTaskMetadata?.tier, "task");
     const taskMetadata = JSON.parse(rowById.get(taskId)?.metadata_json ?? "{}");
     assert.equal(taskMetadata?.tier, "task");
 
