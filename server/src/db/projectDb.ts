@@ -5,7 +5,7 @@ import { nowIso } from "../utils/time.js";
 import { logWarn } from "../utils/structuredLog.js";
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./migrations.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
-import { openSqliteDatabase } from "./sqlite.js";
+import { assertTestSafeSqlitePath, openSqliteDatabase } from "./sqlite.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
 export const PROJECT_DB_FILENAME = "project.sqlite";
@@ -413,6 +413,7 @@ export function ensureProjectDb(params: EnsureProjectDbParams): ProjectDbHandle 
   const projectId = params.projectId;
   const basePath = path.resolve(params.basePath);
   const dbPath = getProjectDbPath(basePath);
+  assertTestSafeSqlitePath(dbPath);
   const allowCreate = params.initializeIfMissing === true;
   const existingPath = projectPathById.get(projectId);
 
@@ -528,6 +529,7 @@ export function getProjectDb(params: { projectId: string; basePath: string }): D
 export function detectProjectDbMetadata(params: { basePath: string }): ProjectDbMetadata | null {
   const basePath = path.resolve(params.basePath);
   const dbPath = getProjectDbPath(basePath);
+  assertTestSafeSqlitePath(dbPath);
   if (!fs.existsSync(dbPath)) {
     return null;
   }

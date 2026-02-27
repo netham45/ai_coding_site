@@ -1,9 +1,13 @@
+import path from "node:path";
 import Database from "better-sqlite3";
 import { logDb } from "../utils/backendLogger.js";
+import { runningTests, workspaceRoot } from "../utils/paths.js";
 
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
 const INSTRUMENTED_DB = Symbol("instrumented_db");
 const INSTRUMENTED_STATEMENT = Symbol("instrumented_statement");
+const STATIC_PROTECTED_TEST_ROOTS = [path.resolve(path.sep, "repo"), path.resolve(path.sep, "repos"), path.resolve(path.sep, "data")];
+const WORKSPACE_PROTECTED_TEST_ROOTS = [path.join(workspaceRoot, "repos"), path.join(workspaceRoot, "data")];
 
 function normalizeSql(sql: string): string {
   return sql.replace(/\s+/g, " ").trim();
@@ -11,6 +15,30 @@ function normalizeSql(sql: string): string {
 
 function durationMs(started: bigint): number {
   return Number(process.hrtime.bigint() - started) / 1_000_000;
+}
+
+function normalizePathForComparison(inputPath: string): string {
+  const resolved = path.resolve(inputPath);
+  const normalizedSeparators = resolved.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalizedSeparators.toLowerCase() : normalizedSeparators;
+}
+
+function isPathInsideRoot(candidatePath: string, rootPath: string): boolean {
+  const candidate = normalizePathForComparison(candidatePath);
+  const root = normalizePathForComparison(rootPath);
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+export function assertTestSafeSqlitePath(dbPath: string): void {
+  if (!runningTests) {
+    return;
+  }
+  const protectedRoots = [...STATIC_PROTECTED_TEST_ROOTS, ...WORKSPACE_PROTECTED_TEST_ROOTS];
+  if (protectedRoots.some((root) => isPathInsideRoot(dbPath, root))) {
+    throw new Error(
+      `[test-safety] Refusing to open sqlite path in protected root during tests: ${path.resolve(dbPath)}`
+    );
+  }
 }
 
 function sanitizeStatementResult(method: "run" | "get" | "all" | "iterate", result: unknown): Record<string, unknown> {
@@ -195,6 +223,7 @@ export function applyStandardSqlitePragmas(db: Database.Database): void {
 }
 
 export function openSqliteDatabase(dbPath: string): Database.Database {
+  assertTestSafeSqlitePath(dbPath);
   logDb("db.open.start", { dbPath });
   const started = process.hrtime.bigint();
   const db = instrumentDatabase(new Database(dbPath), dbPath);
