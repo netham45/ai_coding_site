@@ -114,6 +114,7 @@ export async function hasSession(socketPath: string, sessionName: string): Promi
 
 export async function sendInput(socketPath: string, sessionName: string, text: string): Promise<void> {
   await execFileAsync("tmux", ["-S", socketPath, "send-keys", "-t", `${sessionName}:0.0`, "-l", text], { timeout: 10000 });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   await execFileAsync("tmux", ["-S", socketPath, "send-keys", "-t", `${sessionName}:0.0`, "Enter"], { timeout: 10000 });
 }
 
