@@ -1,17 +1,8 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, test } from "node:test";
+import { describe, test } from "node:test";
 import Database from "better-sqlite3";
 import { projectBaselineMigration } from "../../db/migrations.js";
 import { legacyJobSuppressedByWorkflowOwnership } from "./ownership.js";
-
-const ORIGINAL_ENV = { ...process.env };
-
-function resetEnv() {
-  for (const key of Object.keys(process.env)) {
-    delete process.env[key];
-  }
-  Object.assign(process.env, ORIGINAL_ENV);
-}
 
 function createTestDb(): Database.Database {
   const db = new Database(":memory:");
@@ -59,10 +50,6 @@ function insertActiveWorkflowRunForTask(db: Database.Database, taskId: string): 
 }
 
 describe("workflow ownership for legacy orchestration jobs", () => {
-  afterEach(() => {
-    resetEnv();
-  });
-
   test("suppresses decompose for plan nodes owned by running workflow", () => {
     const db = createTestDb();
     insertTask(db, { id: "plan-1", mode: "plan" });
@@ -96,11 +83,9 @@ describe("workflow ownership for legacy orchestration jobs", () => {
     db.close();
   });
 
-  test("legacy ownership toggle disables suppression", () => {
-    process.env.ORCHESTRATION_LEGACY_JOB_OWNERSHIP_ENABLED = "true";
+  test("does not suppress when no workflow run owns the plan node", () => {
     const db = createTestDb();
     insertTask(db, { id: "plan-1", mode: "plan" });
-    insertActiveWorkflowRunForTask(db, "plan-1");
 
     assert.equal(
       legacyJobSuppressedByWorkflowOwnership({
