@@ -24,9 +24,9 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
 import { api, createNode, getHierarchy } from "../api/client";
-import type { HierarchyNodeRow, NodeTier, Project, Task, UserSettings } from "../api/types";
+import type { HierarchyNode, HierarchyNodeRow, NodeTier, Project, Task, UserSettings } from "../api/types";
 import { NodeCreateForm } from "../components/NodeCreateForm";
-import { TaskSidebar } from "../components/TaskSidebar";
+import { OrchestrationTree } from "../components/OrchestrationTree";
 
 type ProjectResponse = { project: Project };
 type TasksResponse = { tasks: Task[] };
@@ -59,6 +59,7 @@ export function ProjectDetailPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [hierarchyRoots, setHierarchyRoots] = useState<HierarchyNode[]>([]);
   const [hierarchyNodes, setHierarchyNodes] = useState<HierarchyNodeRow[]>([]);
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>(["codex --yolo {prompt}"]);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
@@ -79,29 +80,34 @@ export function ProjectDetailPage() {
   const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
   const projectIdeAutoAttemptedRef = useRef(false);
 
+  const hierarchyRows = useMemo(
+    () =>
+      hierarchyNodes.length
+        ? hierarchyNodes
+        : tasks.map((task) => ({
+            task,
+            tier: (task.mode === "execution" ? "task" : "plan") as NodeTier,
+            waiting: {
+              waiting: false,
+              reasonCode: "",
+              reason: "",
+              dependencyBlockerTaskId: null,
+              unresolvedDependencyIds: [],
+              unresolvedDependencyDetails: []
+            }
+          })),
+    [hierarchyNodes, tasks]
+  );
+
   const nodeOptions = useMemo(() => {
-    const rows = hierarchyNodes.length
-      ? hierarchyNodes
-      : tasks.map((task) => ({
-          task,
-          tier: (task.mode === "execution" ? "task" : "plan") as NodeTier,
-          waiting: {
-            waiting: false,
-            reasonCode: "",
-            reason: "",
-            dependencyBlockerTaskId: null,
-            unresolvedDependencyIds: [],
-            unresolvedDependencyDetails: []
-          }
-        }));
-    return rows.map((row) => ({
+    return hierarchyRows.map((row) => ({
       id: row.task.id,
       title: row.task.title,
       tier: row.tier,
       status: row.task.status,
       isBlocked: row.task.isBlocked
     }));
-  }, [hierarchyNodes, tasks]);
+  }, [hierarchyRows]);
 
   const nodeTierById = useMemo(() => new Map(nodeOptions.map((node) => [node.id, node.tier])), [nodeOptions]);
 
@@ -127,6 +133,7 @@ export function ProjectDetailPage() {
       projectOther: projectRes.project.projectOther ?? ""
     });
     setTasks(tasksRes.tasks);
+    setHierarchyRoots(hierarchyRes?.hierarchy.roots ?? []);
     setHierarchyNodes(hierarchyRes?.hierarchy.nodes ?? []);
     const commandOptions = settingsRes.settings.defaultAiCommands?.length
       ? settingsRes.settings.defaultAiCommands
@@ -253,7 +260,12 @@ export function ProjectDetailPage() {
 
   return (
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
-      <TaskSidebar tasks={tasks} isCollapsed={isTaskSidebarCollapsed} onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)} />
+      <OrchestrationTree
+        roots={hierarchyRoots}
+        fallbackRows={hierarchyRows}
+        isCollapsed={isTaskSidebarCollapsed}
+        onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)}
+      />
 
       <Box flex="1" bg="white" borderRadius="lg" p={6} boxShadow="sm" border="1px solid" borderColor="blackAlpha.200">
         <Box mb={6}>
