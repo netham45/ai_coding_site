@@ -1,13 +1,21 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import type Database from "better-sqlite3";
 import { parsePlanYaml } from "./planParser.js";
+import { buildInitialNodeMetadata, serializeNodeMetadata } from "./orchestration/metadata.js";
+import { validateProposedNodeGraph } from "./orchestration/dependencyGraph.js";
 import {
   createWorkflowEvent,
+  getWorkflowRunById,
   getWorkflowStageRunById,
   listWorkflowEventsByStageRun,
   transitionWorkflowStageRunStatus
 } from "./workflowRepository.js";
+import { makeId } from "../utils/id.js";
+import { nowIso } from "../utils/time.js";
+import type { NodeDependencyRef, NodeTier, TaskMode, TaskRow } from "../types.js";
 
 export type WorkflowStageActionType =
   | "run_command"
@@ -189,26 +197,227 @@ function taskRuntimePromptDefault(input: Record<string, unknown>): Record<string
   };
 }
 
-function createChildNodesFromPlanYamlDefault(input: Record<string, unknown>): Record<string, unknown> {
-  const yaml = parseStringField(input, "yaml");
-  const parsed = parsePlanYaml(yaml);
-  return {
-    createdChildCount: parsed.tasks.length,
-    itemKeys: parsed.tasks.map((task) => task.itemKey)
-  };
+function projectTaskById(db: Database.Database, taskId: string): TaskRow | undefined {
+  return db.prepare("SELECT * FROM tasks WHERE id = ? LIMIT 1").get(taskId) as TaskRow | undefined;
 }
 
-function reviewChildNodesDefault(input: Record<string, unknown>): Record<string, unknown> {
+function createChildNodesFromPlanYamlDefault(input: Record<string, unknown>, context: StageActionContext): Record<string, unknown> {
+  const workflowRun = getWorkflowRunById(context.db, context.workflowRunId);
+  if (!workflowRun) {
+    throw new StageActionError(`Workflow run not found: ${context.workflowRunId}`, {
+      code: "workflow_run_not_found",
+      retryable: false
+    });
+  }
+
+  const parentTaskIdInput = typeof input.parentTaskId === "string" && input.parentTaskId.trim()
+    ? input.parentTaskId.trim()
+    : workflowRun.task_id;
+  if (!parentTaskIdInput) {
+    throw new StageActionError("Workflow run does not have parent task context", {
+      code: "missing_parent_task_context",
+      retryable: false
+    });
+  }
+  const parentTask = projectTaskById(context.db, parentTaskIdInput);
+  if (!parentTask) {
+    throw new StageActionError(`Parent task not found: ${parentTaskIdInput}`, {
+      code: "parent_task_not_found",
+      retryable: false
+    });
+  }
+
+  const planPath = typeof input.planPath === "string" && input.planPath.trim() ? input.planPath.trim() : ".ai-plan/latest-plan.yaml";
+  const absolutePlanPath = path.isAbsolute(planPath) ? planPath : path.join(parentTask.workspace_path, planPath);
+
+  let yamlText = "";
+  try {
+    yamlText = fs.readFileSync(absolutePlanPath, "utf8");
+  } catch (error: any) {
+    throw new StageActionError(`Unable to read plan YAML: ${absolutePlanPath}`, {
+      code: "plan_yaml_read_error",
+      retryable: true,
+      details: { planPath: absolutePlanPath, error: String(error?.message ?? "read_failed") }
+    });
+  }
+
+  let parsed;
+  try {
+    parsed = parsePlanYaml(yamlText);
+  } catch (error: any) {
+    throw new StageActionError(String(error?.message ?? "Unable to parse plan YAML"), {
+      code: "parse_error",
+      retryable: true
+    });
+  }
+
+  const nodesByItemKey = new Map(parsed.tasks.map((task) => [task.itemKey.toLowerCase(), { id: makeId(), task }]));
+  const missingDeps = new Set<string>();
+  const proposedNodes = parsed.tasks.map((task) => {
+    const mapped = nodesByItemKey.get(task.itemKey.toLowerCase())!;
+    const dependencies: NodeDependencyRef[] = task.dependsOnItemKeys.flatMap((itemKey) => {
+      const dep = nodesByItemKey.get(itemKey.toLowerCase());
+      if (!dep) {
+        missingDeps.add(itemKey);
+        return [];
+      }
+      return [{
+        id: dep.id,
+        tier: dep.task.itemType === "sub_plan" ? "plan" : "exec",
+        reason: `plan_item:${itemKey}`
+      }];
+    });
+    const tier: NodeTier = task.itemType === "sub_plan" ? "plan" : "exec";
+    return {
+      id: mapped.id,
+      tier,
+      dependencies
+    };
+  });
+  if (missingDeps.size > 0) {
+    throw new StageActionError(`Plan contains unknown dependency item key(s): ${[...missingDeps].join(", ")}`, {
+      code: "validation_error",
+      retryable: false,
+      details: { missingDependencies: [...missingDeps] }
+    });
+  }
+  try {
+    validateProposedNodeGraph({
+      projectDb: context.db,
+      projectId: workflowRun.project_id,
+      proposedNodes
+    });
+  } catch (error: any) {
+    throw new StageActionError(String(error?.message ?? "Invalid dependency graph"), {
+      code: "validation_error",
+      retryable: false
+    });
+  }
+
+  const createdAt = nowIso();
+  const children = parsed.tasks.map((task) => {
+    const mapped = nodesByItemKey.get(task.itemKey.toLowerCase())!;
+    const mode: TaskMode = task.itemType === "sub_plan" ? "plan" : "execution";
+    const tier: NodeTier = mode === "plan" ? "plan" : "exec";
+    const dependencyTaskIds = task.dependsOnItemKeys
+      .map((itemKey) => nodesByItemKey.get(itemKey.toLowerCase())?.id)
+      .filter((value): value is string => typeof value === "string");
+    return {
+      id: mapped.id,
+      itemKey: task.itemKey,
+      title: task.title,
+      prompt: task.prompt,
+      mode,
+      tier,
+      dependencyTaskIds
+    };
+  });
+
+  context.db.transaction(() => {
+    for (const child of children) {
+      const metadataJson = serializeNodeMetadata(
+        buildInitialNodeMetadata({
+          task: {
+            id: child.id,
+            project_id: parentTask.project_id,
+            mode: child.mode,
+            metadata_json: null,
+            auto_merge: 0,
+            auto_start: 0,
+            auto_merge_on_complete: 0,
+            parent_plan_task_id: parentTask.id,
+            source_plan_revision_id: null,
+            source_plan_item_key: child.itemKey
+          },
+          dependencyTaskIds: child.dependencyTaskIds,
+          tier: child.tier
+        })
+      );
+      context.db.prepare(
+        `INSERT INTO tasks (
+          id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+          auto_merge, auto_start, auto_merge_on_complete, metadata_json,
+          mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+          status, workspace_path, base_commit_sha_at_create, head_commit_sha,
+          cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, '', ?, ?, 0, 0, 0, ?, ?, ?, NULL, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ).run(
+        child.id,
+        parentTask.project_id,
+        child.title,
+        child.prompt,
+        child.prompt,
+        parentTask.ai_command,
+        metadataJson,
+        child.mode,
+        parentTask.id,
+        child.itemKey,
+        path.join(path.dirname(parentTask.workspace_path), "tasks", child.id),
+        parentTask.head_commit_sha ?? parentTask.base_commit_sha_at_create,
+        parentTask.created_by_user_id,
+        createdAt,
+        createdAt
+      );
+      context.db.prepare(
+        `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
+         VALUES (?, ?, 'null', 'queued', 'task_created_from_workflow_plan_ingest', ?, ?)`
+      ).run(makeId(), child.id, parentTask.created_by_user_id, createdAt);
+      for (const dependencyTaskId of child.dependencyTaskIds) {
+        context.db.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+          child.id,
+          dependencyTaskId,
+          createdAt
+        );
+      }
+    }
+  })();
+
+  const artifact = {
+    parentTaskId: parentTask.id,
+    planPath,
+    createdChildCount: children.length,
+    children: children.map((child) => ({
+      taskId: child.id,
+      itemKey: child.itemKey,
+      mode: child.mode,
+      dependsOnTaskIds: child.dependencyTaskIds
+    }))
+  };
+  createWorkflowEvent(context.db, {
+    workflowRunId: context.workflowRunId,
+    workflowStageRunId: context.stageRunId,
+    eventType: "workflow.stage.action.child_nodes_created",
+    payload: artifact
+  });
+
+  return artifact;
+}
+
+function reviewChildNodesDefault(input: Record<string, unknown>, context: StageActionContext): Record<string, unknown> {
   const childNodesInput = input.childNodes;
-  const childNodes = Array.isArray(childNodesInput) ? childNodesInput : [];
+  let childNodes = Array.isArray(childNodesInput) ? childNodesInput : null;
+  if (!childNodes) {
+    const workflowRun = getWorkflowRunById(context.db, context.workflowRunId);
+    if (!workflowRun?.task_id) {
+      throw new StageActionError("Workflow run does not have parent task context", {
+        code: "missing_parent_task_context",
+        retryable: false
+      });
+    }
+    childNodes = context.db
+      .prepare("SELECT id, status FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
+      .all(workflowRun.task_id) as Array<{ id: string; status: string }>;
+  }
   const statuses = childNodes
     .map((row) => (typeof row === "object" && row !== null ? (row as { status?: unknown }).status : null))
     .filter((status): status is string => typeof status === "string");
-  const failingCount = statuses.filter((status) => status === "failed" || status === "merge_conflict").length;
+  const failingCount = statuses.filter((status) => status === "failed" || status === "merge_conflict" || status === "cancelled").length;
+  const incompleteCount = statuses.filter((status) => status !== "merged").length;
   return {
     reviewedCount: childNodes.length,
     failingCount,
-    approved: failingCount === 0
+    incompleteCount,
+    approved: failingCount === 0 && incompleteCount === 0
   };
 }
 
@@ -280,10 +489,10 @@ async function executeByType(
   if (actionType === "create_child_nodes_from_plan_yaml") {
     return handlers.createChildNodesFromPlanYaml
       ? await handlers.createChildNodesFromPlanYaml(actionInput, context)
-      : createChildNodesFromPlanYamlDefault(actionInput);
+      : createChildNodesFromPlanYamlDefault(actionInput, context);
   }
   if (actionType === "review_child_nodes") {
-    return handlers.reviewChildNodes ? await handlers.reviewChildNodes(actionInput, context) : reviewChildNodesDefault(actionInput);
+    return handlers.reviewChildNodes ? await handlers.reviewChildNodes(actionInput, context) : reviewChildNodesDefault(actionInput, context);
   }
   return handlers.noOp ? await handlers.noOp(actionInput, context) : noOpDefault(actionInput);
 }
