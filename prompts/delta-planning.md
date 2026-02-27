@@ -1,39 +1,125 @@
-# Delta Planning Template
+# Delta Planning Runtime Prompt
 
-Use this template for `delta_plan(parent)` coordinators that generate only gap-closing child nodes from failed verification results.
+## Goal
+Generate only net-new child work needed to close verification-confirmed gaps.
 
-## Include Shared Section
+## Non-Goals
+- Re-proposing completed or already-planned work.
+- Broad re-scoping beyond current verification failures.
+- Exceeding iteration budget.
 
-Include `prompts/shared-input-output.md`.
+## Definition of Done
+- Includes narrative and structured delta plan payload.
+- Proposed children map directly to failed verification gaps.
+- Every proposed child includes deterministic `gap_hash` and valid dependencies.
 
-## Delta-Planning Inputs
+## Dependencies
+- `prompts/shared-input-output.md`
+- `docs/architecture/prompt-contract.md`
+- Verification fail output, iteration budget, seen gap hashes, existing children, DAG state.
+- CLI research context before proposing net-new children:
+  - `npm run cli -- tasks all --project-id <projectId> --json`
+  - `npm run cli -- plans list --project-id <projectId> --json`
+  - `npm run cli -- tasks details <taskId> --project-id <projectId> --json` (target + related open items)
+- Repository code/docs review for impacted gap areas.
 
-- `verification.fail_output` (authoritative source of unmet checks and evidence)
-- `parent.node_id`
-- `parent.iteration_count`
-- `constraints.iteration_budget`
-- `state.gap_hashes_seen` (all previously proposed or completed gap hashes for this parent)
-- `state.existing_children` (open + complete children, with status and prior `gap_hash`)
-- `state.dependency_dag` (current DAG for valid dependency wiring)
+## Artifacts
+- Delta planning artifact with net-new proposed children and dedupe rationale.
 
-## Delta-Planning Requirements
+## Risks
+- Duplicate remediation items due to unstable hash basis.
+- Invalid dependency wiring causing orchestration deadlocks.
 
-- Propose children only for verification-confirmed gaps in `verification.fail_output`.
-- Do not restate, recreate, or re-scope already complete work.
-- Do not propose a child when its `gap_hash` exists in `state.gap_hashes_seen`.
-- Each proposed child must include a deterministic `gap_hash` derived from normalized gap evidence.
-- Emit only net-new children; unchanged or existing children must be excluded from output.
-- Dependencies for each child must reference valid nodes in `state.dependency_dag`.
-- Keep output minimal and bounded to gap closure for this iteration only.
-- If `parent.iteration_count >= constraints.iteration_budget`, do not propose new children; emit escalation.
+## Idempotency
+- Compute gap hashes from normalized failing requirement evidence.
+- Skip items whose `gap_hash` already exists in seen state.
 
-## Output
+## Bounded Iteration
+- Respect `constraints.iteration_budget` strictly.
+- If budget exhausted, emit escalation and no new children.
 
-- Natural-language rationale
-- Structured payload per prompt contract that includes:
-  - `proposed_children` (net-new only)
-  - `proposed_children[].gap_hash` (required for every child)
-  - `proposed_children[].deps` (DAG-valid dependencies only)
-  - `dedupe` summary (why skipped items were excluded)
-  - `escalation` when iteration budget is exceeded
-  - `bounded_iteration` guidance aligned to remaining budget
+## Auto-Merge Guidance
+- Delta plans are not merge-eligible by default.
+
+## Runtime Prompt Text
+Use verification failures as authoritative and propose the smallest set of new children that close uncovered requirements. Exclude unchanged, complete, or duplicate work.
+
+Before proposing any new child, run a research pass across related hierarchy nodes (CLI) and relevant code/docs so the delta only adds truly missing work.
+
+## Structured Output Contract
+Return exactly two sections:
+1. Narrative delta rationale.
+2. Structured payload (YAML preferred) compliant with shared contract and:
+
+```yaml
+schema_version: "1.0"
+node:
+  id: "<parent-id>"
+  tier: epoch | phase | plan | task
+  parent_id: "<parent-id-or-null>"
+  children_ids: ["<child-id>"]
+  status: in_progress | awaiting_children | waiting_input
+
+goals: ["<goal>"]
+non_goals: ["<non-goal>"]
+definition_of_done: ["<DoD>"]
+deps:
+  - id: "<dependency-id>"
+    reason: "<why required>"
+artifacts:
+  - path: "<delta-plan-artifact>"
+    kind: file
+    required: true
+risks:
+  - risk: "<risk>"
+    impact: medium
+    mitigation: "<mitigation>"
+idempotency:
+  input_fingerprint: "<hash>"
+  output_fingerprint: "<hash>"
+  dedupe_key: "delta-planning:<parent-id>:<input-fingerprint>"
+  idempotent: true
+bounded_iteration:
+  max_iterations: 1
+  max_replans: 0
+  stop_conditions:
+    - "Net-new gap-closing children emitted"
+    - "Budget exhausted"
+  escalation_on_limit: "Escalate when iteration budget exceeded"
+auto_merge_guidance:
+  eligible: false
+  strategy: manual
+  required_checks: ["Verification re-run required"]
+  blockers: ["Budget exhausted or unresolved external dependency"]
+
+delta_plan:
+  proposed_children:
+    - id: "<child-id>"
+      tier: plan | task | exec
+      title: "<title>"
+      objective: "<gap-closing outcome>"
+      gap_hash: "<sha256>"
+      deps:
+        - id: "<valid-node-id>"
+          reason: "<why required>"
+      prompt: "<runtime prompt text>"
+  dedupe:
+    skipped_gap_hashes: ["<hash>"]
+    skipped_reasons: ["already_seen", "already_complete", "out_of_scope"]
+  escalation:
+    required: false
+    reason: "<if true>"
+    requested_decision: "<needed decision>"
+research_evidence:
+  cli_queries:
+    - command: "npm run cli -- tasks all --project-id <projectId> --json"
+      findings: "<what was learned>"
+    - command: "npm run cli -- plans list --project-id <projectId> --json"
+      findings: "<what was learned>"
+  repo_reads:
+    - path: "<file-or-dir>"
+      findings: "<what was learned>"
+  tree_coverage:
+    reviewed_related_nodes: ["<node-id>"]
+    coverage_note: "Confirm related open/completed work was reviewed before proposing delta children"
+```
