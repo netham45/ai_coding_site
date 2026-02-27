@@ -1,0 +1,68 @@
+{
+  "scenario_id": "webrtc-remote-desktop-workflow-engine-e2e-001",
+  "prompt": "Create a remote desktop application that uses WebRTC to stream Windows to browsers captured via WGC and converted using WMF",
+  "ownership": "workflow_engine",
+  "workflow_run_id": "wf-run-remote-desktop",
+  "stages": [
+    {
+      "stage_key": "generate_plan_yaml",
+      "transition": "pending -> running -> succeeded"
+    },
+    {
+      "stage_key": "ingest_child_nodes",
+      "transition": "pending -> blocked(missing_plan_yaml) -> running -> succeeded",
+      "artifacts": {
+        "generated_child_nodes": [
+          "exec-wgc-capture",
+          "exec-wmf-convert"
+        ]
+      }
+    },
+    {
+      "stage_key": "toolkit_decision",
+      "transition": "pending -> blocked(deterministic_checks_pending) -> running -> succeeded",
+      "deterministic_checks": [
+        {
+          "name": "ingest-stage-complete",
+          "type": "stage_complete",
+          "status_before_unblock": "pass"
+        },
+        {
+          "name": "child-nodes-generated",
+          "type": "child_nodes_created_count",
+          "status_before_unblock": "pass"
+        },
+        {
+          "name": "toolkit-adr-merged",
+          "type": "node_merged",
+          "status_before_unblock": "fail",
+          "status_after_workflow_node_merged": "pass"
+        }
+      ],
+      "unblock_event": {
+        "event_type": "workflow.node.merged",
+        "node_id": "tsk-toolkit-selection-adr-001",
+        "effect": "re-evaluates pending stage gates and starts toolkit_decision immediately"
+      }
+    },
+    {
+      "stage_key": "ai_checks",
+      "transition": "pending -> running -> waiting_input -> verifying -> waiting_input -> verifying -> succeeded",
+      "ai_checks": [
+        {
+          "name": "ai-check-contract",
+          "type": "command_exit_code",
+          "command": "test -f ai-check.ok",
+          "first_result": "fail",
+          "feedback_event": "workflow.stage.runtime_input.required",
+          "second_result": "pass"
+        }
+      ]
+    },
+    {
+      "stage_key": "finalize",
+      "transition": "pending -> running -> succeeded"
+    }
+  ],
+  "workflow_run_status": "succeeded"
+}

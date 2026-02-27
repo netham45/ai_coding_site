@@ -76,7 +76,7 @@ The scenario is executed after these UI fixes are present:
 - `children_ids`: `pl-observability-001`, `pl-deployment-security-001`
 
 ## UI Creation + Control Evidence
-The following actions are recorded in [webrtc-remote-desktop-events.json](/mnt/c/Users/Nathan/Documents/GitHub/ai_coding_site/repos/ai-coding-site-2/tasks/a3aeeb6d-1988-4982-91cb-5b1342269dab/docs/examples/webrtc-remote-desktop-events.json):
+The following actions are recorded in [webrtc-remote-desktop-events.json](./webrtc-remote-desktop-events.json):
 - `evt-ui-0001`: Project page create-node creates `ep-webrtc-rd-001` (tier `epoch`).
 - `evt-ui-0002`: Project page create-node creates `ph-platform-spike-001` under epoch parent.
 - `evt-ui-0003`: Node detail panel starts epoch orchestration (`POST /api/nodes/ep-webrtc-rd-001/start`).
@@ -88,6 +88,18 @@ Observed status transitions from those UI actions:
 - `ep-webrtc-rd-001`: `queued -> in_progress -> awaiting_children -> merge_ready -> merged`
 - `pl-host-capture-pipeline-001`: `queued -> blocked -> ready -> in_progress -> merge_ready -> merged`
 - `tsk-host-webrtc-publisher-001`: `in_progress -> verify_failed -> delta_planned -> merge_ready -> merged`
+
+## Workflow Engine Ownership E2E
+The workflow-engine-owned scenario for the same prompt is captured in:
+- Test: `server/src/services/workflowEngine.test.ts`
+- Artifact: [webrtc-remote-desktop-workflow-engine-events.json](./webrtc-remote-desktop-workflow-engine-events.json)
+
+What this scenario demonstrates end-to-end:
+- Child nodes are generated from `.ai-plan/latest-plan.yaml` in `ingest_child_nodes`.
+- `toolkit_decision` is blocked by deterministic checks until toolkit ADR node merge.
+- Deterministic checks include `stage_complete`, `child_nodes_created_count`, and `node_merged`.
+- AI-style verification checks run under `expected_results` and emit `workflow.stage.runtime_input.required` feedback on failure.
+- Unblock progression is event-driven through `workflow.node.merged`, then workflow advances to completion.
 
 ### Plan
 1. `pl-capture-stack-001` (WGC/WMF toolkit selection and prototype)
