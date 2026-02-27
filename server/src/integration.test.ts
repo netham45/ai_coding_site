@@ -3645,7 +3645,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     }
   });
 
-  test("compatibility mode disables orchestration endpoints while preserving task workflows", async () => {
+  test("compatibility mode env no longer disables orchestration endpoints", async () => {
     const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
     process.env.ORCHESTRATION_COMPATIBILITY_MODE = "1";
     try {
@@ -3682,16 +3682,16 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         assert.equal(taskDetails.json?.task?.id, taskId);
 
         const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
-        assert.equal(hierarchy.status, 404);
-        assert.equal(hierarchy.json?.code, "FEATURE_DISABLED");
+        assert.equal(hierarchy.status, 200);
+        assert.equal(Array.isArray(hierarchy.json?.hierarchy?.nodes), true);
 
         const nodeStart = await localCallApi(`/api/nodes/${taskId}/start`, {
           method: "POST",
           userId,
           body: {}
         });
-        assert.equal(nodeStart.status, 404);
-        assert.equal(nodeStart.json?.code, "FEATURE_DISABLED");
+        assert.equal(nodeStart.status, 200);
+        assert.equal(nodeStart.json?.started, true);
       } finally {
         await new Promise<void>((resolve) => {
           localServer.close(() => resolve());
@@ -3702,7 +3702,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     }
   });
 
-  test("granular hierarchy/action feature flags can be disabled independently", async () => {
+  test("hierarchy/action env flags no longer disable orchestration APIs", async () => {
     const previousHierarchy = process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
     const previousActions = process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
     const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
@@ -3735,20 +3735,20 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
 
       try {
         const nodeDetails = await localCallApi(`/api/nodes/${taskId}`, { userId });
-        assert.equal(nodeDetails.status, 404);
-        assert.equal(nodeDetails.json?.code, "FEATURE_DISABLED");
+        assert.equal(nodeDetails.status, 200);
+        assert.equal(nodeDetails.json?.node?.id, taskId);
 
         const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
-        assert.equal(graph.status, 404);
-        assert.equal(graph.json?.code, "FEATURE_DISABLED");
+        assert.equal(graph.status, 200);
+        assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
 
         const toggleAutoMode = await localCallApi(`/api/nodes/${taskId}/auto-mode`, {
           method: "POST",
           userId,
           body: { enabled: false }
         });
-        assert.equal(toggleAutoMode.status, 404);
-        assert.equal(toggleAutoMode.json?.code, "FEATURE_DISABLED");
+        assert.equal(toggleAutoMode.status, 200);
+        assert.equal(toggleAutoMode.json?.node?.id, taskId);
 
         const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
         assert.equal(taskDetails.status, 200);
