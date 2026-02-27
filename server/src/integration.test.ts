@@ -583,6 +583,103 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     }
   });
 
+  test("unified nodes endpoint creates epoch/phase/plan/task tiers with expected mode and dependencies", async () => {
+    const userId = createUser();
+    const basePath = randomPath("nodes-endpoint");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "seed\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+
+    const epochCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Program Epoch",
+        taskPrompt: "Define the top-level program milestone.",
+        nodeTier: "epoch",
+        autoStart: true
+      }
+    });
+    assert.equal(epochCreate.status, 201);
+    const epochId = epochCreate.json?.node?.id;
+    assert.equal(epochCreate.json?.node?.mode, "plan");
+    assert.equal(epochCreate.json?.node?.nodeMetadata?.tier, "epoch");
+
+    const phaseCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Delivery Phase",
+        taskPrompt: "Break the epoch into a single delivery phase.",
+        nodeTier: "phase",
+        parentNodeId: epochId,
+        dependencyNodeRefs: [{ id: epochId, tier: "epoch", reason: "parent_phase_sequence" }]
+      }
+    });
+    assert.equal(phaseCreate.status, 201);
+    const phaseId = phaseCreate.json?.node?.id;
+    assert.equal(phaseCreate.json?.node?.mode, "plan");
+    assert.equal(phaseCreate.json?.node?.nodeMetadata?.tier, "phase");
+    assert.equal(phaseCreate.json?.node?.parentPlanTaskId, epochId);
+
+    const planCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Implementation Plan",
+        taskPrompt: "Draft implementation plan details for this phase.",
+        nodeTier: "plan",
+        parentNodeId: phaseId
+      }
+    });
+    assert.equal(planCreate.status, 201);
+    const planId = planCreate.json?.node?.id;
+    assert.equal(planCreate.json?.node?.mode, "plan");
+    assert.equal(planCreate.json?.node?.nodeMetadata?.tier, "plan");
+    assert.equal(planCreate.json?.node?.parentPlanTaskId, phaseId);
+
+    const taskCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Execute Implementation",
+        taskPrompt: "Implement the code changes from the plan.",
+        nodeTier: "task",
+        parentNodeId: planId,
+        dependencyNodeRefs: [{ id: planId, tier: "plan", reason: "await_plan_completion" }],
+        autoMerge: true
+      }
+    });
+    assert.equal(taskCreate.status, 201);
+    const taskId = taskCreate.json?.node?.id;
+    assert.equal(taskCreate.json?.node?.mode, "execution");
+    assert.equal(taskCreate.json?.node?.nodeMetadata?.tier, "task");
+    assert.equal(taskCreate.json?.node?.parentPlanTaskId, planId);
+
+    const storedRows = projectDb
+      .prepare("SELECT id, mode, metadata_json FROM tasks WHERE id IN (?, ?, ?, ?)")
+      .all(epochId, phaseId, planId, taskId) as Array<{ id: string; mode: string; metadata_json: string | null }>;
+    const rowById = new Map(storedRows.map((row) => [row.id, row]));
+    assert.equal(rowById.get(epochId)?.mode, "plan");
+    assert.equal(rowById.get(phaseId)?.mode, "plan");
+    assert.equal(rowById.get(planId)?.mode, "plan");
+    assert.equal(rowById.get(taskId)?.mode, "execution");
+
+    const taskMetadata = JSON.parse(rowById.get(taskId)?.metadata_json ?? "{}");
+    assert.equal(taskMetadata?.tier, "task");
+
+    const persistedDependencies = projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(taskId) as Array<{ dependency_task_id: string }>;
+    assert.equal(persistedDependencies.some((row) => row.dependency_task_id === planId), true);
+  });
+
   test("portability metadata detection reads cloned project DB metadata and catches project-id mismatch", () => {
     const sourceProjectId = randomUUID();
     const sourceBasePath = randomPath("portable-source");
