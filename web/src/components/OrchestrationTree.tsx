@@ -1,6 +1,6 @@
 import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from "@chakra-ui/icons";
 import { Badge, Box, Button, Flex, Heading, HStack, Link, Stack, Text } from "@chakra-ui/react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link as RouterLink } from "react-router-dom";
 import type { HierarchyNode, HierarchyNodeRow, NodeTier, TaskStatus } from "../api/types";
 
@@ -108,15 +108,7 @@ export function OrchestrationTree({
   onToggleCollapse?: () => void;
 }) {
   const treeRoots = useMemo(() => (roots.length ? roots : buildFallbackTree(fallbackRows)), [fallbackRows, roots]);
-  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set(treeRoots.map((node) => taskIdFor(node))));
-
-  useEffect(() => {
-    setExpandedNodeIds((previous) => {
-      const next = new Set(previous);
-      treeRoots.forEach((root) => next.add(taskIdFor(root)));
-      return next;
-    });
-  }, [treeRoots]);
+  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set());
 
   function toggleNode(nodeId: string) {
     setExpandedNodeIds((previous) => {
