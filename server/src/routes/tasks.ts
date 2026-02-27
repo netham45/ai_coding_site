@@ -31,6 +31,30 @@ import { buildDependencyDiagnostics, partitionDependenciesByTier, resolveAndVali
 import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
 import { orchestrationActionsApiEnabled, orchestrationHierarchyApiEnabled } from "../config/featureFlags.js";
+import {
+  createWorkflowDefinition,
+  createWorkflowRun,
+  deleteWorkflowDefinition,
+  getWorkflowDefinitionById,
+  getWorkflowRunById,
+  listWorkflowCheckResultsByStageRun,
+  listWorkflowDefinitionsByProject,
+  listWorkflowEventsByRun,
+  listWorkflowEventsByStageRun,
+  listWorkflowRunsByProject,
+  listWorkflowStageRunsByRun,
+  transitionWorkflowRunStatus,
+  transitionWorkflowStageRunStatus,
+  updateWorkflowDefinition
+} from "../services/workflowRepository.js";
+import { startWorkflowRun, tickWorkflowRun } from "../services/workflowEngine.js";
+import {
+  workflowDefinitionCreateSchema,
+  workflowDefinitionPatchSchema,
+  workflowRunCancelSchema,
+  workflowRunStartSchema,
+  workflowRunStateSchema
+} from "../api/contracts/workflows.js";
 import type {
   IdeInstanceRow,
   MergeRecordRow,
@@ -158,6 +182,16 @@ function parseTime(value: string | null | undefined): number {
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
 }
+
+function safeParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+type WorkflowLifecycleState = "blocked" | "ready" | "running" | "waiting_input" | "verifying";
 
 type ChronoTaskRow = TaskRow & { __rowid?: number };
 
@@ -855,6 +889,115 @@ function serializeMergeRecord(row: MergeRecordRow) {
   };
 }
 
+function serializeWorkflowDefinitionRow(row: {
+  id: string;
+  project_id: string;
+  name: string;
+  version: number;
+  definition_yaml: string;
+  created_by_user_id: string;
+  created_at: string;
+  updated_at: string;
+}) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    version: row.version,
+    definitionYaml: row.definition_yaml,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function serializeWorkflowRunState(projectDb: Database.Database, workflowRunId: string) {
+  const run = getWorkflowRunById(projectDb, workflowRunId);
+  if (!run) return null;
+  const definition = getWorkflowDefinitionById(projectDb, run.workflow_definition_id);
+  if (!definition) return null;
+
+  const stages = listWorkflowStageRunsByRun(projectDb, run.id);
+  const stageStates = stages.map((stage) => {
+    const stageEvents = listWorkflowEventsByStageRun(projectDb, stage.id);
+    const checks = listWorkflowCheckResultsByStageRun(projectDb, stage.id).map((check) => ({
+      id: check.id,
+      stageRunId: check.workflow_stage_run_id,
+      checkName: check.check_name,
+      status: check.status,
+      details: safeParseJson(check.details_json),
+      createdAt: check.created_at,
+      updatedAt: check.updated_at
+    }));
+
+    let lifecycleState: WorkflowLifecycleState | null = null;
+    let blockedBy: string[] = [];
+    let attemptsStarted = 0;
+    for (const event of stageEvents) {
+      if (event.event_type === "workflow.stage.attempt.started") {
+        attemptsStarted += 1;
+      }
+      if (event.event_type === "workflow.stage.lifecycle") {
+        const payload = safeParseJson(event.payload) as { state?: unknown; unresolvedDependsOn?: unknown } | null;
+        if (typeof payload?.state === "string") {
+          lifecycleState = payload.state as WorkflowLifecycleState;
+        }
+        if (Array.isArray(payload?.unresolvedDependsOn)) {
+          blockedBy = payload.unresolvedDependsOn.filter((entry): entry is string => typeof entry === "string");
+        }
+      }
+    }
+
+    return {
+      id: stage.id,
+      workflowRunId: stage.workflow_run_id,
+      stageKey: stage.stage_key,
+      ordinal: stage.ordinal,
+      status: stage.status,
+      startedAt: stage.started_at,
+      completedAt: stage.completed_at,
+      createdAt: stage.created_at,
+      updatedAt: stage.updated_at,
+      diagnostics: {
+        lifecycleState,
+        attemptsStarted,
+        blockedBy,
+        checks,
+        recentEvents: stageEvents.slice(-25).map((event) => ({
+          id: event.id,
+          eventType: event.event_type,
+          payload: safeParseJson(event.payload),
+          createdAt: event.created_at
+        }))
+      }
+    };
+  });
+
+  const responsePayload = {
+    run: {
+      id: run.id,
+      workflowDefinitionId: run.workflow_definition_id,
+      projectId: run.project_id,
+      taskId: run.task_id,
+      status: run.status,
+      startedAt: run.started_at,
+      completedAt: run.completed_at,
+      createdAt: run.created_at,
+      updatedAt: run.updated_at
+    },
+    definition: serializeWorkflowDefinitionRow(definition),
+    stages: stageStates,
+    events: listWorkflowEventsByRun(projectDb, run.id).slice(-50).map((event) => ({
+      id: event.id,
+      eventType: event.event_type,
+      payload: safeParseJson(event.payload),
+      createdAt: event.created_at
+    }))
+  };
+
+  return workflowRunStateSchema.parse(responsePayload);
+}
+
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -1478,6 +1621,243 @@ tasksRouter.get("/projects/:projectId/dependency-graph", (req, res) => {
   );
   if (!scopedProject) return;
   res.json({ graph: projectDependencyGraph(scopedProject.projectDb, scopedProject.project.id) });
+});
+
+tasksRouter.get("/projects/:projectId/workflow-definitions", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  const definitions = listWorkflowDefinitionsByProject(scopedProject.projectDb, scopedProject.project.id).map(serializeWorkflowDefinitionRow);
+  res.json({ definitions });
+});
+
+tasksRouter.post("/projects/:projectId/workflow-definitions", (req, res) => {
+  const parsed = workflowDefinitionCreateSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const created = createWorkflowDefinition(scopedProject.projectDb, {
+    projectId: scopedProject.project.id,
+    name: parsed.data.name,
+    version: parsed.data.version,
+    definitionYaml: parsed.data.definitionYaml,
+    createdByUserId: req.user.id
+  });
+  res.status(201).json({ definition: serializeWorkflowDefinitionRow(created) });
+});
+
+tasksRouter.get("/projects/:projectId/workflow-definitions/:definitionId", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  const definition = getWorkflowDefinitionById(scopedProject.projectDb, req.params.definitionId);
+  if (!definition || definition.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow definition not found" });
+    return;
+  }
+  res.json({ definition: serializeWorkflowDefinitionRow(definition) });
+});
+
+tasksRouter.patch("/projects/:projectId/workflow-definitions/:definitionId", (req, res) => {
+  const parsed = workflowDefinitionPatchSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const existing = getWorkflowDefinitionById(scopedProject.projectDb, req.params.definitionId);
+  if (!existing || existing.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow definition not found" });
+    return;
+  }
+  const updated = updateWorkflowDefinition(scopedProject.projectDb, {
+    id: existing.id,
+    name: parsed.data.name ?? existing.name,
+    version: parsed.data.version ?? existing.version,
+    definitionYaml: parsed.data.definitionYaml ?? existing.definition_yaml
+  });
+  if (!updated) {
+    res.status(404).json({ error: "Workflow definition not found" });
+    return;
+  }
+  res.json({ definition: serializeWorkflowDefinitionRow(updated) });
+});
+
+tasksRouter.delete("/projects/:projectId/workflow-definitions/:definitionId", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const existing = getWorkflowDefinitionById(scopedProject.projectDb, req.params.definitionId);
+  if (!existing || existing.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow definition not found" });
+    return;
+  }
+  deleteWorkflowDefinition(scopedProject.projectDb, req.params.definitionId);
+  res.json({ ok: true });
+});
+
+tasksRouter.get("/projects/:projectId/workflow-runs", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  const runs = listWorkflowRunsByProject(scopedProject.projectDb, scopedProject.project.id)
+    .map((run) => serializeWorkflowRunState(scopedProject.projectDb, run.id))
+    .filter((run): run is NonNullable<typeof run> => Boolean(run));
+  res.json({ runs });
+});
+
+tasksRouter.post("/projects/:projectId/workflow-runs/start", (req, res) => {
+  const parsed = workflowRunStartSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const definition = getWorkflowDefinitionById(scopedProject.projectDb, parsed.data.workflowDefinitionId);
+  if (!definition || definition.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow definition not found" });
+    return;
+  }
+  if (parsed.data.taskId) {
+    const task = scopedProject.projectDb
+      .prepare("SELECT id FROM tasks WHERE id = ? AND project_id = ? LIMIT 1")
+      .get(parsed.data.taskId, scopedProject.project.id) as { id: string } | undefined;
+    if (!task) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+  }
+  const createdRun = createWorkflowRun(scopedProject.projectDb, {
+    workflowDefinitionId: definition.id,
+    projectId: scopedProject.project.id,
+    taskId: parsed.data.taskId ?? null
+  });
+  const startedRun = startWorkflowRun({ db: scopedProject.projectDb, workflowRunId: createdRun.id });
+  const state = serializeWorkflowRunState(scopedProject.projectDb, startedRun.id);
+  if (!state) {
+    res.status(500).json({ error: "Failed to load workflow run state" });
+    return;
+  }
+  res.status(201).json({ workflow: state });
+});
+
+tasksRouter.get("/projects/:projectId/workflow-runs/:runId", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  const run = getWorkflowRunById(scopedProject.projectDb, req.params.runId);
+  if (!run || run.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  const state = serializeWorkflowRunState(scopedProject.projectDb, run.id);
+  if (!state) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  res.json({ workflow: state });
+});
+
+tasksRouter.post("/projects/:projectId/workflow-runs/:runId/tick", (req, res) => {
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const run = getWorkflowRunById(scopedProject.projectDb, req.params.runId);
+  if (!run || run.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  const ticked = tickWorkflowRun({ db: scopedProject.projectDb, workflowRunId: run.id });
+  const state = serializeWorkflowRunState(scopedProject.projectDb, run.id);
+  if (!state) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  res.json({ workflow: state, progressed: ticked.progressed });
+});
+
+tasksRouter.post("/projects/:projectId/workflow-runs/:runId/cancel", (req, res) => {
+  const parsed = workflowRunCancelSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const run = getWorkflowRunById(scopedProject.projectDb, req.params.runId);
+  if (!run || run.project_id !== scopedProject.project.id) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  if (run.status === "queued" || run.status === "running") {
+    for (const stage of listWorkflowStageRunsByRun(scopedProject.projectDb, run.id)) {
+      if (stage.status === "pending" || stage.status === "running") {
+        transitionWorkflowStageRunStatus(scopedProject.projectDb, {
+          stageRunId: stage.id,
+          toStatus: "cancelled",
+          reason: parsed.data.reason ?? "workflow_run_cancelled"
+        });
+      }
+    }
+    transitionWorkflowRunStatus(scopedProject.projectDb, {
+      runId: run.id,
+      toStatus: "cancelled",
+      reason: parsed.data.reason ?? "workflow_run_cancelled"
+    });
+  }
+  const state = serializeWorkflowRunState(scopedProject.projectDb, run.id);
+  if (!state) {
+    res.status(404).json({ error: "Workflow run not found" });
+    return;
+  }
+  res.json({ workflow: state });
+});
+
+tasksRouter.get("/nodes/:nodeId/workflow-status", (req, res) => {
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "read" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+  const run = projectDb
+    .prepare("SELECT * FROM workflow_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
+    .get(task.id) as { id: string } | undefined;
+  if (!run) {
+    res.json({ nodeId: task.id, workflow: null });
+    return;
+  }
+  const state = serializeWorkflowRunState(projectDb, run.id);
+  res.json({ nodeId: task.id, workflow: state });
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
