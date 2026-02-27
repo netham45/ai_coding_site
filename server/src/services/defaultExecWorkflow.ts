@@ -22,6 +22,12 @@ const DEFAULT_EXEC_WORKFLOW_DEFINITION = JSON.stringify({
   ]
 });
 
+export const DEFAULT_EXEC_WORKFLOW = {
+  name: DEFAULT_EXEC_WORKFLOW_NAME,
+  version: DEFAULT_EXEC_WORKFLOW_VERSION,
+  definition: DEFAULT_EXEC_WORKFLOW_DEFINITION
+} as const;
+
 type EnsureDefaultExecWorkflowInput = {
   db: Database.Database;
   projectId: string;
@@ -50,6 +56,14 @@ function ensureDefaultDefinition(params: { db: Database.Database; projectId: str
     definitionYaml: DEFAULT_EXEC_WORKFLOW_DEFINITION,
     createdByUserId: params.createdByUserId
   });
+}
+
+export function ensureDefaultExecWorkflowDefinition(params: {
+  db: Database.Database;
+  projectId: string;
+  createdByUserId: string;
+}): WorkflowDefinitionRow {
+  return ensureDefaultDefinition(params);
 }
 
 function findRunForTaskAndDefinition(db: Database.Database, taskId: string, workflowDefinitionId: string): WorkflowRunRow | undefined {
