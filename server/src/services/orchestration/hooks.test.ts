@@ -31,7 +31,7 @@ describe("orchestration hooks", () => {
     );
   });
 
-  test("rollback flag re-enables legacy plan_orchestration_pass ownership", () => {
+  test("legacy rollback flag no longer adds plan_orchestration_pass ownership", () => {
     process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "true";
     const jobs = deriveOrchestrationJobsFromEvent({
       eventType: "task.created",
@@ -42,7 +42,7 @@ describe("orchestration hooks", () => {
 
     assert.deepEqual(
       jobs.map((job) => job.jobType),
-      ["task_queue_dispatch", "plan_orchestration_pass"]
+      ["task_queue_dispatch"]
     );
   });
 });

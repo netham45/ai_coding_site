@@ -3,7 +3,6 @@ import { db as appDb, ensureLocalUser, resolveProjectDatabase } from "./db/index
 import { startIdeHeartbeat } from "./services/ide.js";
 import { startOrchestrationJobQueueWorker } from "./services/orchestration/jobQueue.js";
 import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
-import { startPlanOrchestrationWorker } from "./services/planOrchestrator.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { setupDiagnosticsProfiler } from "./services/diagnosticsProfiler.js";
@@ -32,7 +31,6 @@ startRuntimeHeartbeat().catch((error) => {
 if (orchestrationWorkersEnabled()) {
   startOrchestrationJobQueueWorker();
   startHierarchicalOrchestrationJobs();
-  startPlanOrchestrationWorker();
 } else {
   console.log("Orchestration workers disabled by feature flag");
 }
