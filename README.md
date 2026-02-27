@@ -139,6 +139,20 @@ Server environment variables:
 - `TERMINAL_TOKEN_TTL_SECONDS`: terminal token TTL in seconds. Default: `300`
 - `AI_CODING_DATA_ROOT`: override app DB root. Default: `<workspace>/data`
 - `AI_CODING_REPOS_ROOT`: override repos root. Default: `<workspace>/repos`
+- `AI_CODING_PROFILER_ENABLED`: enable diagnostics profiler (`1`/`true`). Default: disabled
+- `AI_CODING_PROFILER_OUTPUT_DIR`: profiler output directory. Default: `<data-root>/profiles`
+- `AI_CODING_PROFILER_LAG_THRESHOLD_MS`: event loop lag threshold for stall snapshots. Default: `750`
+- `AI_CODING_PROFILER_POLL_INTERVAL_MS`: poll interval for lag detection. Default: `250`
+- `AI_CODING_PROFILER_CPU_MS`: default CPU profile duration (ms). Default: `10000`
+- `AI_CODING_PROFILER_STALL_COOLDOWN_MS`: minimum gap between auto stall snapshots. Default: `30000`
+- `AI_CODING_PROFILER_SIGNALS_ENABLED`: enable `SIGUSR1`/`SIGUSR2` capture hooks. Default: enabled
+- `AI_CODING_DEP_GRAPH_CACHE_TTL_MS`: cache window for dependency graph diagnostics in milliseconds. Default: `3000`
+- `AI_CODING_DB_TRACE_ENABLED`: enable per-statement sqlite tracing wrapper. Default: disabled
+- `AI_CODING_GIT_STATUS_CACHE_TTL_MS`: cache TTL for workspace git status reads in milliseconds. Default: `5000`
+- `AI_CODING_TASK_DETAIL_INCLUDE_GIT_DEFAULT`: include git status by default on `GET /api/tasks/:taskId`. Default: disabled
+- `AI_CODING_TASK_DETAIL_INCLUDE_HEAVY_DEFAULT`: include completion artifact payloads by default on `GET /api/tasks/:taskId`. Default: disabled
+- `AI_CODING_PLAN_DETAIL_INCLUDE_HEAVY_DEFAULT`: include completion artifact payloads by default on `GET /api/plans/:planId`. Default: disabled
+- `AI_CODING_LOG_QUEUE_MAX_LINES`: max queued lines per backend log stream before dropping. Default: `50000`
 
 Example:
 
@@ -147,6 +161,7 @@ HOST=0.0.0.0
 PORT=3001
 TERMINAL_TOKEN_SECRET=replace-with-long-random-secret
 TERMINAL_TOKEN_TTL_SECONDS=300
+AI_CODING_PROFILER_ENABLED=1
 ```
 
 Important behavior:
@@ -389,6 +404,15 @@ WebSocket:
   - Check dependency tasks; queued tasks with unmet dependencies do not start.
 - Port conflicts
   - Set a different `PORT` for server or free `3001`/`5173`.
+- Diagnose deadlock/loop behavior with profiler
+  - Start with profiling enabled: `npm run dev:profile -w server` (or `npm run start:profile -w server`).
+  - Snapshot stalled state: `kill -USR1 <server-pid>` writes a `.snapshot.json` file.
+  - Capture CPU loop profile: `kill -USR2 <server-pid>` writes a `.cpuprofile` file.
+  - You can also trigger via API:
+    - `POST /api/debug/profiler/snapshot` body: `{ \"reason\": \"manual\" }`
+    - `POST /api/debug/profiler/cpu` body: `{ \"reason\": \"manual\", \"durationMs\": 15000 }`
+    - `GET /api/debug/profiler/status`
+  - Output files are under `data/profiles` by default. Open `.cpuprofile` in Chrome DevTools Performance panel.
 
 ## Development notes
 

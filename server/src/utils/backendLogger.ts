@@ -15,7 +15,19 @@ const CATEGORY_FILE_MAP: Record<BackendLogCategory, string> = {
 };
 
 let dirReady = false;
-const fileReady = new Set<string>();
+const MAX_QUEUE_LINES = Number(process.env.AI_CODING_LOG_QUEUE_MAX_LINES ?? 50_000);
+
+type CategoryWriter = {
+  category: BackendLogCategory;
+  filePath: string;
+  stream: fs.WriteStream;
+  queue: string[];
+  waitingForDrain: boolean;
+  droppedLines: number;
+};
+
+const writersByCategory = new Map<BackendLogCategory, CategoryWriter>();
+let shutdownHooksInstalled = false;
 
 function ensureLogFile(category: BackendLogCategory): string {
   if (!dirReady) {
@@ -25,11 +37,78 @@ function ensureLogFile(category: BackendLogCategory): string {
 
   const filename = CATEGORY_FILE_MAP[category];
   const filePath = path.join(LOG_DIR, filename);
-  if (!fileReady.has(filePath)) {
-    fs.closeSync(fs.openSync(filePath, "a"));
-    fileReady.add(filePath);
-  }
   return filePath;
+}
+
+function flushWriter(writer: CategoryWriter): void {
+  if (writer.waitingForDrain) {
+    return;
+  }
+  while (writer.queue.length > 0) {
+    const line = writer.queue.shift();
+    if (typeof line !== "string") {
+      return;
+    }
+    const canContinue = writer.stream.write(line);
+    if (!canContinue) {
+      writer.waitingForDrain = true;
+      return;
+    }
+  }
+}
+
+function installShutdownHooks(): void {
+  if (shutdownHooksInstalled) {
+    return;
+  }
+  shutdownHooksInstalled = true;
+
+  process.once("beforeExit", () => {
+    for (const writer of writersByCategory.values()) {
+      if (!writer.stream.destroyed) {
+        writer.stream.end();
+      }
+    }
+  });
+
+  process.once("exit", () => {
+    for (const writer of writersByCategory.values()) {
+      if (!writer.stream.destroyed) {
+        writer.stream.destroy();
+      }
+    }
+  });
+}
+
+function getCategoryWriter(category: BackendLogCategory): CategoryWriter {
+  const existing = writersByCategory.get(category);
+  if (existing) {
+    return existing;
+  }
+
+  const filePath = ensureLogFile(category);
+  const stream = fs.createWriteStream(filePath, { flags: "a" });
+  const writer: CategoryWriter = {
+    category,
+    filePath,
+    stream,
+    queue: [],
+    waitingForDrain: false,
+    droppedLines: 0
+  };
+
+  stream.on("drain", () => {
+    writer.waitingForDrain = false;
+    flushWriter(writer);
+  });
+
+  stream.on("error", (error) => {
+    console.error(`Failed to write ${category} log: ${String(error.message || error)}`);
+  });
+
+  writersByCategory.set(category, writer);
+  installShutdownHooks();
+  return writer;
 }
 
 function truncateText(value: string, maxLength = 8000): string {
@@ -88,12 +167,28 @@ function writeCategoryLog(category: BackendLogCategory, event: string, fields?: 
   const line = `${JSON.stringify(entry)}\n`;
 
   try {
-    const filePath = ensureLogFile(category);
-    fs.appendFile(filePath, line, (error) => {
-      if (error) {
-        console.error(`Failed to write ${category} log: ${String(error.message || error)}`);
+    const writer = getCategoryWriter(category);
+    if (writer.queue.length >= MAX_QUEUE_LINES) {
+      writer.droppedLines += 1;
+      if (writer.droppedLines % 1000 === 1) {
+        console.error(
+          `Dropping ${category} log lines due to writer queue saturation: dropped=${writer.droppedLines} file=${writer.filePath}`
+        );
       }
-    });
+      return;
+    }
+    if (writer.droppedLines > 0) {
+      const droppedNotice = {
+        ts: new Date().toISOString(),
+        category,
+        event: "logger.lines_dropped",
+        droppedLines: writer.droppedLines
+      };
+      writer.queue.push(`${JSON.stringify(droppedNotice)}\n`);
+      writer.droppedLines = 0;
+    }
+    writer.queue.push(line);
+    flushWriter(writer);
   } catch (error) {
     console.error(`Failed to write ${category} log: ${String((error as Error)?.message || error)}`);
   }

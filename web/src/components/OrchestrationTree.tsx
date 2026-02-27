@@ -38,6 +38,39 @@ function nodeRoute(node: HierarchyNode) {
   return `/plans/${taskId}?tab=ide`;
 }
 
+type ChildStatusKey = TaskStatus | "blocked";
+
+const CHILD_STATUS_ORDER: ChildStatusKey[] = [
+  "blocked",
+  "awaiting_children",
+  "queued",
+  "in_progress",
+  "waiting_input",
+  "merge_ready",
+  "merged",
+  "failed",
+  "cancelled",
+  "merge_conflict"
+];
+
+const CHILD_STATUS_LABELS: Record<ChildStatusKey, string> = {
+  blocked: "blocked",
+  awaiting_children: "awaiting children",
+  queued: "queued",
+  in_progress: "in progress",
+  waiting_input: "waiting input",
+  merge_ready: "merge ready",
+  merged: "merged",
+  failed: "failed",
+  cancelled: "cancelled",
+  merge_conflict: "merge conflict"
+};
+
+function childStatusKey(node: HierarchyNode): ChildStatusKey {
+  const isBlocked = node.task.isBlocked || node.waiting?.waiting === true;
+  return isBlocked ? "blocked" : node.task.status;
+}
+
 function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
   const byId = new Map<string, HierarchyNode>();
   rows.forEach((row) => {
@@ -57,6 +90,7 @@ function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
     }
   });
 
+  // Order is backend-defined; do not re-sort client-side.
   return roots;
 }
 
@@ -187,6 +221,16 @@ function TreeRow({
   const unresolvedDependencyCount = waiting.unresolvedDependencyDetails.length;
   const dependencyCount = dependencyTaskIds.length;
   const isBlocked = node.task.isBlocked || waiting.waiting;
+  const childStatusSummary = hasChildren
+    ? CHILD_STATUS_ORDER
+      .map((status) => {
+        const count = children.reduce((sum, child) => {
+          return sum + (childStatusKey(child) === status ? 1 : 0);
+        }, 0);
+        return count > 0 ? `${count} ${CHILD_STATUS_LABELS[status]}` : null;
+      })
+      .filter((value): value is string => Boolean(value))
+    : [];
 
   return (
     <Box>
@@ -231,15 +275,14 @@ function TreeRow({
           <Flex mt={1} wrap="wrap" gap={1}>
             <Badge colorScheme={tierColor(node.tier)}>{node.tier}</Badge>
             <Badge colorScheme={statusColor(node.task.status)}>{node.task.status}</Badge>
-            <Badge colorScheme={node.task.autoMerge ? "green" : "gray"}>auto-merge: {node.task.autoMerge ? "on" : "off"}</Badge>
-            {node.task.mode === "plan" ? (
-              <Badge colorScheme={node.task.autoMergeOnComplete ? "green" : "gray"}>
-                auto-merge on complete: {node.task.autoMergeOnComplete ? "on" : "off"}
-              </Badge>
-            ) : null}
             {isBlocked ? <Badge colorScheme="orange">blocked</Badge> : null}
             {unresolvedDependencyCount > 0 ? <Badge colorScheme="red">deps {unresolvedDependencyCount}</Badge> : null}
             {unresolvedDependencyCount === 0 && dependencyCount > 0 ? <Badge colorScheme="gray">deps {dependencyCount}</Badge> : null}
+            {childStatusSummary.length ? (
+              <Badge colorScheme="blue" variant="subtle">
+                children: {childStatusSummary.join(" ")}
+              </Badge>
+            ) : null}
           </Flex>
         </Box>
       </HStack>

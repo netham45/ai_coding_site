@@ -13,6 +13,7 @@ const DEFAULT_AI_COMMANDS_JSON = JSON.stringify([DEFAULT_AI_COMMAND]);
 const APP_DB_FILENAME = "app.sqlite";
 
 let appDb: Database.Database | undefined;
+let cachedLocalUserId: string | undefined;
 
 export function getAppDbPath(): string {
   return path.join(dataRoot, APP_DB_FILENAME);
@@ -95,6 +96,9 @@ export function getAppDb(): Database.Database {
 export const db = getAppDb();
 
 export function ensureLocalUser(): string {
+  if (cachedLocalUserId) {
+    return cachedLocalUserId;
+  }
   const app = getAppDb();
   const row = app.prepare("SELECT id FROM users ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
   if (row?.id) {
@@ -118,6 +122,7 @@ export function ensureLocalUser(): string {
     app.prepare(
       "UPDATE user_settings SET default_ai_commands = ?, updated_at = ? WHERE user_id = ? AND (default_ai_commands IS NULL OR TRIM(default_ai_commands) = '')"
     ).run(DEFAULT_AI_COMMANDS_JSON, nowIso(), row.id);
+    cachedLocalUserId = row.id;
     return row.id;
   }
 
@@ -134,5 +139,6 @@ export function ensureLocalUser(): string {
     `INSERT INTO user_settings (user_id, default_ai_command, default_ai_commands, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?)`
   ).run(id, DEFAULT_AI_COMMAND, DEFAULT_AI_COMMANDS_JSON, now, now);
+  cachedLocalUserId = id;
   return id;
 }

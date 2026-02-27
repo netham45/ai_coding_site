@@ -6,12 +6,14 @@ import { startHierarchicalOrchestrationJobs } from "./services/orchestration/job
 import { startPlanOrchestrationWorker } from "./services/planOrchestrator.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
+import { setupDiagnosticsProfiler } from "./services/diagnosticsProfiler.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { nowIso } from "./utils/time.js";
 import { createApp } from "./app.js";
 import { orchestrationWorkersEnabled } from "./config/featureFlags.js";
 
-const app = createApp();
+const profiler = setupDiagnosticsProfiler();
+const app = createApp({ profiler });
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? "0.0.0.0";
 

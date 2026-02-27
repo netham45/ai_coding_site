@@ -231,7 +231,9 @@ export function buildAutomationVisibility(projectDb: Database.Database, task: Ta
   const deps = blockingDependencies(projectDb, task.id);
   const children = task.mode === "plan" ? pendingChildren(projectDb, task.id) : [];
   const latest = latestTransition(projectDb, task.id);
-  const diagnosticTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow | undefined;
+  const diagnosticTask = (task as Partial<TaskRow>).project_id
+    ? (task as TaskRow)
+    : (projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow | undefined);
   const dependencyDiagnostics = diagnosticTask
     ? buildDependencyDiagnostics({ projectDb, task: diagnosticTask })
     : {

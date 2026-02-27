@@ -221,6 +221,29 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function firstToken(command: string | null | undefined): string | null {
+  const trimmed = String(command ?? "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  const token = trimmed.split(/\s+/)[0];
+  return token && token.length > 0 ? token : null;
+}
+
+export function buildIdeResumeCommand(params: {
+  detectedTool?: string | null;
+  backendCommand?: string | null;
+}): string | null {
+  const executable = firstToken(params.backendCommand) ?? "codex";
+  const lowerExecutable = executable.toLowerCase();
+  const lowerTool = String(params.detectedTool ?? "").toLowerCase();
+  const isCodex = lowerTool === "codex" || lowerExecutable.includes("codex");
+  if (!isCodex) {
+    return null;
+  }
+  return `${shellSingleQuote(executable)} resume`;
+}
+
 function compactId(value: string): string {
   const cleaned = value.replace(/[^a-zA-Z0-9_-]/g, "");
   if (cleaned.length > 0) {
@@ -235,6 +258,7 @@ export async function prepareIdeWorkspace(params: {
   tmuxSocketPath?: string | null;
   tmuxSessionName?: string | null;
   hasSessionHistory?: boolean;
+  resumeCommand?: string | null;
 }): Promise<string> {
   const hasTmuxTarget = Boolean(params.tmuxSocketPath && params.tmuxSessionName);
   const hasSessionHistory = Boolean(params.hasSessionHistory);
@@ -250,8 +274,12 @@ export async function prepareIdeWorkspace(params: {
     const tmuxAttachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} set-option -g mouse on \\; attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
     attachCommand = tmuxAttachCommand;
   } else if (hasSessionHistory) {
-    // Preserve workspace-task shape for historical sessions, but never auto-resume.
-    attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && echo \"No active tmux session to attach.\"`;
+    const resumeCommand = params.resumeCommand?.trim();
+    if (resumeCommand) {
+      attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && ${resumeCommand}`;
+    } else {
+      attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && echo \"No active tmux session to attach.\"`;
+    }
   }
 
   const workspaceSpec = {
