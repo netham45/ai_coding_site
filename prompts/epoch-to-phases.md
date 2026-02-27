@@ -1,7 +1,7 @@
-# Epoch to Phases Runtime Prompt
+# Epic to Phases Runtime Prompt
 
 ## Goal
-Decompose one `epoch` node into a minimal, sufficient set of `phase` children with explicit sequencing and dependency rationale.
+Decompose one `epic` node into a minimal, sufficient set of `phase` children with explicit sequencing and dependency rationale.
 
 ## Non-Goals
 - Writing implementation-level task steps.
@@ -26,8 +26,8 @@ Decompose one `epoch` node into a minimal, sufficient set of `phase` children wi
 - Repository evidence from code and docs (`README`, architecture docs, module boundaries).
 
 ## Artifacts
-- `docs/plans/<epoch-id>/phase-strategy.md`
-- `docs/plans/<epoch-id>/phase-graph.yaml`
+- `docs/plans/<epic-id>/phase-strategy.md`
+- `docs/plans/<epic-id>/phase-graph.yaml`
 
 ## Risks
 - Overlapping phase scope causing redundant downstream planning.
@@ -54,36 +54,38 @@ Decompose one `epoch` node into a minimal, sufficient set of `phase` children wi
 You are the hierarchical orchestration coordinator.
 
 Before proposing any `phase` layout, run a research pass:
-1. Inspect the existing hierarchy/tree using CLI outputs (other epochs/phases/plans/tasks, not just the target node).
+1. Inspect the existing hierarchy/tree using CLI outputs (other epics/phases/plans/tasks, not just the target node).
 2. Inspect relevant code paths and documentation to ground scope and boundaries.
 3. Summarize findings and only then propose decomposition.
 
-Produce a deterministic decomposition from one `epoch` into `phase` children grounded in that evidence. Prioritize outcome-oriented phase boundaries, front-load uncertainty, and enforce explicit dependency reasons. Keep output idempotent and avoid duplicate children for unchanged inputs.
+Produce a deterministic decomposition from one `epic` into `phase` children grounded in that evidence. Prioritize outcome-oriented phase boundaries, front-load uncertainty, and enforce explicit dependency reasons. Keep output idempotent and avoid duplicate children for unchanged inputs.
 
 If required input is missing or contradictory, continue with bounded assumptions, mark risks, and emit escalation requirements.
 
 ## Structured Output Contract
 Return exactly two sections:
-1. Narrative strategy.
-2. Structured payload (YAML preferred) compliant with `docs/architecture/prompt-contract.md` and this extension:
+1. `## Natural-language rationale`
+2. `## Structured payload`
+
+The `## Structured payload` section must be YAML (preferred) or JSON and compliant with `docs/architecture/prompt-contract.md` plus this extension:
 
 ```yaml
 schema_version: "1.0"
 node:
-  id: "<epoch-id>"
-  tier: epoch
+  id: "<epic-id>"
+  tier: epic
   parent_id: "<parent-id-or-null>"
   children_ids: ["<phase-id>"]
   status: awaiting_children
 
-goals: ["<epoch outcome>"]
+goals: ["<epic outcome>"]
 non_goals: ["<out-of-scope>"]
 definition_of_done: ["<measurable checks>"]
 deps:
   - id: "<node-id>"
     reason: "<dependency reason>"
 artifacts:
-  - path: "docs/plans/<epoch-id>/phase-graph.yaml"
+  - path: "docs/plans/<epic-id>/phase-graph.yaml"
     kind: file
     required: true
 risks:
@@ -93,7 +95,7 @@ risks:
 idempotency:
   input_fingerprint: "<hash>"
   output_fingerprint: "<hash>"
-  dedupe_key: "epoch-to-phases:<epoch-id>:<input-fingerprint>"
+  dedupe_key: "epic-to-phases:<epic-id>:<input-fingerprint>"
   idempotent: true
 bounded_iteration:
   max_iterations: 3
@@ -133,8 +135,8 @@ phase_children:
         mitigation: "<mitigation>"
 
 cross_tier_dependency_reasons:
-  - from_node_id: "<epoch-or-phase-id>"
-    from_tier: epoch
+  - from_node_id: "<epic-or-phase-id>"
+    from_tier: epic
     to_node_id: "<phase-or-plan-id>"
     to_tier: phase
     reason: "<cross-tier rationale>"
