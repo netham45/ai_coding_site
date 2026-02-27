@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
+  legacyPlanOrchestrationPassOwnershipEnabled,
   orchestrationActionsApiEnabled,
   orchestrationCompatibilityModeEnabled,
   orchestrationHierarchyApiEnabled,
@@ -26,11 +27,13 @@ describe("feature flags", () => {
     process.env.ORCHESTRATION_WORKERS_ENABLED = "true";
     process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "true";
     process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "true";
+    process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "true";
 
     assert.equal(orchestrationCompatibilityModeEnabled(), true);
     assert.equal(orchestrationWorkersEnabled(), false);
     assert.equal(orchestrationHierarchyApiEnabled(), false);
     assert.equal(orchestrationActionsApiEnabled(), false);
+    assert.equal(legacyPlanOrchestrationPassOwnershipEnabled(), false);
   });
 
   test("defaults to workers/apis enabled when env vars are unset or invalid", () => {
@@ -38,11 +41,13 @@ describe("feature flags", () => {
     delete process.env.ORCHESTRATION_WORKERS_ENABLED;
     delete process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
     delete process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
+    delete process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
 
     assert.equal(orchestrationCompatibilityModeEnabled(), false);
     assert.equal(orchestrationWorkersEnabled(), true);
     assert.equal(orchestrationHierarchyApiEnabled(), true);
     assert.equal(orchestrationActionsApiEnabled(), true);
+    assert.equal(legacyPlanOrchestrationPassOwnershipEnabled(), false);
 
     process.env.ORCHESTRATION_WORKERS_ENABLED = "invalid";
     assert.equal(orchestrationWorkersEnabled(), true);
@@ -52,9 +57,11 @@ describe("feature flags", () => {
     process.env.ORCHESTRATION_WORKERS_ENABLED = "off";
     process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "0";
     process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "no";
+    process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "on";
 
     assert.equal(orchestrationWorkersEnabled(), false);
     assert.equal(orchestrationHierarchyApiEnabled(), false);
     assert.equal(orchestrationActionsApiEnabled(), false);
+    assert.equal(legacyPlanOrchestrationPassOwnershipEnabled(), true);
   });
 });

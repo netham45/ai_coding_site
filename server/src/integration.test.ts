@@ -2557,57 +2557,114 @@ describe("integration: orchestration hooks and job queue", () => {
     assert.equal(handledCount, 1);
   });
 
-  test("non-material output updates do not thrash orchestration hooks", async () => {
-    const userId = createUser();
-    const basePath = randomPath("output-monitor");
-    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
-    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
-    const taskId = insertTask({
-      projectDb,
-      projectId,
-      userId,
-      title: "Output Monitor Task",
-      status: "in_progress"
-    });
-
-    let handledCount = 0;
-    registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
-      handledCount += 1;
-    });
-
-    const first = observeNodeOutputMaterialChange({
-      projectDb,
-      taskId,
-      source: "runtime_session",
-      rawOutput: "Plan step started\nWorking..."
-    });
-    assert.equal(first.materialChanged, true);
-    if (first.materialChanged) {
-      recordEvent({
+  test("workflow engine ownership disables legacy plan_orchestration_pass by default", async () => {
+    const previousLegacyPlanOwnership = process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
+    delete process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
+    try {
+      const userId = createUser();
+      const basePath = randomPath("output-monitor-cutover-default");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
         projectId,
-        taskId,
-        eventType: "task.output.material_changed",
-        payload: {
-          source: first.source,
-          outputHash: first.outputHash,
-          previousOutputHash: first.previousOutputHash
-        },
-        database: projectDb
+        userId,
+        title: "Output Monitor Cutover",
+        status: "in_progress"
       });
+
+      let handledCount = 0;
+      registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
+        handledCount += 1;
+      });
+
+      const changed = observeNodeOutputMaterialChange({
+        projectDb,
+        taskId,
+        source: "runtime_session",
+        rawOutput: "Plan step started\nWorking..."
+      });
+      assert.equal(changed.materialChanged, true);
+      if (changed.materialChanged) {
+        recordEvent({
+          projectId,
+          taskId,
+          eventType: "task.output.material_changed",
+          payload: {
+            source: changed.source,
+            outputHash: changed.outputHash,
+            previousOutputHash: changed.previousOutputHash
+          },
+          database: projectDb
+        });
+      }
+
+      await runOrchestrationJobQueuePassForTests();
+      await new Promise((resolve) => setTimeout(resolve, 1_750));
+      await runOrchestrationJobQueuePassForTests();
+      assert.equal(handledCount, 0);
+    } finally {
+      process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = previousLegacyPlanOwnership;
     }
+  });
 
-    const nonMaterial = observeNodeOutputMaterialChange({
-      projectDb,
-      taskId,
-      source: "runtime_session",
-      rawOutput: "Plan step started  \r\nWorking...\n"
-    });
-    assert.equal(nonMaterial.materialChanged, false);
+  test("non-material output updates do not thrash orchestration hooks", async () => {
+    const previousLegacyPlanOwnership = process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
+    process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "1";
+    try {
+      const userId = createUser();
+      const basePath = randomPath("output-monitor");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: "Output Monitor Task",
+        status: "in_progress"
+      });
 
-    await runOrchestrationJobQueuePassForTests();
-    await new Promise((resolve) => setTimeout(resolve, 1_750));
-    await runOrchestrationJobQueuePassForTests();
-    assert.equal(handledCount, 1);
+      let handledCount = 0;
+      registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
+        handledCount += 1;
+      });
+
+      const first = observeNodeOutputMaterialChange({
+        projectDb,
+        taskId,
+        source: "runtime_session",
+        rawOutput: "Plan step started\nWorking..."
+      });
+      assert.equal(first.materialChanged, true);
+      if (first.materialChanged) {
+        recordEvent({
+          projectId,
+          taskId,
+          eventType: "task.output.material_changed",
+          payload: {
+            source: first.source,
+            outputHash: first.outputHash,
+            previousOutputHash: first.previousOutputHash
+          },
+          database: projectDb
+        });
+      }
+
+      const nonMaterial = observeNodeOutputMaterialChange({
+        projectDb,
+        taskId,
+        source: "runtime_session",
+        rawOutput: "Plan step started  \r\nWorking...\n"
+      });
+      assert.equal(nonMaterial.materialChanged, false);
+
+      await runOrchestrationJobQueuePassForTests();
+      await new Promise((resolve) => setTimeout(resolve, 1_750));
+      await runOrchestrationJobQueuePassForTests();
+      assert.equal(handledCount, 1);
+    } finally {
+      process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = previousLegacyPlanOwnership;
+    }
   });
 
   test("watchdog enqueues stale-node readiness and re-review actions with event audit trail", async () => {
