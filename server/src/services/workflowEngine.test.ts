@@ -215,4 +215,95 @@ stages:
     assert.equal(waitingEvents.length, 1);
     db.close();
   });
+
+  test("waiting_input stages auto-verify on idle cadence and advance automatically", () => {
+    const db = createTestDb();
+    const runId = seedDefinition(
+      db,
+      JSON.stringify({
+        version: 1,
+        stages: [
+          {
+            id: "build",
+            expected_results: [
+              {
+                type: "command_exit_code",
+                name: "echo-ok",
+                command: ["bash", "-lc", "exit 0"],
+                expectedExitCode: 0
+              }
+            ]
+          },
+          {
+            id: "verify",
+            depends_on: ["build"]
+          }
+        ]
+      })
+    );
+
+    startWorkflowRun({ db, workflowRunId: runId });
+    const initial = listWorkflowStageRunsByRun(db, runId);
+    const handled = handleEvent({
+      db,
+      workflowRunId: runId,
+      stageRunId: initial[0].id,
+      eventType: "workflow.stage.waiting_input"
+    });
+    assert.equal(handled.applied, true);
+
+    const after = listWorkflowStageRunsByRun(db, runId);
+    assert.equal(after[0].status, "succeeded");
+    assert.equal(after[1].status, "running");
+    db.close();
+  });
+
+  test("failed expected_results checks publish actionable feedback to runtime input", () => {
+    const db = createTestDb();
+    const runId = seedDefinition(
+      db,
+      JSON.stringify({
+        version: 1,
+        stages: [
+          {
+            id: "execute",
+            expected_results: [
+              {
+                type: "command_exit_code",
+                name: "must-pass",
+                command: ["bash", "-lc", "exit 1"],
+                expectedExitCode: 0
+              }
+            ]
+          }
+        ]
+      })
+    );
+
+    startWorkflowRun({ db, workflowRunId: runId });
+    const stage = listWorkflowStageRunsByRun(db, runId)[0];
+    handleEvent({
+      db,
+      workflowRunId: runId,
+      stageRunId: stage.id,
+      eventType: "workflow.stage.waiting_input"
+    });
+
+    const ticked = tickWorkflowRun({ db, workflowRunId: runId });
+    assert.equal(ticked.progressed, true);
+
+    const sameStage = listWorkflowStageRunsByRun(db, runId)[0];
+    assert.equal(sameStage.status, "running");
+    const inputFeedbackEvents = listWorkflowEventsByStageRun(db, stage.id).filter(
+      (event) => event.event_type === "workflow.stage.runtime_input.required"
+    );
+    assert.equal(inputFeedbackEvents.length >= 1, true);
+    const payload = JSON.parse(inputFeedbackEvents[inputFeedbackEvents.length - 1].payload) as {
+      feedback?: Array<{ check?: string; reason?: string }>;
+    };
+    assert.equal(Array.isArray(payload.feedback), true);
+    assert.equal(payload.feedback?.[0]?.check, "must-pass");
+    assert.equal(typeof payload.feedback?.[0]?.reason, "string");
+    db.close();
+  });
 });
