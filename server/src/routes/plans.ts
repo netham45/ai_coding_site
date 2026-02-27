@@ -14,6 +14,7 @@ import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { buildDependencyDiagnostics, partitionDependenciesByTier, validateProposedNodeGraph } from "../services/orchestration/dependencyGraph.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
+import { createProjectNode } from "./tasks.js";
 import type {
   NodeDependencyRef,
   NodeMetadata,
@@ -528,109 +529,30 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
 
   const input = parsed.data;
   const plannerPrompt = buildPlanTaskPrompt(input.taskPrompt);
-  const id = makeId();
-  const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
-  const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
-  const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
-  const autoStart = Boolean(input.autoStart);
-  const autoMergeOnComplete = Boolean(input.autoMergeOnComplete);
-  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
-
-  let parentPlanTask: TaskRow | undefined;
-  if (input.parentPlanTaskId) {
-    parentPlanTask = planTaskInProject(projectDb, project.id, input.parentPlanTaskId);
-    if (!parentPlanTask) {
-      res.status(400).json({ error: "parentPlanTaskId must reference an existing plan in this project" });
-      return;
-    }
-  }
-
-  let baseCommitSha: string;
+  let task: TaskRow;
   try {
-    const sourcePath = parentPlanTask ? parentPlanTask.workspace_path : project.base_path;
-    const sourceBranch = parentPlanTask ? taskBranchName(parentPlanTask.id) : project.default_branch;
-    baseCommitSha = await getHeadCommitSha(sourcePath);
-    await cloneLocalBaseToWorkspace({ basePath: sourcePath, baseBranch: sourceBranch, workspacePath });
-    await createTaskBranch(workspacePath, id);
-    await fs.promises.mkdir(path.join(workspacePath, ".ai-plan"), { recursive: true });
+    task = await createProjectNode({
+      project,
+      projectDb,
+      userId: req.user.id,
+      source: "legacyPlan",
+      input: {
+        title: input.title,
+        taskPrompt: plannerPrompt,
+        nodeTier: "plan",
+        aiCommand: input.aiCommand,
+        autoStart: input.autoStart,
+        autoMergeOnComplete: input.autoMergeOnComplete ?? true,
+        allowReplanBudgetOverride: input.allowReplanBudgetOverride,
+        parentNodeId: input.parentPlanTaskId
+      }
+    });
   } catch (error: any) {
-    const message = String(error?.message ?? "Failed to initialize plan workspace");
-    res.status(500).json({ error: message });
+    const status = Number(error?.status);
+    res.status(Number.isInteger(status) ? status : 500).json({ error: String(error?.message ?? "Failed to create plan") });
     return;
   }
 
-  projectDb.transaction(() => {
-    const metadataJson = serializeNodeMetadata(
-      withReplanBudgetOverride(buildInitialNodeMetadata({
-        task: {
-          id,
-          project_id: project.id,
-          mode: "plan",
-          metadata_json: null,
-          auto_merge: 0,
-          auto_start: autoStart ? 1 : 0,
-          auto_merge_on_complete: autoMergeOnComplete ? 1 : 0,
-          parent_plan_task_id: parentPlanTask?.id ?? null,
-          source_plan_revision_id: null,
-          source_plan_item_key: null
-        },
-        dependencyTaskIds: [],
-        tier: "plan",
-        crossTierDependencies: parentPlanTask ? [{ id: parentPlanTask.id, tier: "plan", reason: "parent_plan" }] : []
-      }), allowReplanBudgetOverride)
-    );
-    projectDb.prepare(
-      `INSERT INTO tasks (
-        id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge, auto_start, auto_merge_on_complete, metadata_json,
-        mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
-        status, workspace_path, base_commit_sha_at_create, head_commit_sha,
-        cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-    ).run(
-      id,
-      project.id,
-      input.title,
-      plannerPrompt,
-      effectivePrompt,
-      aiCommand,
-      autoStart ? 1 : 0,
-      autoMergeOnComplete ? 1 : 0,
-      metadataJson,
-      parentPlanTask?.id ?? null,
-      workspacePath,
-      baseCommitSha,
-      req.user.id,
-      now,
-      now
-    );
-
-    projectDb.prepare(
-      `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(makeId(), id, "null", "queued", "plan_created", req.user.id, now);
-  })();
-
-  recordEvent({
-    projectId: project.id,
-    taskId: id,
-    eventType: "plan.created",
-    database: projectDb,
-    payload: {
-      title: input.title,
-      aiCommand,
-      autoStart,
-      autoMergeOnComplete,
-      allowReplanBudgetOverride,
-      parentPlanTaskId: parentPlanTask?.id ?? null,
-      workspacePath,
-      baseCommitShaAtCreate: baseCommitSha
-    }
-  });
-
-  const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
-  kickTaskQueueProcessing();
   res.status(201).json({ plan: serializeTask(projectDb, task) });
 });
 

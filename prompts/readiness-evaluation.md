@@ -1,70 +1,103 @@
-# Readiness Evaluation Template
+# Readiness Evaluation Runtime Prompt
 
-Use this template for deterministic readiness evaluation in `evaluate_readiness(node)` across all tiers (`epoch`, `phase`, `plan`, `task`, `exec`).
+## Goal
+Deterministically evaluate readiness and allowed state transition for any node tier (`epoch|phase|plan|task|exec`).
 
-## Include Shared Section
+## Non-Goals
+- Performing implementation changes.
+- Inferring hidden state beyond supplied inputs.
+- Returning ambiguous transition outcomes.
 
-Include `prompts/shared-input-output.md`.
+## Definition of Done
+- Includes narrative and structured decision payload.
+- Produces deterministic recommended state and reason codes.
+- Identifies blockers, follow-up jobs, and idempotency key.
 
-## Readiness-Specific Required Inputs
+## Dependencies
+- `prompts/shared-input-output.md`
+- `docs/architecture/prompt-contract.md`
+- Node metadata, dependency graph, children summary, merge/verification prerequisites.
 
-- `node` canonical metadata payload (id, tier, parent/children, status, deps, iteration, merge settings, evidence).
-- `dependency_graph` status snapshot for all direct and transitive dependencies.
-- `children_summary` aggregated child states and outstanding work counts.
-- `prerequisites.merge` status for merge policy checks and required checks.
-- `prerequisites.verification` status for tests/validation/evidence prerequisites.
+## Artifacts
+- Readiness decision record with reason codes and blockers.
 
-## Deterministic State Evaluation Rules
+## Risks
+- Incorrectly unblocking work with incomplete dependency data.
+- Failing to propagate child failures to parent readiness.
 
-Evaluate and normalize state using this lifecycle set:
+## Idempotency
+- Same normalized inputs must yield same `idempotency_key` and recommendation.
 
-- `draft`
-- `ready`
-- `blocked`
-- `running`
-- `complete`
-- `failed`
-- `canceled`
+## Bounded Iteration
+- Single-pass deterministic evaluation per invocation.
+- Escalate when inputs are contradictory or incomplete.
 
-Rules:
+## Auto-Merge Guidance
+- Readiness output does not itself authorize merge.
+- If merge prerequisites are missing, emit blocker codes.
 
-- Use only provided inputs; do not infer hidden state.
-- If any required upstream dependency is not `complete`, evaluate as `blocked`.
-- If prerequisites are unsatisfied for execution start, evaluate as `blocked`.
-- If node work is active and not terminal, evaluate as `running`.
-- If DoD/evidence/prerequisites are all satisfied and no blockers remain, evaluate as `ready` or `complete` based on execution status.
-- Terminal states (`complete`, `failed`, `canceled`) are sticky unless explicit override input is provided.
-- For parent tiers (`epoch`, `phase`, `plan`), child terminal/blocking conditions must be reflected in parent readiness.
-- Cross-tier dependencies must be evaluated identically to same-tier dependencies.
+## Runtime Prompt Text
+Evaluate node readiness only from provided data. Honor sticky terminal states unless explicit override is provided. Cross-tier dependencies must be treated exactly like same-tier dependencies.
 
-## Transition Reason Codes (Required)
+## Structured Output Contract
+Return exactly two sections:
+1. Narrative rationale.
+2. Structured payload (YAML preferred) compliant with shared contract and:
 
-Structured output MUST include at least one explicit reason code from this set:
+```yaml
+schema_version: "1.0"
+node:
+  id: "<node-id>"
+  tier: epoch | phase | plan | task | exec
+  parent_id: "<parent-id-or-null>"
+  children_ids: ["<child-id>"]
+  status: queued | in_progress | waiting_input | awaiting_children | merge_ready | merged | cancelled | failed | merge_conflict
 
-- `NOOP_STATE_STABLE`
-- `DEPS_INCOMPLETE`
-- `DEPS_FAILED`
-- `CHILDREN_INCOMPLETE`
-- `CHILDREN_FAILED`
-- `MERGE_PREREQ_MISSING`
-- `VERIFICATION_PREREQ_MISSING`
-- `READY_TO_START`
-- `READY_TO_COMPLETE`
-- `EXECUTION_IN_PROGRESS`
-- `TERMINAL_COMPLETE`
-- `TERMINAL_FAILED`
-- `TERMINAL_CANCELED`
-- `MANUAL_INTERVENTION_REQUIRED`
+goals: ["<goal>"]
+non_goals: ["<non-goal>"]
+definition_of_done: ["<DoD>"]
+deps:
+  - id: "<dependency-id>"
+    reason: "<why required>"
+artifacts:
+  - path: "<artifact-path>"
+    kind: task_output
+    required: true
+risks:
+  - risk: "<risk>"
+    impact: low
+    mitigation: "<mitigation>"
+idempotency:
+  input_fingerprint: "<hash>"
+  output_fingerprint: "<hash>"
+  dedupe_key: "readiness-evaluation:<node-id>:<input-fingerprint>"
+  idempotent: true
+bounded_iteration:
+  max_iterations: 1
+  max_replans: 0
+  stop_conditions:
+    - "Decision produced"
+  escalation_on_limit: "Escalate contradictory or missing required state"
+auto_merge_guidance:
+  eligible: false
+  strategy: manual
+  required_checks: ["Readiness only; merge policy evaluated separately"]
+  blockers: ["Set when merge prerequisites are missing"]
 
-## Output
-
-- Natural-language rationale
-- Structured payload per prompt contract
-- Readiness decision and transition recommendation payload containing:
-  - `readiness.current_state`
-  - `readiness.recommended_state`
-  - `readiness.allowed_transition` (`true`/`false`)
-  - `readiness.reason_codes` (non-empty array from required set)
-  - `readiness.blockers` (dependency/child/prerequisite blockers with ids and required action)
-  - `readiness.follow_up_jobs` (ordered jobs to unblock/advance state)
-  - `readiness.idempotency_key` (stable dedupe key for this evaluation result)
+readiness:
+  current_state: draft | ready | blocked | running | complete | failed | canceled
+  recommended_state: draft | ready | blocked | running | complete | failed | canceled
+  allowed_transition: true
+  reason_codes:
+    - NOOP_STATE_STABLE
+  blockers:
+    - id: "<dependency-or-child-id>"
+      reason_code: DEPS_INCOMPLETE
+      required_action: "<action>"
+  follow_up_jobs:
+    - order: 1
+      job: "<job-type>"
+      target_id: "<node-id>"
+      rationale: "<why>"
+  idempotency_key: "<stable-key>"
+```

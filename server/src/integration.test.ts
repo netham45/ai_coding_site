@@ -583,6 +583,138 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     }
   });
 
+  test("legacy and unified create endpoints produce expected tiers, modes, and dependencies", async () => {
+    const userId = createUser();
+    const basePath = randomPath("nodes-endpoint");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "seed\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+
+    const legacyPlanCreate = await callApi(`/api/projects/${projectId}/plans`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Legacy Plan",
+        taskPrompt: "Draft a legacy plan prompt.",
+        autoStart: true
+      }
+    });
+    assert.equal(legacyPlanCreate.status, 201);
+    const legacyPlanId = legacyPlanCreate.json?.plan?.id;
+    assert.equal(legacyPlanCreate.json?.plan?.mode, "plan");
+    assert.equal(legacyPlanCreate.json?.plan?.nodeMetadata?.tier, "plan");
+
+    const legacyTaskCreate = await callApi(`/api/projects/${projectId}/tasks`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Legacy Task",
+        taskPrompt: "Implement legacy task changes.",
+        dependencyNodeRefs: [{ id: legacyPlanId, tier: "plan", reason: "legacy_plan_dependency" }]
+      }
+    });
+    assert.equal(legacyTaskCreate.status, 201);
+    const legacyTaskId = legacyTaskCreate.json?.task?.id;
+    assert.equal(legacyTaskCreate.json?.task?.mode, "execution");
+    assert.equal(legacyTaskCreate.json?.task?.nodeMetadata?.tier, "task");
+    assert.equal(legacyTaskCreate.json?.task?.dependencyTaskIds.includes(legacyPlanId), true);
+
+    const epochCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Program Epoch",
+        taskPrompt: "Define the top-level program milestone.",
+        nodeTier: "epoch",
+        autoStart: true
+      }
+    });
+    assert.equal(epochCreate.status, 201);
+    const epochId = epochCreate.json?.node?.id;
+    assert.equal(epochCreate.json?.node?.mode, "plan");
+    assert.equal(epochCreate.json?.node?.nodeMetadata?.tier, "epoch");
+
+    const phaseCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Delivery Phase",
+        taskPrompt: "Break the epoch into a single delivery phase.",
+        nodeTier: "phase",
+        parentNodeId: epochId,
+        dependencyNodeRefs: [{ id: epochId, tier: "epoch", reason: "parent_phase_sequence" }]
+      }
+    });
+    assert.equal(phaseCreate.status, 201);
+    const phaseId = phaseCreate.json?.node?.id;
+    assert.equal(phaseCreate.json?.node?.mode, "plan");
+    assert.equal(phaseCreate.json?.node?.nodeMetadata?.tier, "phase");
+    assert.equal(phaseCreate.json?.node?.parentPlanTaskId, epochId);
+
+    const planCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Implementation Plan",
+        taskPrompt: "Draft implementation plan details for this phase.",
+        nodeTier: "plan",
+        parentNodeId: phaseId
+      }
+    });
+    assert.equal(planCreate.status, 201);
+    const planId = planCreate.json?.node?.id;
+    assert.equal(planCreate.json?.node?.mode, "plan");
+    assert.equal(planCreate.json?.node?.nodeMetadata?.tier, "plan");
+    assert.equal(planCreate.json?.node?.parentPlanTaskId, phaseId);
+
+    const taskCreate = await callApi(`/api/projects/${projectId}/nodes`, {
+      method: "POST",
+      userId,
+      body: {
+        title: "Execute Implementation",
+        taskPrompt: "Implement the code changes from the plan.",
+        nodeTier: "task",
+        parentNodeId: planId,
+        dependencyNodeRefs: [{ id: planId, tier: "plan", reason: "await_plan_completion" }],
+        autoMerge: true
+      }
+    });
+    assert.equal(taskCreate.status, 201);
+    const taskId = taskCreate.json?.node?.id;
+    assert.equal(taskCreate.json?.node?.mode, "execution");
+    assert.equal(taskCreate.json?.node?.nodeMetadata?.tier, "task");
+    assert.equal(taskCreate.json?.node?.parentPlanTaskId, planId);
+
+    const storedRows = projectDb
+      .prepare("SELECT id, mode, metadata_json FROM tasks WHERE id IN (?, ?, ?, ?, ?, ?)")
+      .all(legacyPlanId, legacyTaskId, epochId, phaseId, planId, taskId) as Array<{ id: string; mode: string; metadata_json: string | null }>;
+    const rowById = new Map(storedRows.map((row) => [row.id, row]));
+    assert.equal(rowById.get(legacyPlanId)?.mode, "plan");
+    assert.equal(rowById.get(legacyTaskId)?.mode, "execution");
+    assert.equal(rowById.get(epochId)?.mode, "plan");
+    assert.equal(rowById.get(phaseId)?.mode, "plan");
+    assert.equal(rowById.get(planId)?.mode, "plan");
+    assert.equal(rowById.get(taskId)?.mode, "execution");
+
+    const legacyPlanMetadata = JSON.parse(rowById.get(legacyPlanId)?.metadata_json ?? "{}");
+    assert.equal(legacyPlanMetadata?.tier, "plan");
+    const legacyTaskMetadata = JSON.parse(rowById.get(legacyTaskId)?.metadata_json ?? "{}");
+    assert.equal(legacyTaskMetadata?.tier, "task");
+    const taskMetadata = JSON.parse(rowById.get(taskId)?.metadata_json ?? "{}");
+    assert.equal(taskMetadata?.tier, "task");
+
+    const persistedDependencies = projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(taskId) as Array<{ dependency_task_id: string }>;
+    assert.equal(persistedDependencies.some((row) => row.dependency_task_id === planId), true);
+  });
+
   test("portability metadata detection reads cloned project DB metadata and catches project-id mismatch", () => {
     const sourceProjectId = randomUUID();
     const sourceBasePath = randomPath("portable-source");
@@ -3116,6 +3248,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
       assert.equal(hierarchy.status, 200);
       assert.equal(hierarchy.json?.hierarchy?.roots?.length, 1);
+      assert.equal(Array.isArray(hierarchy.json?.hierarchy?.nodes), true);
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.tier, "epoch");
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.tier, "phase");
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.tier, "plan");
@@ -3125,11 +3258,21 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         "exec"
       );
       assert.equal(typeof hierarchy.json?.hierarchy?.roots?.[0]?.task?.orchestrationControls?.replan?.iterationsUsed, "number");
+      const execHierarchyNode = (hierarchy.json?.hierarchy?.nodes ?? []).find((node: any) => node.task?.id === execId);
+      assert.equal(execHierarchyNode?.tier, "exec");
+      assert.equal(Array.isArray(execHierarchyNode?.waiting?.unresolvedDependencyDetails), true);
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.id, taskTierId);
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.tier, "task");
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.reason, "await_task_tier");
 
       const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
       assert.equal(graph.status, 200);
       assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
       assert.equal(Array.isArray(graph.json?.graph?.edges), true);
+      const graphExecNode = (graph.json?.graph?.nodes ?? []).find((node: any) => node.id === execId);
+      assert.equal(graphExecNode?.tier, "exec");
+      assert.equal(graphExecNode?.mode, "execution");
+      assert.equal(typeof graphExecNode?.dependencyCount, "number");
       assert.equal(
         graph.json?.graph?.edges?.some((edge: any) => edge.fromId === execId && edge.toId === taskTierId && edge.reason === "await_task_tier"),
         true

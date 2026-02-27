@@ -29,6 +29,7 @@ export type TaskStatus =
   | "merge_conflict";
 
 export type TaskMode = "execution" | "plan";
+export type NodeTier = "epoch" | "phase" | "plan" | "task" | "exec";
 
 export type CompletionEvidence = {
   child_task_id: string;
@@ -115,6 +116,142 @@ export type Task = {
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type NodeDependencyRef = {
+  id: string;
+  tier?: NodeTier;
+  reason?: string;
+};
+
+export type CreateNodeTier = Exclude<NodeTier, "exec">;
+
+export type CreateNodePayload = {
+  title: string;
+  taskPrompt: string;
+  nodeTier: CreateNodeTier;
+  aiCommand?: string;
+  autoMerge?: boolean;
+  autoStart?: boolean;
+  autoMergeOnComplete?: boolean;
+  allowReplanBudgetOverride?: boolean;
+  parentNodeId?: string;
+  dependencyTaskIds?: string[];
+  dependencyNodeRefs?: NodeDependencyRef[];
+};
+
+export type CreateNodeResponse = {
+  node: Task;
+};
+
+export type HierarchyWaitingState = {
+  waiting: boolean;
+  reasonCode: string;
+  reason: string;
+  dependencyBlockerTaskId: string | null;
+  unresolvedDependencyIds: string[];
+  unresolvedDependencyDetails: Array<{
+    id: string;
+    tier: NodeTier;
+    reason: string | null;
+    status: TaskStatus | null;
+  }>;
+};
+
+export type HierarchyNode = {
+  task: Task;
+  tier: NodeTier;
+  waiting: HierarchyWaitingState;
+  children: HierarchyNode[];
+};
+
+export type HierarchyNodeRow = Omit<HierarchyNode, "children">;
+
+export type ProjectHierarchy = {
+  projectId: string;
+  roots: HierarchyNode[];
+  nodes: HierarchyNodeRow[];
+};
+
+export type GetHierarchyResponse = {
+  hierarchy: ProjectHierarchy;
+};
+
+export type DependencyGraphNode = {
+  id: string;
+  title: string;
+  mode: TaskMode;
+  status: TaskStatus;
+  tier: NodeTier;
+  dependencyCount: number;
+};
+
+export type DependencyGraphEdge = {
+  fromId: string;
+  fromTier: NodeTier;
+  toId: string;
+  toTier: NodeTier;
+  toStatus: TaskStatus | null;
+  unresolved: boolean;
+  reason: string | null;
+};
+
+export type ProjectDependencyGraph = {
+  projectId: string;
+  nodes: DependencyGraphNode[];
+  edges: DependencyGraphEdge[];
+};
+
+export type GetDependencyGraphResponse = {
+  graph: ProjectDependencyGraph;
+};
+
+export type OrchestrationNodeDetail = {
+  node: Task;
+  transitions: TaskTransition[];
+  dependencyDiagnostics: unknown;
+  waiting: unknown;
+  automation: unknown;
+  orchestration: unknown;
+  parent: Task | null;
+  children: Task[];
+};
+
+export type StartNodePayload = {
+  autoMode?: boolean;
+};
+
+export type StartNodeResult = {
+  node: Task;
+  started: boolean;
+  tier: NodeTier;
+};
+
+export type SetNodeAutoModePayload = {
+  enabled: boolean;
+};
+
+export type SetNodeAutoMergePayload = {
+  enabled: boolean;
+  onComplete?: boolean;
+};
+
+export type ForceReReviewPayload = {
+  reason?: string;
+};
+
+export type ApproveBudgetOverridePayload = {
+  reason?: string;
+  enabled?: boolean;
+};
+
+export type NodeMutationResult = {
+  node: Task;
+};
+
+export type AsyncNodeActionResult = {
+  ok: boolean;
+  pendingEventId: string;
 };
 
 export type PlanRevisionItem = {

@@ -1,73 +1,71 @@
-# Epoch to Phases Decomposition Template
+# Epoch to Phases Runtime Prompt
 
-Use this template when decomposing an `epoch` node into `phase` children.
+## Goal
+Decompose one `epoch` node into a minimal, sufficient set of `phase` children with explicit sequencing and dependency rationale.
 
-## Include Shared Section
+## Non-Goals
+- Writing implementation-level task steps.
+- Creating `plan`, `task`, or `exec` children directly.
+- Emitting speculative dependencies without evidence.
 
-Include `prompts/shared-input-output.md`.
+## Definition of Done
+- Output includes narrative plus structured payload.
+- Every proposed phase has measurable DoD.
+- Dependency DAG is acyclic and every edge includes a reason.
+- Required contract sections and fields are present.
+
+## Dependencies
+- `prompts/shared-input-output.md`
+- `docs/architecture/prompt-contract.md`
+- Current hierarchy/DAG snapshot for parent project.
+- CLI visibility into hierarchy and node details:
+  - `npm run cli -- tasks all --project-id <projectId> --json`
+  - `npm run cli -- plans list --project-id <projectId> --json`
+  - `npm run cli -- tasks details <taskId> --project-id <projectId> --json` (sample across related branches)
+  - `npm run cli -- info <taskId> --project-id <projectId> --json` (sample)
+- Repository evidence from code and docs (`README`, architecture docs, module boundaries).
+
+## Artifacts
+- `docs/plans/<epoch-id>/phase-strategy.md`
+- `docs/plans/<epoch-id>/phase-graph.yaml`
+
+## Risks
+- Overlapping phase scope causing redundant downstream planning.
+- Hidden external blockers invalidating dependency ordering.
+- Unstable IDs causing duplicate children on retries.
+
+## Idempotency
+- Normalize inputs before decomposition.
+- Reuse stable phase IDs when intent/scope is unchanged.
+- Emit deterministic `input_fingerprint`, `output_fingerprint`, and `dedupe_key`.
+
+## Bounded Iteration
+- `max_iterations: 3`
+- `max_replans: 1`
+- Stop when decomposition is complete, no material improvement is found, or limits are reached.
+- Escalate with exact missing decisions when limits are reached with unresolved critical ambiguity.
+
+## Auto-Merge Guidance
+- Decomposition output is not merge-ready by default.
+- `eligible: false` unless explicitly configured by controller policy.
+- Require dependency and DoD review before merge.
 
 ## Runtime Prompt Text
+You are the hierarchical orchestration coordinator.
 
-You are the orchestration coordinator for hierarchical planning.
+Before proposing any `phase` layout, run a research pass:
+1. Inspect the existing hierarchy/tree using CLI outputs (other epochs/phases/plans/tasks, not just the target node).
+2. Inspect relevant code paths and documentation to ground scope and boundaries.
+3. Summarize findings and only then propose decomposition.
 
-Your task is to decompose one `epoch` node into a minimal, sufficient set of `phase` children that can be executed through downstream plan/task coordinators.
+Produce a deterministic decomposition from one `epoch` into `phase` children grounded in that evidence. Prioritize outcome-oriented phase boundaries, front-load uncertainty, and enforce explicit dependency reasons. Keep output idempotent and avoid duplicate children for unchanged inputs.
 
-Prioritize:
-1. Strategic scope clarity at epoch level.
-2. Milestone slicing into coherent phase boundaries.
-3. Explicit cross-phase and cross-tier dependency reasons.
-4. Risk front-loading so highest-uncertainty work is addressed early.
-5. Idempotent output that avoids duplicate decomposition artifacts.
+If required input is missing or contradictory, continue with bounded assumptions, mark risks, and emit escalation requirements.
 
-### Required Inputs
-
-You will receive all shared required inputs plus the following decomposition inputs:
-
-- `epoch_metadata`: epoch objective, constraints, success criteria, ownership, known assumptions.
-- `epoch_spec`: intended deliverable scope and expected business/technical outcomes.
-- `project_constraints`: timeline, staffing, compliance, budget, tooling, quality bars.
-- `existing_dag_state`: current nodes and edges across epoch/phase/plan/task/exec tiers.
-- `repo_context`: codebase layout, active components, known architectural boundaries.
-- `unresolved_blockers`: open questions, external approvals, missing prerequisites.
-
-If any required input is missing or contradictory, state the gap in rationale and apply bounded decomposition with explicit escalation notes.
-
-### Decomposition Rules
-
-- Produce 2-7 phases unless constraints justify a different count.
-- Each phase must have a distinct objective and a measurable definition of done.
-- Map every dependency to a concrete reason; do not emit dependency edges without rationale.
-- Front-load uncertainty, integration risk, and irreversible decisions into earlier phases.
-- Keep phase goals outcome-based, not implementation-step checklists.
-- Reuse stable ids and fingerprints when inputs are materially unchanged.
-
-### Bounded Iteration and Escalation
-
-Perform decomposition passes up to the configured budget:
-
-1. Pass 1: propose candidate phases and dependency graph.
-2. Pass 2: tighten scope boundaries, eliminate overlap, verify DoD measurability.
-3. Pass N (if allowed): resolve unresolved blockers only when evidence changes output quality.
-
-Stop immediately when one of the following is true:
-- decomposition is internally consistent and DoD-complete,
-- no material improvement is found in the last pass,
-- iteration or replan limits are reached.
-
-Escalate instead of continuing when limits are reached and critical ambiguity remains. Escalation text must specify exactly what input/decision is required and which phase(s) are blocked.
-
-## Required Output
-
-Your response MUST include exactly two sections:
-
-1. Natural-language phase strategy
-- Summarize strategic scope, proposed phase sequence, risk front-loading choices, and escalation decisions (if any).
-
-2. Structured payload (YAML preferred)
-- Must conform to `docs/architecture/prompt-contract.md`.
-- Must include cross-tier dependency reasons.
-
-Use this payload shape:
+## Structured Output Contract
+Return exactly two sections:
+1. Narrative strategy.
+2. Structured payload (YAML preferred) compliant with `docs/architecture/prompt-contract.md` and this extension:
 
 ```yaml
 schema_version: "1.0"
@@ -75,102 +73,88 @@ node:
   id: "<epoch-id>"
   tier: epoch
   parent_id: "<parent-id-or-null>"
-  children_ids:
-    - "phase-1"
-    - "phase-2"
+  children_ids: ["<phase-id>"]
   status: awaiting_children
 
-goals:
-  - "Epoch-level outcome to be achieved by all phases"
-non_goals:
-  - "Work explicitly out of scope for this epoch decomposition"
-definition_of_done:
-  - "Each proposed phase has measurable completion criteria"
-  - "Dependencies are acyclic and justified"
+goals: ["<epoch outcome>"]
+non_goals: ["<out-of-scope>"]
+definition_of_done: ["<measurable checks>"]
 deps:
-  - id: "<dependency-node-id>"
-    reason: "Why this dependency must be satisfied before downstream work"
+  - id: "<node-id>"
+    reason: "<dependency reason>"
 artifacts:
-  - path: "docs/plans/<epoch-id>/phase-strategy.md"
-    kind: file
-    required: true
   - path: "docs/plans/<epoch-id>/phase-graph.yaml"
     kind: file
     required: true
 risks:
-  - risk: "Critical uncertainty that can invalidate phase boundaries"
-    impact: high
-    mitigation: "Front-load discovery/prototype in earliest phase"
+  - risk: "<risk>"
+    impact: medium
+    mitigation: "<mitigation>"
 idempotency:
-  input_fingerprint: "<stable-hash-of-epoch-inputs>"
-  output_fingerprint: "<stable-hash-of-phase-output>"
+  input_fingerprint: "<hash>"
+  output_fingerprint: "<hash>"
   dedupe_key: "epoch-to-phases:<epoch-id>:<input-fingerprint>"
   idempotent: true
 bounded_iteration:
   max_iterations: 3
   max_replans: 1
   stop_conditions:
-    - "All phase DoD items are measurable and non-overlapping"
-    - "No new high-impact insights in latest pass"
+    - "DoD complete"
+    - "No material improvement"
     - "Iteration budget reached"
-  escalation_on_limit: "Escalate to planner owner with missing decisions and blocked phase ids"
+  escalation_on_limit: "Escalate missing decisions with blocked phase IDs"
 auto_merge_guidance:
   eligible: false
   strategy: manual
   required_checks:
-    - "Dependency graph validated"
-    - "Phase goals and DoD reviewed"
+    - "Dependency DAG review"
+    - "Phase DoD review"
   blockers:
-    - "Unresolved cross-team approval"
+    - "Unresolved external blocker"
 
 phase_children:
-  - id: "phase-1"
+  - id: "<phase-id>"
     tier: phase
-    title: "<short milestone title>"
-    objective: "<phase outcome>"
-    goals:
-      - "<phase goal>"
-    non_goals:
-      - "<phase non-goal>"
-    definition_of_done:
-      - "<measurable completion criterion>"
+    title: "<title>"
+    objective: "<outcome>"
+    goals: ["<goal>"]
+    non_goals: ["<non-goal>"]
+    definition_of_done: ["<measurable DoD>"]
     deps:
-      - id: "<phase-or-external-dependency-id>"
-        reason: "<why dependency exists>"
+      - id: "<dependency-id>"
+        reason: "<why required>"
     artifacts:
-      - path: "<expected artifact path>"
+      - path: "<artifact-path>"
         kind: file
         required: true
     risks:
-      - risk: "<phase-specific risk>"
-        impact: medium
+      - risk: "<risk>"
+        impact: low
         mitigation: "<mitigation>"
 
 cross_tier_dependency_reasons:
-  - from_node_id: "<epoch-or-phase-node-id>"
+  - from_node_id: "<epoch-or-phase-id>"
     from_tier: epoch
-    to_node_id: "<phase-or-plan-node-id>"
+    to_node_id: "<phase-or-plan-id>"
     to_tier: phase
-    reason: "<why this cross-tier edge is required for correct sequencing>"
+    reason: "<cross-tier rationale>"
 
-decomposition_fingerprint: "<stable-hash-of-epoch-to-phases-decomposition>"
-assumptions:
-  - "<assumption used to make decomposition decisions>"
+assumptions: ["<assumption>"]
+research_evidence:
+  cli_queries:
+    - command: "npm run cli -- tasks all --project-id <projectId> --json"
+      findings: "<what was learned>"
+    - command: "npm run cli -- plans list --project-id <projectId> --json"
+      findings: "<what was learned>"
+  repo_reads:
+    - path: "<file-or-dir>"
+      findings: "<what was learned>"
+  tree_coverage:
+    reviewed_related_nodes: ["<node-id>"]
+    coverage_note: "Confirm related branches were reviewed before decomposition"
 escalations:
-  - trigger: "<limit-hit-or-critical-ambiguity>"
-    action: "<who/what to escalate to>"
-    required_input: "<specific decision or artifact needed>"
-    blocks:
-      - "<phase-id>"
+  - trigger: "<trigger>"
+    action: "<owner/action>"
+    required_input: "<needed decision/artifact>"
+    blocks: ["<phase-id>"]
 ```
-
-## Quality Gate Before Responding
-
-Verify before finalizing output:
-
-- all required contract fields are present,
-- each dependency has a reason,
-- cross-tier dependency reasons are explicit,
-- decomposition fingerprint is present and stable,
-- bounded iteration and escalation behavior are explicit,
-- rationale and payload do not conflict.

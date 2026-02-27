@@ -26,9 +26,29 @@ import {
 } from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
-import { api } from "../api/client";
+import {
+  api,
+  approveNodeBudgetOverride,
+  forceNodeReReview,
+  getNode,
+  setNodeAutoMerge,
+  setNodeAutoMode,
+  startNode
+} from "../api/client";
+import { NodeActionsPanel, type NodeActionLoadingState } from "../components/NodeActionsPanel";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskTransition, UserSettings } from "../api/types";
+import type {
+  GitStatusSummary,
+  IdeInstance,
+  MergeRecord,
+  OrchestrationNodeDetail,
+  PlanRevision,
+  Project,
+  Task,
+  TaskSession,
+  TaskTransition,
+  UserSettings
+} from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -120,6 +140,17 @@ export function TaskDetailPage() {
   const [autoMergeItemKeys, setAutoMergeItemKeys] = useState<string[]>([]);
   const [planItemDrafts, setPlanItemDrafts] = useState<Record<string, PlanItemDraft>>({});
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>([DEFAULT_AI_COMMAND]);
+  const [nodeDetail, setNodeDetail] = useState<OrchestrationNodeDetail | null>(null);
+  const [nodeDetailLoading, setNodeDetailLoading] = useState(false);
+  const [nodeDetailError, setNodeDetailError] = useState<string | null>(null);
+  const [nodeActionLoading, setNodeActionLoading] = useState<NodeActionLoadingState>({
+    start: false,
+    autoMode: false,
+    autoMerge: false,
+    autoMergeOnComplete: false,
+    reReview: false,
+    budgetOverride: false
+  });
 
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
   const latestFailedTransition = transitions.find((item) => item.toStatus === "failed");
@@ -166,6 +197,23 @@ export function TaskDetailPage() {
     setTaskAiCommandOptions(commandOptions);
   }
 
+  async function loadNodeDetails(currentNodeId: string, suppressError = false) {
+    setNodeDetailLoading(true);
+    try {
+      const response = await getNode(currentNodeId);
+      setNodeDetail(response);
+      setNodeDetailError(null);
+    } catch (error: any) {
+      setNodeDetail(null);
+      setNodeDetailError(error.message || "Failed to load node orchestration details.");
+      if (!suppressError) {
+        toast({ status: "warning", title: "Node orchestration unavailable", description: error.message });
+      }
+    } finally {
+      setNodeDetailLoading(false);
+    }
+  }
+
   function updatePlanItemDraft(itemKey: string, updates: Partial<PlanItemDraft>, defaults: Pick<PlanItemDraft, "title" | "description">) {
     setPlanItemDrafts((current) => {
       const key = itemKey.toLowerCase();
@@ -198,6 +246,18 @@ export function TaskDetailPage() {
   }, [entityId, searchParams]);
 
   useEffect(() => {
+    if (!entityId) {
+      setNodeDetail(null);
+      setNodeDetailError(null);
+      return;
+    }
+    loadNodeDetails(entityId).catch(() => {
+      // handled in helper
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entityId]);
+
+  useEffect(() => {
     if (!task?.projectId) return;
     loadProjectContext(task.projectId).catch((error: Error) => {
       toast({ status: "error", title: "Failed to load task list", description: error.message });
@@ -214,7 +274,10 @@ export function TaskDetailPage() {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      loadTask().catch((error: Error) => {
+      Promise.all([
+        loadTask(),
+        entityId ? loadNodeDetails(entityId, true) : Promise.resolve()
+      ]).catch((error: Error) => {
         console.error("Failed to poll task", error);
       });
     }, 3000);
@@ -528,6 +591,60 @@ export function TaskDetailPage() {
     }
   }
 
+  async function runNodeAction(action: keyof NodeActionLoadingState, actionFn: () => Promise<void>, successTitle: string) {
+    setNodeActionLoading((current) => ({ ...current, [action]: true }));
+    try {
+      await actionFn();
+      if (entityId) {
+        await Promise.all([loadTask(), loadNodeDetails(entityId, true)]);
+      }
+      toast({ status: "success", title: successTitle });
+    } catch (error: any) {
+      toast({ status: "error", title: "Node action failed", description: error.message });
+    } finally {
+      setNodeActionLoading((current) => ({ ...current, [action]: false }));
+    }
+  }
+
+  function handleStartNode(autoMode: boolean) {
+    if (!entityId) return;
+    runNodeAction("start", async () => {
+      await startNode(entityId, { autoMode });
+    }, "Node start requested");
+  }
+
+  function handleSetNodeAutoMode(enabled: boolean) {
+    if (!entityId) return;
+    runNodeAction("autoMode", async () => {
+      await setNodeAutoMode(entityId, { enabled });
+    }, "Auto mode updated");
+  }
+
+  function handleSetNodeAutoMerge(enabled: boolean, onComplete?: boolean) {
+    if (!entityId) return;
+    const action: keyof NodeActionLoadingState = onComplete === false ? "autoMergeOnComplete" : "autoMerge";
+    runNodeAction(action, async () => {
+      await setNodeAutoMerge(entityId, { enabled, onComplete });
+    }, "Auto-merge updated");
+  }
+
+  function handleForceNodeReReview(reason?: string) {
+    if (!entityId) return;
+    runNodeAction("reReview", async () => {
+      await forceNodeReReview(entityId, reason?.trim() ? { reason: reason.trim() } : undefined);
+    }, "Re-review queued");
+  }
+
+  function handleApproveNodeBudgetOverride(enabled: boolean, reason?: string) {
+    if (!entityId) return;
+    runNodeAction("budgetOverride", async () => {
+      await approveNodeBudgetOverride(entityId, {
+        enabled,
+        ...(reason?.trim() ? { reason: reason.trim() } : {})
+      });
+    }, "Budget override updated");
+  }
+
   const latestProposedRevision = planRevisions.find((revision) => revision.status === "proposed");
   const latestProposedItemKeys = (latestProposedRevision?.items ?? []).map((item) => item.itemKey);
   const allAutoMergeSelected = latestProposedItemKeys.length > 0 && latestProposedItemKeys.every((itemKey) => autoMergeItemKeys.includes(itemKey));
@@ -611,6 +728,12 @@ export function TaskDetailPage() {
             <Stack direction="row" align="center" flexWrap="wrap">
               <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
               <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
+              <Badge colorScheme={task.autoMerge ? "green" : "gray"}>auto-merge: {task.autoMerge ? "on" : "off"}</Badge>
+              {task.mode === "plan" ? (
+                <Badge colorScheme={task.autoMergeOnComplete ? "green" : "gray"}>
+                  auto-merge on complete: {task.autoMergeOnComplete ? "on" : "off"}
+                </Badge>
+              ) : null}
               <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
                 ide: {ide?.status ?? "stopped"}
               </Badge>
@@ -1081,6 +1204,21 @@ export function TaskDetailPage() {
                     </Stack>
                   </Box>
                 )}
+
+                <Box>
+                  <NodeActionsPanel
+                    nodeDetail={nodeDetail}
+                    isLoading={nodeDetailLoading}
+                    loadError={nodeDetailError}
+                    actionLoading={nodeActionLoading}
+                    onStartNode={handleStartNode}
+                    onSetAutoMode={handleSetNodeAutoMode}
+                    onSetAutoMerge={handleSetNodeAutoMerge}
+                    onForceReReview={handleForceNodeReReview}
+                    onApproveBudgetOverride={handleApproveNodeBudgetOverride}
+                  />
+                </Box>
+
                 <Box>
                   <Heading size="sm" mb={2}>
                     Dependencies

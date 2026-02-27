@@ -62,6 +62,24 @@ const createTaskSchema = z.object({
   })).max(200).optional()
 });
 
+const createNodeSchema = z.object({
+  title: z.string().min(2).max(160),
+  taskPrompt: z.string().min(1).max(12000),
+  nodeTier: z.enum(["epoch", "phase", "plan", "task"]),
+  aiCommand: z.string().min(1).max(500).optional(),
+  autoMerge: z.boolean().optional(),
+  autoStart: z.boolean().optional(),
+  autoMergeOnComplete: z.boolean().optional(),
+  allowReplanBudgetOverride: z.boolean().optional(),
+  parentNodeId: z.string().min(1).max(200).optional(),
+  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional(),
+  dependencyNodeRefs: z.array(z.object({
+    id: z.string().min(1).max(200),
+    tier: z.enum(["epoch", "phase", "plan", "task", "exec"]).optional(),
+    reason: z.string().min(1).max(500).optional()
+  })).max(200).optional()
+});
+
 function withReplanBudgetOverride(metadata: any, enabled: boolean) {
   if (!enabled) return metadata;
   return {
@@ -832,7 +850,285 @@ function getTaskAccessOrRespond(
   }
 }
 
+export type CreateProjectNodeInput = {
+  title: string;
+  taskPrompt: string;
+  nodeTier: "epoch" | "phase" | "plan" | "task";
+  aiCommand?: string;
+  autoMerge?: boolean;
+  autoStart?: boolean;
+  autoMergeOnComplete?: boolean;
+  allowReplanBudgetOverride?: boolean;
+  parentNodeId?: string;
+  dependencyTaskIds?: string[];
+  dependencyNodeRefs?: NodeDependencyRef[];
+};
+
+type CreateProjectNodeSource = "unified" | "legacyTask" | "legacyPlan";
+
+type CreateProjectNodeParams = {
+  project: ProjectRow;
+  projectDb: Database.Database;
+  userId: string;
+  source: CreateProjectNodeSource;
+  input: CreateProjectNodeInput;
+};
+
+type CreateProjectNodeError = Error & { status?: number };
+
+function createProjectNodeError(status: number, message: string): CreateProjectNodeError {
+  const error = new Error(message) as CreateProjectNodeError;
+  error.status = status;
+  return error;
+}
+
+export async function createProjectNode(params: CreateProjectNodeParams): Promise<TaskRow> {
+  const { project, projectDb, userId, source, input } = params;
+  const id = makeId();
+  const now = nowIso();
+  const mode: TaskRow["mode"] = input.nodeTier === "task" ? "execution" : "plan";
+  const autoMerge = input.autoMerge ?? true;
+  const autoStart = mode === "plan" ? Boolean(input.autoStart) : false;
+  const autoMergeOnComplete = mode === "plan" ? (input.autoMergeOnComplete ?? true) : false;
+  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
+  const aiCommand = resolveAiCommand(input.aiCommand, userId);
+  const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
+  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
+
+  let parentTask: TaskRow | undefined;
+  if (input.parentNodeId) {
+    parentTask = projectDb
+      .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?")
+      .get(input.parentNodeId, project.id) as TaskRow | undefined;
+    if (!parentTask) {
+      if (source === "legacyPlan") {
+        throw createProjectNodeError(400, "parentPlanTaskId must reference an existing plan in this project");
+      }
+      throw createProjectNodeError(400, "parentNodeId must reference an existing node in this project");
+    }
+    if (source === "legacyPlan" && parentTask.mode !== "plan") {
+      throw createProjectNodeError(400, "parentPlanTaskId must reference an existing plan in this project");
+    }
+  }
+
+  const parentDeps = parentTask
+    ? (projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(parentTask.id) as Array<{ dependency_task_id: string }>)
+      .map((row) => row.dependency_task_id)
+    : [];
+  const parentTier = parentTask
+    ? readNodeMetadata({ projectDb, task: parentTask, dependencyTaskIds: parentDeps }).metadata.tier
+    : null;
+
+  const materializedDependencyNodeRefs = [...(input.dependencyNodeRefs ?? [])];
+  if (
+    source === "unified"
+    && parentTask
+    && !materializedDependencyNodeRefs.some((dep) => dep.id === parentTask?.id)
+  ) {
+    materializedDependencyNodeRefs.push({
+      id: parentTask.id,
+      tier: parentTier ?? "plan",
+      reason: "parent_node"
+    });
+  }
+
+  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
+  try {
+    dependencyResolution = resolveAndValidateNodeDependencies({
+      projectDb,
+      projectId: project.id,
+      nodeId: id,
+      nodeTier: input.nodeTier,
+      dependencyTaskIds: input.dependencyTaskIds ?? [],
+      dependencyNodeRefs: materializedDependencyNodeRefs
+    });
+  } catch (error: any) {
+    throw createProjectNodeError(400, String(error?.message ?? "Invalid dependencies"));
+  }
+
+  const dependencies = dependencyResolution.taskDependencies;
+  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
+  const isBlocked = unresolvedDependencies.length > 0;
+  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, input.nodeTier);
+  const sourcePath = parentTask ? parentTask.workspace_path : project.base_path;
+  const sourceBranch = parentTask ? taskBranchName(parentTask.id) : project.default_branch;
+
+  let baseCommitSha: string;
+  try {
+    baseCommitSha = await getHeadCommitSha(sourcePath);
+    if (!isBlocked) {
+      await cloneLocalBaseToWorkspace({ basePath: sourcePath, baseBranch: sourceBranch, workspacePath });
+      await createTaskBranch(workspacePath, id);
+      if (mode === "plan") {
+        await fs.promises.mkdir(path.join(workspacePath, ".ai-plan"), { recursive: true });
+      }
+    }
+  } catch (error: any) {
+    throw createProjectNodeError(500, String(error?.message ?? "Failed to initialize node workspace"));
+  }
+
+  projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      withReplanBudgetOverride(buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode,
+          metadata_json: null,
+          auto_merge: autoMerge ? 1 : 0,
+          auto_start: autoStart ? 1 : 0,
+          auto_merge_on_complete: autoMergeOnComplete ? 1 : 0,
+          parent_plan_task_id: parentTask?.id ?? null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: dependencies.map((dependency) => dependency.id),
+        tier: input.nodeTier,
+        sameTierDependencies: partitionedDeps.sameTierDependencies,
+        crossTierDependencies: partitionedDeps.crossTierDependencies
+      }), allowReplanBudgetOverride)
+    );
+
+    projectDb.prepare(
+      `INSERT INTO tasks (
+        id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+        auto_merge, auto_start, auto_merge_on_complete, metadata_json,
+        mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+        status, workspace_path, base_commit_sha_at_create, head_commit_sha,
+        cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+    ).run(
+      id,
+      project.id,
+      input.title,
+      input.taskPrompt,
+      effectivePrompt,
+      aiCommand,
+      autoMerge ? 1 : 0,
+      autoStart ? 1 : 0,
+      autoMergeOnComplete ? 1 : 0,
+      metadataJson,
+      mode,
+      parentTask?.id ?? null,
+      workspacePath,
+      baseCommitSha,
+      userId,
+      now,
+      now
+    );
+
+    const transitionReason = source === "legacyTask"
+      ? (isBlocked ? "task_created_blocked" : "task_created")
+      : source === "legacyPlan"
+        ? "plan_created"
+        : (isBlocked ? "node_created_blocked" : "node_created");
+    projectDb.prepare(
+      `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(makeId(), id, "null", "queued", transitionReason, userId, now);
+
+    for (const dependency of dependencies) {
+      projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+        id,
+        dependency.id,
+        now
+      );
+    }
+  })();
+
+  recordEvent({
+    projectId: project.id,
+    taskId: id,
+    eventType: mode === "plan" ? "plan.created" : "task.created",
+    database: projectDb,
+    payload: source === "legacyPlan"
+      ? {
+        title: input.title,
+        aiCommand,
+        autoStart,
+        autoMergeOnComplete,
+        allowReplanBudgetOverride,
+        parentPlanTaskId: parentTask?.id ?? null,
+        workspacePath,
+        baseCommitShaAtCreate: baseCommitSha
+      }
+      : source === "legacyTask"
+        ? {
+          title: input.title,
+          aiCommand,
+          autoMerge,
+          workspacePath,
+          baseCommitShaAtCreate: baseCommitSha,
+          dependencyTaskIds: dependencies.map((x) => x.id),
+          dependencyNodeRefs: dependencyResolution.normalizedDependencies,
+          blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
+          blocked: isBlocked,
+          allowReplanBudgetOverride
+        }
+        : {
+          title: input.title,
+          nodeTier: input.nodeTier,
+          aiCommand,
+          autoMerge,
+          autoStart,
+          autoMergeOnComplete,
+          allowReplanBudgetOverride,
+          parentNodeId: parentTask?.id ?? null,
+          workspacePath,
+          baseCommitShaAtCreate: baseCommitSha,
+          dependencyTaskIds: dependencies.map((x) => x.id),
+          dependencyNodeRefs: dependencyResolution.normalizedDependencies,
+          blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
+          blocked: isBlocked
+        }
+  });
+
+  const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
+  kickTaskQueueProcessing();
+  return task;
+}
+
 export const tasksRouter = Router();
+
+tasksRouter.post("/projects/:projectId/nodes", async (req, res) => {
+  const parsed = createNodeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "write" },
+    res
+  );
+  if (!scopedProject) return;
+  const { project, projectDb } = scopedProject;
+
+  if (project.clone_status !== "ready") {
+    res.status(409).json({ error: "Project base repository is not ready" });
+    return;
+  }
+
+  const input = parsed.data;
+  let task: TaskRow;
+  try {
+    task = await createProjectNode({
+      project,
+      projectDb,
+      userId: req.user.id,
+      source: "unified",
+      input
+    });
+  } catch (error: any) {
+    const status = Number(error?.status);
+    res.status(Number.isInteger(status) ? status : 500).json({ error: String(error?.message ?? "Failed to create node") });
+    return;
+  }
+
+  res.status(201).json({ node: serializeTask(projectDb, task) });
+});
 
 tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const parsed = createTaskSchema.safeParse(req.body ?? {});
@@ -854,126 +1150,30 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   }
 
   const input = parsed.data;
-  const id = makeId();
-  const now = nowIso();
-  const workspacePath = path.join(path.dirname(project.base_path), "tasks", id);
-  const aiCommand = resolveAiCommand(input.aiCommand, req.user.id);
-  const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
-  const dependencyTaskIds = input.dependencyTaskIds ?? [];
-  const autoMerge = Boolean(input.autoMerge);
-  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
-
-  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
+  let task: TaskRow;
   try {
-    dependencyResolution = resolveAndValidateNodeDependencies({
+    task = await createProjectNode({
+      project,
       projectDb,
-      projectId: project.id,
-      nodeId: id,
-      nodeTier: "task",
-      dependencyTaskIds,
-      dependencyNodeRefs: input.dependencyNodeRefs
+      userId: req.user.id,
+      source: "legacyTask",
+      input: {
+        title: input.title,
+        taskPrompt: input.taskPrompt,
+        nodeTier: "task",
+        aiCommand: input.aiCommand,
+        autoMerge: input.autoMerge,
+        allowReplanBudgetOverride: input.allowReplanBudgetOverride,
+        dependencyTaskIds: input.dependencyTaskIds,
+        dependencyNodeRefs: input.dependencyNodeRefs
+      }
     });
   } catch (error: any) {
-    res.status(400).json({ error: String(error?.message ?? "Invalid dependencies") });
+    const status = Number(error?.status);
+    res.status(Number.isInteger(status) ? status : 500).json({ error: String(error?.message ?? "Failed to create task") });
     return;
   }
 
-  const dependencies = dependencyResolution.taskDependencies;
-  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
-  const isBlocked = unresolvedDependencies.length > 0;
-  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, "task");
-
-  let baseCommitSha: string;
-  try {
-    baseCommitSha = await getHeadCommitSha(project.base_path);
-    if (!isBlocked) {
-      await cloneLocalBaseToWorkspace({ basePath: project.base_path, baseBranch: project.default_branch, workspacePath });
-      await createTaskBranch(workspacePath, id);
-    }
-  } catch (error: any) {
-    const message = String(error?.message ?? "Failed to initialize task workspace");
-    res.status(500).json({ error: message });
-    return;
-  }
-
-  projectDb.transaction(() => {
-    const metadataJson = serializeNodeMetadata(
-      withReplanBudgetOverride(buildInitialNodeMetadata({
-        task: {
-          id,
-          project_id: project.id,
-          mode: "execution",
-          metadata_json: null,
-          auto_merge: autoMerge ? 1 : 0,
-          auto_start: 0,
-          auto_merge_on_complete: 0,
-          parent_plan_task_id: null,
-          source_plan_revision_id: null,
-          source_plan_item_key: null
-        },
-        dependencyTaskIds: dependencies.map((dependency) => dependency.id),
-        tier: "task",
-        sameTierDependencies: partitionedDeps.sameTierDependencies,
-        crossTierDependencies: partitionedDeps.crossTierDependencies
-      }), allowReplanBudgetOverride)
-    );
-    projectDb.prepare(
-      `INSERT INTO tasks (
-        id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge, metadata_json,
-        mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
-        status, workspace_path, base_commit_sha_at_create, head_commit_sha,
-        cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-    ).run(
-      id,
-      project.id,
-      input.title,
-      input.taskPrompt,
-      effectivePrompt,
-      aiCommand,
-      autoMerge ? 1 : 0,
-      metadataJson,
-      workspacePath,
-      baseCommitSha,
-      req.user.id,
-      now,
-      now
-    );
-
-    projectDb.prepare(
-      `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(makeId(), id, "null", "queued", isBlocked ? "task_created_blocked" : "task_created", req.user.id, now);
-
-    for (const dependency of dependencies) {
-      projectDb.prepare(
-        "INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)"
-      ).run(id, dependency.id, now);
-    }
-  })();
-
-  recordEvent({
-    projectId: project.id,
-    taskId: id,
-    eventType: "task.created",
-    database: projectDb,
-    payload: {
-      title: input.title,
-      aiCommand,
-      autoMerge,
-      workspacePath,
-      baseCommitShaAtCreate: baseCommitSha,
-      dependencyTaskIds: dependencies.map((x) => x.id),
-      dependencyNodeRefs: dependencyResolution.normalizedDependencies,
-      blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
-      blocked: isBlocked,
-      allowReplanBudgetOverride
-    }
-  });
-
-  const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow;
-  kickTaskQueueProcessing();
   res.status(201).json({ task: serializeTask(projectDb, task) });
 });
 

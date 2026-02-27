@@ -2,7 +2,6 @@ import {
   Badge,
   Box,
   Button,
-  Checkbox,
   Code,
   Flex,
   FormControl,
@@ -24,27 +23,15 @@ import {
 } from "@chakra-ui/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
-import { api } from "../api/client";
-import type { Project, Task, UserSettings } from "../api/types";
-import { TaskSidebar } from "../components/TaskSidebar";
+import { api, createNode, getHierarchy } from "../api/client";
+import type { HierarchyNode, HierarchyNodeRow, NodeTier, Project, Task, UserSettings } from "../api/types";
+import { NodeCreateForm } from "../components/NodeCreateForm";
+import { OrchestrationTree } from "../components/OrchestrationTree";
 
 type ProjectResponse = { project: Project };
 type TasksResponse = { tasks: Task[] };
 type ProjectIdeStartResponse = { launchUrl: string };
-type ProjectFilesResponse = { files: string[] };
 type SettingsResponse = { settings: UserSettings };
-
-type CreateTaskForm = {
-  title: string;
-  taskPrompt: string;
-  autoMerge: boolean;
-  dependencyTaskIds: string[];
-};
-
-type CreatePlanForm = {
-  title: string;
-  taskPrompt: string;
-};
 
 type ProjectInstructionsForm = {
   projectPrompt: string;
@@ -53,21 +40,6 @@ type ProjectInstructionsForm = {
   codingStandardOther: string;
   projectOther: string;
 };
-
-const initialForm: CreateTaskForm = {
-  title: "",
-  taskPrompt: "",
-  autoMerge: false,
-  dependencyTaskIds: []
-};
-
-const initialPlanForm: CreatePlanForm = {
-  title: "",
-  taskPrompt: ""
-};
-
-const NON_SELECTABLE_DEPENDENCY_STATUSES = new Set(["merged", "cancelled", "failed"]);
-const AI_COMMAND_OTHER = "__other__";
 
 const CODING_STANDARD_OPTIONS = [
   { value: "", label: "None selected" },
@@ -87,13 +59,9 @@ export function ProjectDetailPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [form, setForm] = useState<CreateTaskForm>(initialForm);
+  const [hierarchyRoots, setHierarchyRoots] = useState<HierarchyNode[]>([]);
+  const [hierarchyNodes, setHierarchyNodes] = useState<HierarchyNodeRow[]>([]);
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>(["codex --yolo {prompt}"]);
-  const [taskAiCommandSelection, setTaskAiCommandSelection] = useState<string>("codex --yolo {prompt}");
-  const [taskAiCommandOverride, setTaskAiCommandOverride] = useState("");
-  const [planAiCommandSelection, setPlanAiCommandSelection] = useState<string>("codex --yolo {prompt}");
-  const [planAiCommandOverride, setPlanAiCommandOverride] = useState("");
-  const [planForm, setPlanForm] = useState<CreatePlanForm>(initialPlanForm);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
     projectPrompt: "",
     projectRules: "",
@@ -101,8 +69,7 @@ export function ProjectDetailPage() {
     codingStandardOther: "",
     projectOther: ""
   });
-  const [loading, setLoading] = useState(false);
-  const [creatingPlan, setCreatingPlan] = useState(false);
+  const [creatingNode, setCreatingNode] = useState(false);
   const [savingProjectInstructions, setSavingProjectInstructions] = useState(false);
   const [activePane, setActivePane] = useState<"tasks" | "plans" | "project" | "ide">("tasks");
   const [projectIdeLaunchUrl, setProjectIdeLaunchUrl] = useState<string | null>(null);
@@ -112,138 +79,50 @@ export function ProjectDetailPage() {
   const [expandedIde, setExpandedIde] = useState(false);
   const [isTaskSidebarCollapsed, setIsTaskSidebarCollapsed] = useState(false);
   const projectIdeAutoAttemptedRef = useRef(false);
-  const taskPromptRef = useRef<HTMLTextAreaElement | null>(null);
-  const suggestionRequestSeqRef = useRef(0);
-  const suggestionDebounceRef = useRef<number | null>(null);
-  const [fileSuggestions, setFileSuggestions] = useState<string[]>([]);
-  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
-  const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
-  const [mentionQuery, setMentionQuery] = useState("");
-  const [showSuggestions, setShowSuggestions] = useState(false);
-  const [dependencySelections, setDependencySelections] = useState<string[]>([""]);
 
-  const selectableDependencyTasks = useMemo(
-    () => tasks.filter((task) => task.mode === "execution" && !NON_SELECTABLE_DEPENDENCY_STATUSES.has(task.status)),
-    [tasks]
+  const hierarchyRows = useMemo(
+    () =>
+      hierarchyNodes.length
+        ? hierarchyNodes
+        : tasks.map((task) => ({
+            task,
+            tier: (task.mode === "execution" ? "task" : "plan") as NodeTier,
+            waiting: {
+              waiting: false,
+              reasonCode: "",
+              reason: "",
+              dependencyBlockerTaskId: null,
+              unresolvedDependencyIds: [],
+              unresolvedDependencyDetails: []
+            }
+          })),
+    [hierarchyNodes, tasks]
   );
-  const planTasks = useMemo(() => tasks.filter((task) => task.mode === "plan"), [tasks]);
 
-  const canCreate = useMemo(() => {
-    const hasCommand = taskAiCommandSelection === AI_COMMAND_OTHER ? taskAiCommandOverride.trim().length > 0 : true;
-    return form.title.trim().length >= 2 && form.taskPrompt.trim().length > 0 && hasCommand;
-  }, [form, taskAiCommandOverride, taskAiCommandSelection]);
-  const canCreatePlan = useMemo(() => {
-    const hasCommand = planAiCommandSelection === AI_COMMAND_OTHER ? planAiCommandOverride.trim().length > 0 : true;
-    return planForm.title.trim().length >= 2 && planForm.taskPrompt.trim().length > 0 && hasCommand;
-  }, [planAiCommandOverride, planAiCommandSelection, planForm]);
+  const nodeOptions = useMemo(() => {
+    return hierarchyRows.map((row) => ({
+      id: row.task.id,
+      title: row.task.title,
+      tier: row.tier,
+      status: row.task.status,
+      isBlocked: row.task.isBlocked
+    }));
+  }, [hierarchyRows]);
 
-  const closeSuggestions = () => {
-    setShowSuggestions(false);
-    setMentionRange(null);
-    setMentionQuery("");
-    setFileSuggestions([]);
-    setActiveSuggestionIndex(0);
-  };
+  const nodeTierById = useMemo(() => new Map(nodeOptions.map((node) => [node.id, node.tier])), [nodeOptions]);
 
-  const updateMentionContext = (text: string, cursor: number | null) => {
-    if (!projectId || cursor === null || cursor < 0) {
-      closeSuggestions();
-      return;
-    }
-
-    const atPos = text.lastIndexOf("@", cursor - 1);
-    if (atPos < 0) {
-      closeSuggestions();
-      return;
-    }
-
-    const token = text.slice(atPos + 1, cursor);
-    if (/\s/.test(token)) {
-      closeSuggestions();
-      return;
-    }
-
-    if (token.includes("@")) {
-      closeSuggestions();
-      return;
-    }
-
-    setMentionRange({ start: atPos, end: cursor });
-    setMentionQuery(token);
-    setShowSuggestions(true);
-  };
-
-  const insertSuggestion = (filePath: string) => {
-    if (!mentionRange) return;
-    const before = form.taskPrompt.slice(0, mentionRange.start + 1);
-    const after = form.taskPrompt.slice(mentionRange.end);
-    const nextTaskPrompt = `${before}${filePath}${after}`;
-    const nextCursorPos = mentionRange.start + 1 + filePath.length;
-
-    setForm((prev) => ({ ...prev, taskPrompt: nextTaskPrompt }));
-    closeSuggestions();
-
-    window.requestAnimationFrame(() => {
-      const input = taskPromptRef.current;
-      if (!input) return;
-      input.focus();
-      input.setSelectionRange(nextCursorPos, nextCursorPos);
-    });
-  };
-
-  useEffect(() => {
-    if (!showSuggestions || !projectId || !mentionRange) return;
-
-    if (suggestionDebounceRef.current !== null) {
-      window.clearTimeout(suggestionDebounceRef.current);
-    }
-
-    suggestionDebounceRef.current = window.setTimeout(() => {
-      const requestSeq = ++suggestionRequestSeqRef.current;
-      api<ProjectFilesResponse>(
-        `/api/projects/${projectId}/files?query=${encodeURIComponent(mentionQuery)}&limit=8`
-      )
-        .then((response) => {
-          if (requestSeq !== suggestionRequestSeqRef.current) return;
-          setFileSuggestions(response.files);
-          setActiveSuggestionIndex(0);
-        })
-        .catch(() => {
-          if (requestSeq !== suggestionRequestSeqRef.current) return;
-          setFileSuggestions([]);
-        });
-    }, 120);
-
-    return () => {
-      if (suggestionDebounceRef.current !== null) {
-        window.clearTimeout(suggestionDebounceRef.current);
-      }
-    };
-  }, [mentionQuery, mentionRange, projectId, showSuggestions]);
-
-  useEffect(() => {
-    return () => {
-      if (suggestionDebounceRef.current !== null) {
-        window.clearTimeout(suggestionDebounceRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    const selectableIds = new Set(selectableDependencyTasks.map((task) => task.id));
-    setDependencySelections((prev) => {
-      const next = prev.map((id) => (id && selectableIds.has(id) ? id : ""));
-      const hasChanged = next.length !== prev.length || next.some((id, index) => id !== prev[index]);
-      return hasChanged ? next : prev;
-    });
-  }, [selectableDependencyTasks]);
+  const planTasks = useMemo(
+    () => tasks.filter((task) => nodeTierById.get(task.id) === "plan" || (!nodeTierById.has(task.id) && task.mode === "plan")),
+    [nodeTierById, tasks]
+  );
 
   async function loadData() {
     if (!projectId) return;
-    const [projectRes, tasksRes, settingsRes] = await Promise.all([
+    const [projectRes, tasksRes, settingsRes, hierarchyRes] = await Promise.all([
       api<ProjectResponse>(`/api/projects/${projectId}`),
       api<TasksResponse>(`/api/projects/${projectId}/tasks`),
-      api<SettingsResponse>("/api/users/me/settings")
+      api<SettingsResponse>("/api/users/me/settings"),
+      getHierarchy(projectId).catch(() => null)
     ]);
     setProject(projectRes.project);
     setInstructionsForm({
@@ -254,14 +133,12 @@ export function ProjectDetailPage() {
       projectOther: projectRes.project.projectOther ?? ""
     });
     setTasks(tasksRes.tasks);
+    setHierarchyRoots(hierarchyRes?.hierarchy.roots ?? []);
+    setHierarchyNodes(hierarchyRes?.hierarchy.nodes ?? []);
     const commandOptions = settingsRes.settings.defaultAiCommands?.length
       ? settingsRes.settings.defaultAiCommands
       : [settingsRes.settings.defaultAiCommand || "codex --yolo {prompt}"];
     setTaskAiCommandOptions(commandOptions);
-    setTaskAiCommandSelection(commandOptions[0] || "codex --yolo {prompt}");
-    setTaskAiCommandOverride("");
-    setPlanAiCommandSelection(commandOptions[0] || "codex --yolo {prompt}");
-    setPlanAiCommandOverride("");
   }
 
   useEffect(() => {
@@ -320,72 +197,29 @@ export function ProjectDetailPage() {
     };
   }, [expandedIde]);
 
-  async function onCreateTask(event: React.FormEvent) {
-    event.preventDefault();
+  async function onCreateNode(payload: {
+    title: string;
+    taskPrompt: string;
+    nodeTier: "epoch" | "phase" | "plan" | "task";
+    aiCommand?: string;
+    autoMerge?: boolean;
+    autoMergeOnComplete?: boolean;
+    parentNodeId?: string;
+    dependencyNodeRefs?: Array<{ id: string; tier?: NodeTier }>;
+  }) {
     if (!projectId) return;
-
-    const dependencyTaskIds = [...new Set(dependencySelections.filter((id) => id))];
-    const selectedAiCommand = taskAiCommandSelection === AI_COMMAND_OTHER ? taskAiCommandOverride.trim() : taskAiCommandSelection;
-    if (!selectedAiCommand) {
-      toast({ status: "error", title: "AI command override is required" });
-      return;
-    }
-
-    setLoading(true);
+    setCreatingNode(true);
     try {
-      const created = await api<{ task: Task }>(`/api/projects/${projectId}/tasks`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: form.title,
-          taskPrompt: form.taskPrompt,
-          aiCommand: selectedAiCommand,
-          autoMerge: form.autoMerge,
-          dependencyTaskIds
-        })
-      });
-      setForm(initialForm);
-      setTaskAiCommandSelection(taskAiCommandOptions[0] || "codex --yolo {prompt}");
-      setTaskAiCommandOverride("");
-      setDependencySelections([""]);
+      const created = await createNode(projectId, payload);
       await loadData();
-      toast({ status: "success", title: "Task created" });
-      navigate(`/tasks/${created.task.id}?tab=ide`);
-    } catch (error: any) {
-      toast({ status: "error", title: "Task create failed", description: error.message });
+      toast({ status: "success", title: `${payload.nodeTier} created` });
+      const detailRoute = created.node.mode === "execution" ? `/tasks/${created.node.id}?tab=ide` : `/plans/${created.node.id}?tab=ide`;
+      navigate(detailRoute);
+    } catch (error: unknown) {
+      const description = error instanceof Error ? error.message : "Node create failed";
+      toast({ status: "error", title: "Node create failed", description });
     } finally {
-      setLoading(false);
-    }
-  }
-
-  async function onCreatePlan(event: React.FormEvent) {
-    event.preventDefault();
-    if (!projectId) return;
-    const selectedAiCommand = planAiCommandSelection === AI_COMMAND_OTHER ? planAiCommandOverride.trim() : planAiCommandSelection;
-    if (!selectedAiCommand) {
-      toast({ status: "error", title: "AI command override is required" });
-      return;
-    }
-
-    setCreatingPlan(true);
-    try {
-      const created = await api<{ plan: Task }>(`/api/projects/${projectId}/plans`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: planForm.title,
-          taskPrompt: planForm.taskPrompt,
-          aiCommand: selectedAiCommand
-        })
-      });
-      setPlanForm(initialPlanForm);
-      setPlanAiCommandSelection(taskAiCommandOptions[0] || "codex --yolo {prompt}");
-      setPlanAiCommandOverride("");
-      await loadData();
-      toast({ status: "success", title: "Plan created" });
-      navigate(`/plans/${created.plan.id}?tab=ide`);
-    } catch (error: any) {
-      toast({ status: "error", title: "Plan create failed", description: error.message });
-    } finally {
-      setCreatingPlan(false);
+      setCreatingNode(false);
     }
   }
 
@@ -427,7 +261,12 @@ export function ProjectDetailPage() {
 
   return (
     <Flex direction={{ base: "column", lg: "row" }} gap={6} align="stretch">
-      <TaskSidebar tasks={tasks} isCollapsed={isTaskSidebarCollapsed} onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)} />
+      <OrchestrationTree
+        roots={hierarchyRoots}
+        fallbackRows={hierarchyRows}
+        isCollapsed={isTaskSidebarCollapsed}
+        onToggleCollapse={() => setIsTaskSidebarCollapsed((value) => !value)}
+      />
 
       <Box flex="1" bg="white" borderRadius="lg" p={6} boxShadow="sm" border="1px solid" borderColor="blackAlpha.200">
         <Box mb={6}>
@@ -454,209 +293,22 @@ export function ProjectDetailPage() {
           <TabPanels>
             <TabPanel px={0} pt={4}>
               <Heading size="md" mb={4}>
-                Create Task
+                Create Node
               </Heading>
-              <form onSubmit={onCreateTask}>
-                <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={4}>
-                  <FormControl isRequired>
-                    <FormLabel>Title</FormLabel>
-                    <Input value={form.title} onChange={(e) => setForm((x) => ({ ...x, title: e.target.value }))} />
-                  </FormControl>
-                  <FormControl isRequired>
-                    <FormLabel>AI Command</FormLabel>
-                    <Stack spacing={2}>
-                      <Select
-                        value={taskAiCommandSelection}
-                        onChange={(e) => {
-                          const selected = e.target.value;
-                          setTaskAiCommandSelection(selected);
-                          if (selected !== AI_COMMAND_OTHER) {
-                            setTaskAiCommandOverride("");
-                          }
-                        }}
-                      >
-                        {taskAiCommandOptions.map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                        <option value={AI_COMMAND_OTHER}>Other</option>
-                      </Select>
-                      {taskAiCommandSelection === AI_COMMAND_OTHER && (
-                        <Input
-                          placeholder="Enter custom AI command"
-                          value={taskAiCommandOverride}
-                          onChange={(e) => setTaskAiCommandOverride(e.target.value)}
-                        />
-                      )}
-                    </Stack>
-                  </FormControl>
-                  <FormControl>
-                    <FormLabel>Dependencies</FormLabel>
-                    <Stack spacing={2}>
-                      {dependencySelections.map((selectedId, index) => (
-                        <Flex key={`dependency-row-${index}`} gap={2}>
-                          <Select
-                            placeholder="Select dependency"
-                            value={selectedId}
-                            onChange={(e) => {
-                              const value = e.target.value;
-                              setDependencySelections((prev) => prev.map((id, rowIndex) => (rowIndex === index ? value : id)));
-                            }}
-                          >
-                            {selectableDependencyTasks.map((task) => {
-                              const selectedElsewhere = dependencySelections.includes(task.id) && selectedId !== task.id;
-                              return (
-                                <option key={task.id} value={task.id} disabled={selectedElsewhere}>
-                                  {task.title} ({task.isBlocked ? "blocked" : task.status})
-                                </option>
-                              );
-                            })}
-                          </Select>
-                          <Button
-                            type="button"
-                            size="sm"
-                            minW="40px"
-                            onClick={() => {
-                              setDependencySelections((prev) => [...prev, ""]);
-                            }}
-                          >
-                            +
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            minW="40px"
-                            onClick={() => {
-                              setDependencySelections((prev) => {
-                                if (prev.length === 1) return [""];
-                                return prev.filter((_, rowIndex) => rowIndex !== index);
-                              });
-                            }}
-                            isDisabled={dependencySelections.length === 1}
-                          >
-                            -
-                          </Button>
-                        </Flex>
-                      ))}
-                    </Stack>
-                    <Text mt={1} fontSize="sm" color="gray.600">
-                      Add dependencies one row at a time. This task stays blocked until all selected tasks are merged.
-                    </Text>
-                  </FormControl>
-                  <FormControl>
-                    <FormLabel>Automation</FormLabel>
-                    <Checkbox isChecked={form.autoMerge} onChange={(e) => setForm((x) => ({ ...x, autoMerge: e.target.checked }))}>
-                      Auto-merge when waiting for input
-                    </Checkbox>
-                  </FormControl>
-                  <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
-                    <FormLabel>Task Prompt</FormLabel>
-                    <Box position="relative">
-                      <Textarea
-                        ref={taskPromptRef}
-                        rows={5}
-                        value={form.taskPrompt}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          const cursor = e.target.selectionStart;
-                          setForm((x) => ({ ...x, taskPrompt: value }));
-                          updateMentionContext(value, cursor);
-                        }}
-                        onClick={(e) => {
-                          updateMentionContext(e.currentTarget.value, e.currentTarget.selectionStart);
-                        }}
-                        onKeyUp={(e) => {
-                          updateMentionContext(e.currentTarget.value, e.currentTarget.selectionStart);
-                        }}
-                        onBlur={() => {
-                          window.setTimeout(() => {
-                            closeSuggestions();
-                          }, 100);
-                        }}
-                        onKeyDown={(e) => {
-                          if (!showSuggestions || fileSuggestions.length === 0) return;
-                          if (e.key === "ArrowDown") {
-                            e.preventDefault();
-                            setActiveSuggestionIndex((index) => (index + 1) % fileSuggestions.length);
-                            return;
-                          }
-                          if (e.key === "ArrowUp") {
-                            e.preventDefault();
-                            setActiveSuggestionIndex((index) => (index - 1 + fileSuggestions.length) % fileSuggestions.length);
-                            return;
-                          }
-                          if (e.key === "Enter" || e.key === "Tab") {
-                            e.preventDefault();
-                            const picked = fileSuggestions[activeSuggestionIndex];
-                            if (picked) {
-                              insertSuggestion(picked);
-                            }
-                            return;
-                          }
-                          if (e.key === "Escape") {
-                            e.preventDefault();
-                            closeSuggestions();
-                          }
-                        }}
-                      />
-                      {showSuggestions && (
-                        <Box
-                          position="absolute"
-                          top="calc(100% + 6px)"
-                          left={0}
-                          right={0}
-                          zIndex={20}
-                          bg="white"
-                          border="1px solid"
-                          borderColor="blackAlpha.300"
-                          borderRadius="md"
-                          boxShadow="md"
-                          maxH="220px"
-                          overflowY="auto"
-                          p={1}
-                        >
-                          {fileSuggestions.length ? (
-                            <Stack spacing={1}>
-                              {fileSuggestions.map((file, index) => (
-                                <Button
-                                  key={file}
-                                  justifyContent="space-between"
-                                  variant={index === activeSuggestionIndex ? "solid" : "ghost"}
-                                  colorScheme={index === activeSuggestionIndex ? "teal" : undefined}
-                                  onMouseDown={(event) => {
-                                    event.preventDefault();
-                                    insertSuggestion(file);
-                                  }}
-                                  size="sm"
-                                  fontFamily="mono"
-                                  fontWeight="500"
-                                >
-                                  {file}
-                                </Button>
-                              ))}
-                            </Stack>
-                          ) : (
-                            <Flex px={2} py={2} align="center" justify="space-between">
-                              <Text fontSize="sm" color="gray.600">
-                                No file matches
-                              </Text>
-                              <Badge colorScheme="gray">@{mentionQuery}</Badge>
-                            </Flex>
-                          )}
-                        </Box>
-                      )}
-                    </Box>
-                  </FormControl>
-                </Grid>
-                <Button mt={4} colorScheme="teal" type="submit" isDisabled={!canCreate} isLoading={loading}>
-                  Create Task
-                </Button>
-              </form>
+              <NodeCreateForm
+                aiCommandOptions={taskAiCommandOptions}
+                nodeOptions={nodeOptions}
+                presetTier="task"
+                submitLabel="Create Node"
+                submitColorScheme="teal"
+                submitting={creatingNode}
+                helperText="Task preset active. Use Node Tier to switch to epoch/phase/plan/task."
+                onCreate={onCreateNode}
+              />
             </TabPanel>
             <TabPanel px={0} pt={4}>
               <Heading size="md" mb={2}>
-                Create Plan
+                Create Node
               </Heading>
               <Text color="gray.600" mb={4}>
                 Plan mode creates a planning runtime (IDE + terminal) that outputs a task graph for approval.
@@ -664,55 +316,16 @@ export function ProjectDetailPage() {
               <Text color="gray.600" mb={4}>
                 YAML format is required and automatically enforced. The planner is instructed to write output to <Code>.ai-plan/latest-plan.yaml</Code>.
               </Text>
-              <form onSubmit={onCreatePlan}>
-                <Grid templateColumns={{ base: "1fr", md: "1fr 1fr" }} gap={4}>
-                  <FormControl isRequired>
-                    <FormLabel>Plan Title</FormLabel>
-                    <Input value={planForm.title} onChange={(e) => setPlanForm((x) => ({ ...x, title: e.target.value }))} />
-                  </FormControl>
-                  <FormControl isRequired>
-                    <FormLabel>AI Command</FormLabel>
-                    <Stack spacing={2}>
-                      <Select
-                        value={planAiCommandSelection}
-                        onChange={(e) => {
-                          const selected = e.target.value;
-                          setPlanAiCommandSelection(selected);
-                          if (selected !== AI_COMMAND_OTHER) {
-                            setPlanAiCommandOverride("");
-                          }
-                        }}
-                      >
-                        {taskAiCommandOptions.map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                        <option value={AI_COMMAND_OTHER}>Other</option>
-                      </Select>
-                      {planAiCommandSelection === AI_COMMAND_OTHER && (
-                        <Input
-                          placeholder="Enter custom AI command"
-                          value={planAiCommandOverride}
-                          onChange={(e) => setPlanAiCommandOverride(e.target.value)}
-                        />
-                      )}
-                    </Stack>
-                  </FormControl>
-                  <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
-                    <FormLabel>Planning Prompt</FormLabel>
-                    <Textarea
-                      rows={6}
-                      value={planForm.taskPrompt}
-                      onChange={(e) => setPlanForm((x) => ({ ...x, taskPrompt: e.target.value }))}
-                      placeholder={"Example ask:\nBreak this into independent implementation tasks.\nInclude dependencies for conflicting work.\nReturn YAML with tasks:id/title/prompt/depends_on."}
-                    />
-                  </FormControl>
-                </Grid>
-                <Button mt={4} colorScheme="purple" type="submit" isDisabled={!canCreatePlan} isLoading={creatingPlan}>
-                  Create Plan
-                </Button>
-              </form>
+              <NodeCreateForm
+                aiCommandOptions={taskAiCommandOptions}
+                nodeOptions={nodeOptions}
+                presetTier="plan"
+                submitLabel="Create Node"
+                submitColorScheme="purple"
+                submitting={creatingNode}
+                helperText="Plan preset active. Use Node Tier to switch to epoch/phase/plan/task."
+                onCreate={onCreateNode}
+              />
 
               <Heading size="sm" mt={8} mb={3}>
                 Existing Plans

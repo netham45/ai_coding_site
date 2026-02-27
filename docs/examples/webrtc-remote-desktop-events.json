@@ -3,6 +3,103 @@
   "epoch_id": "ep-webrtc-rd-001",
   "events": [
     {
+      "event_id": "evt-ui-0001",
+      "ts": "2026-02-24T14:59:30Z",
+      "source": "ui.project.create_node",
+      "actor": "user",
+      "request": {
+        "tier": "epoch",
+        "id": "ep-webrtc-rd-001",
+        "title": "WebRTC Remote Desktop (WGC + WMF)",
+        "prompt": "Create a remote desktop application that uses WebRTC to stream Windows to browsers captured via WGC and converted using WMF",
+        "auto_mode": true,
+        "auto_merge": true,
+        "auto_merge_on_complete": true
+      },
+      "response": {
+        "http_status": 201,
+        "node_id": "ep-webrtc-rd-001",
+        "status": "queued"
+      }
+    },
+    {
+      "event_id": "evt-ui-0002",
+      "ts": "2026-02-24T14:59:42Z",
+      "source": "ui.project.create_node",
+      "actor": "user",
+      "request": {
+        "tier": "phase",
+        "id": "ph-platform-spike-001",
+        "parent_id": "ep-webrtc-rd-001",
+        "dependencyNodeRefs": [
+          {
+            "id": "ep-webrtc-rd-001",
+            "tier": "epoch",
+            "reason": "phase starts only after epoch approval"
+          }
+        ],
+        "auto_mode": true,
+        "auto_merge": true,
+        "auto_merge_on_complete": true
+      },
+      "response": {
+        "http_status": 201,
+        "node_id": "ph-platform-spike-001",
+        "status": "queued"
+      }
+    },
+    {
+      "event_id": "evt-ui-0003",
+      "ts": "2026-02-24T15:00:00Z",
+      "source": "ui.node_actions.start",
+      "actor": "user",
+      "request": {
+        "endpoint": "/api/nodes/ep-webrtc-rd-001/start",
+        "method": "POST"
+      },
+      "response": {
+        "http_status": 200,
+        "node_id": "ep-webrtc-rd-001",
+        "status": "in_progress"
+      }
+    },
+    {
+      "event_id": "evt-ui-0004",
+      "ts": "2026-02-24T15:00:01Z",
+      "source": "ui.node_actions.auto_mode",
+      "actor": "user",
+      "request": {
+        "endpoint": "/api/nodes/ep-webrtc-rd-001/auto-mode",
+        "method": "POST",
+        "enabled": true
+      },
+      "response": {
+        "http_status": 200,
+        "node_id": "ep-webrtc-rd-001",
+        "automation": {
+          "auto_mode": true
+        }
+      }
+    },
+    {
+      "event_id": "evt-ui-0005",
+      "ts": "2026-02-24T15:00:02Z",
+      "source": "ui.node_actions.auto_merge",
+      "actor": "user",
+      "request": {
+        "endpoint": "/api/nodes/ph-platform-spike-001/auto-merge",
+        "method": "POST",
+        "enabled": true
+      },
+      "response": {
+        "http_status": 200,
+        "node_id": "ph-platform-spike-001",
+        "automation": {
+          "auto_merge": true
+        }
+      }
+    },
+    {
       "ts": "2026-02-24T15:00:00Z",
       "job": "readiness",
       "node_id": "ep-webrtc-rd-001",
@@ -67,6 +164,22 @@
       "previous_blocker_hash": "sha256:blocker:tsk-toolkit-selection-adr-001:not_merged",
       "current_blocker_hash": "sha256:blocker:none",
       "idempotency_key": "re_review:pl-host-capture-pipeline-001:sha256:blocker:none"
+    },
+    {
+      "event_id": "evt-ui-0006",
+      "ts": "2026-02-24T15:12:03Z",
+      "source": "ui.node_actions.force_re_review",
+      "actor": "user",
+      "request": {
+        "endpoint": "/api/nodes/pl-host-capture-pipeline-001/force-re-review",
+        "method": "POST"
+      },
+      "response": {
+        "http_status": 200,
+        "node_id": "pl-host-capture-pipeline-001",
+        "status": "ready",
+        "action": "unblocked"
+      }
     },
     {
       "ts": "2026-02-24T15:12:04Z",

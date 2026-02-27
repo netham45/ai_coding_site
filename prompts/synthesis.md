@@ -1,37 +1,53 @@
-# Synthesis Template
+# Synthesis Runtime Prompt
 
-Use this template for `synthesize(parent)` coordinator instructions that aggregate child outputs into requirement-to-evidence coverage.
+## Goal
+Aggregate child outputs into deterministic requirement-to-evidence coverage for a parent node.
 
-## Include Shared Section
+## Non-Goals
+- Creating new implementation tasks.
+- Claiming coverage without concrete evidence references.
+- Omitting uncovered requirements.
 
-Include `prompts/shared-input-output.md`.
+## Definition of Done
+- Includes narrative summary and structured synthesis payload.
+- Coverage matrix contains exactly one row per parent requirement.
+- Uncovered requirements and deterministic gap hashes are provided.
 
-## Synthesis Inputs
+## Dependencies
+- `prompts/shared-input-output.md`
+- `docs/architecture/prompt-contract.md`
+- Parent requirements, child outputs, repo diffs, dependency outcomes.
+- CLI context checks across related hierarchy nodes before synthesis:
+  - `npm run cli -- tasks all --project-id <projectId> --json`
+  - `npm run cli -- plans list --project-id <projectId> --json`
+  - `npm run cli -- tasks summary <taskId> --project-id <projectId> --json` (sample related nodes)
+- Code/docs review for impacted modules and architecture assumptions.
 
-Required synthesis inputs in addition to shared required inputs:
+## Artifacts
+- Synthesis coverage artifact with matrix and gap hashes.
 
-- `parent.spec` (goals, non-goals, DoD, constraints)
-- `parent.requirements` (stable requirement ids and statements)
-- `children.outputs` (structured payloads and rationale from child nodes)
-- `repo.diffs` (relevant file changes, commit/test evidence)
-- `dependency.outcomes` (ready/blocked/failed status for deps)
+## Risks
+- False-positive coverage due to weak evidence quality.
+- Drift between requirements and evidence IDs.
 
-`node.tier` may be any parent tier: `epoch | phase | plan | task`.
+## Idempotency
+- Deterministic coverage rows and gap hashes for identical normalized inputs.
 
-## Synthesis-Specific Requirements
+## Bounded Iteration
+- Single synthesis pass per invocation; escalate if required inputs are missing.
 
-- Produce a short narrative synthesis explaining current parent progress and confidence.
-- Build a requirement-evidence coverage matrix that is explicit and machine-readable.
-- Map each parent requirement id to concrete evidence/artifacts/tests from child outputs or repo diffs.
-- Mark uncovered requirements explicitly and provide actionable gap reasons.
-- Emit deterministic candidate gap hashes so uncovered work can be deduplicated across retries.
-- Keep output idempotent: same inputs must produce the same coverage rows and gap hashes.
+## Auto-Merge Guidance
+- Synthesis informs merge readiness but does not alone approve merge.
 
-## Output
+## Runtime Prompt Text
+Research-first requirement: before final synthesis, inspect related hierarchy context via CLI and review relevant code/docs so coverage claims are grounded in current tree and repo reality.
 
-- Natural-language rationale
-- Structured payload per prompt contract
-- Synthesis coverage payload with the exact schema below
+Synthesize parent progress using only provided requirements and child evidence. Mark uncovered or partial requirements explicitly and provide actionable gap reasons.
+
+## Structured Output Contract
+Return exactly two sections:
+1. Narrative synthesis.
+2. Structured payload (YAML preferred) compliant with shared contract and:
 
 ```yaml
 schema_version: "1.0"
@@ -42,12 +58,9 @@ node:
   children_ids: [string]
   status: queued | in_progress | waiting_input | awaiting_children | merge_ready | merged | cancelled | failed | merge_conflict
 
-goals:
-  - string
-non_goals:
-  - string
-definition_of_done:
-  - string
+goals: [string]
+non_goals: [string]
+definition_of_done: [string]
 deps:
   - id: string
     reason: string
@@ -65,18 +78,15 @@ idempotency:
   dedupe_key: string
   idempotent: true | false
 bounded_iteration:
-  max_iterations: number
-  max_replans: number
-  stop_conditions:
-    - string
-  escalation_on_limit: string
+  max_iterations: 1
+  max_replans: 0
+  stop_conditions: ["Coverage matrix generated"]
+  escalation_on_limit: "Escalate missing requirement/evidence inputs"
 auto_merge_guidance:
-  eligible: true | false
-  strategy: manual | auto_merge | auto_merge_on_complete
-  required_checks:
-    - string
-  blockers:
-    - string
+  eligible: false
+  strategy: manual
+  required_checks: ["Verification pass required"]
+  blockers: ["Uncovered requirements"]
 
 synthesis:
   summary:
@@ -104,8 +114,7 @@ synthesis:
     - requirement_id: string
       reason: string
       blocking_dependencies: [string]
-      suggested_next_actions:
-        - string
+      suggested_next_actions: [string]
   candidate_gap_hashes:
     - requirement_id: string
       algorithm: sha256
@@ -115,14 +124,16 @@ synthesis:
         - normalized_gap_reason
         - blocking_dependencies
         - parent_node_id
+research_evidence:
+  cli_queries:
+    - command: "npm run cli -- tasks all --project-id <projectId> --json"
+      findings: "<what was learned>"
+    - command: "npm run cli -- plans list --project-id <projectId> --json"
+      findings: "<what was learned>"
+  repo_reads:
+    - path: "<file-or-dir>"
+      findings: "<what was learned>"
+  tree_coverage:
+    reviewed_related_nodes: ["<node-id>"]
+    coverage_note: "Show related branches reviewed before finalizing synthesis coverage"
 ```
-
-## Coverage Matrix Rules
-
-- `coverage_matrix` must include exactly one row per `parent.requirements` id.
-- `coverage_status=covered` requires at least one evidence entry with concrete `artifact_ref`.
-- `coverage_status=partial` requires at least one evidence entry and non-empty `gap_reason`.
-- `coverage_status=uncovered` requires empty `evidence` and non-empty `gap_reason`.
-- `uncovered_requirements` must match rows where `coverage_status=uncovered`.
-- `candidate_gap_hashes` must include one entry per uncovered requirement.
-- `candidate_gap_hashes.hash` must be deterministic for identical input state.
