@@ -3248,6 +3248,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
       assert.equal(hierarchy.status, 200);
       assert.equal(hierarchy.json?.hierarchy?.roots?.length, 1);
+      assert.equal(Array.isArray(hierarchy.json?.hierarchy?.nodes), true);
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.tier, "epoch");
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.tier, "phase");
       assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.tier, "plan");
@@ -3257,11 +3258,21 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         "exec"
       );
       assert.equal(typeof hierarchy.json?.hierarchy?.roots?.[0]?.task?.orchestrationControls?.replan?.iterationsUsed, "number");
+      const execHierarchyNode = (hierarchy.json?.hierarchy?.nodes ?? []).find((node: any) => node.task?.id === execId);
+      assert.equal(execHierarchyNode?.tier, "exec");
+      assert.equal(Array.isArray(execHierarchyNode?.waiting?.unresolvedDependencyDetails), true);
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.id, taskTierId);
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.tier, "task");
+      assert.equal(execHierarchyNode?.waiting?.unresolvedDependencyDetails?.[0]?.reason, "await_task_tier");
 
       const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
       assert.equal(graph.status, 200);
       assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
       assert.equal(Array.isArray(graph.json?.graph?.edges), true);
+      const graphExecNode = (graph.json?.graph?.nodes ?? []).find((node: any) => node.id === execId);
+      assert.equal(graphExecNode?.tier, "exec");
+      assert.equal(graphExecNode?.mode, "execution");
+      assert.equal(typeof graphExecNode?.dependencyCount, "number");
       assert.equal(
         graph.json?.graph?.edges?.some((edge: any) => edge.fromId === execId && edge.toId === taskTierId && edge.reason === "await_task_tier"),
         true
