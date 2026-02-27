@@ -43,7 +43,7 @@ export function buildCommand(aiCommand: string): AdapterExecution {
   const detectedTool = classifyTool(aiCommand);
   const normalizedTokens = [...tokens];
   if (detectedTool === "codex" && normalizedTokens[1]?.toLowerCase() === "resume") {
-    normalizedTokens.splice(1, normalizedTokens.length - 1, "--yolo");
+    normalizedTokens.splice(1, 1, "--yolo");
   }
 
   const args = normalizedTokens
