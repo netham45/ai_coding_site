@@ -4,6 +4,7 @@ import type Database from "better-sqlite3";
 import { makeId } from "../../../utils/id.js";
 import { nowIso } from "../../../utils/time.js";
 import type { NodeMetadata, TaskRow } from "../../../types.js";
+import { ensureDefaultExecWorkflowForTask } from "../../defaultExecWorkflow.js";
 import { recordEvent } from "../../events.js";
 import { buildDependencyDiagnostics } from "../dependencyGraph.js";
 import { registerOrchestrationJobHandler } from "../jobQueue.js";
@@ -235,6 +236,14 @@ export async function runDeltaPlanForTask(params: {
   const createdChildIds = netNewGaps
     .map((gap) => insertGapClosingChild({ projectDb: params.projectDb, parent: task, gap }))
     .filter((id): id is string => Boolean(id));
+  for (const childId of createdChildIds) {
+    await ensureDefaultExecWorkflowForTask({
+      db: params.projectDb,
+      projectId: task.project_id,
+      taskId: childId,
+      createdByUserId: task.created_by_user_id
+    });
+  }
   const nextGapHashesSeen = [...new Set([...replan.gapHashesSeen, ...netNewGaps.map((gap) => gap.hash)])];
   const nextMetadata = writeReplanControl({
     metadata,
@@ -291,4 +300,3 @@ export function startDeltaPlanJobWorker(): void {
   });
   deltaPlanHandlerRegistered = true;
 }
-
