@@ -728,6 +728,12 @@ export function TaskDetailPage() {
             <Stack direction="row" align="center" flexWrap="wrap">
               <Badge colorScheme={task.mode === "plan" ? "purple" : "cyan"}>{task.mode}</Badge>
               <Badge colorScheme={task.isBlocked ? "orange" : statusColor(task.status)}>{taskStatusLabel(task)}</Badge>
+              <Badge colorScheme={task.autoMerge ? "green" : "gray"}>auto-merge: {task.autoMerge ? "on" : "off"}</Badge>
+              {task.mode === "plan" ? (
+                <Badge colorScheme={task.autoMergeOnComplete ? "green" : "gray"}>
+                  auto-merge on complete: {task.autoMergeOnComplete ? "on" : "off"}
+                </Badge>
+              ) : null}
               <Badge colorScheme={ide?.status === "running" ? "green" : ide?.status === "starting" ? "blue" : "gray"}>
                 ide: {ide?.status ?? "stopped"}
               </Badge>

@@ -542,7 +542,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
         nodeTier: "plan",
         aiCommand: input.aiCommand,
         autoStart: input.autoStart,
-        autoMergeOnComplete: input.autoMergeOnComplete,
+        autoMergeOnComplete: input.autoMergeOnComplete ?? true,
         allowReplanBudgetOverride: input.allowReplanBudgetOverride,
         parentNodeId: input.parentPlanTaskId
       }

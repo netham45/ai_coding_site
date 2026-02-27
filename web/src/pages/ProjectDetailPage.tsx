@@ -203,6 +203,7 @@ export function ProjectDetailPage() {
     nodeTier: "epoch" | "phase" | "plan" | "task";
     aiCommand?: string;
     autoMerge?: boolean;
+    autoMergeOnComplete?: boolean;
     parentNodeId?: string;
     dependencyNodeRefs?: Array<{ id: string; tier?: NodeTier }>;
   }) {

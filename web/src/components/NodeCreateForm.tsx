@@ -49,7 +49,8 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
   const [title, setTitle] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [nodeTier, setNodeTier] = useState<CreateNodeTier>(presetTier);
-  const [autoMerge, setAutoMerge] = useState(false);
+  const [autoMerge, setAutoMerge] = useState(true);
+  const [autoMergeOnComplete, setAutoMergeOnComplete] = useState(true);
   const [parentNodeId, setParentNodeId] = useState("");
   const [dependencySelections, setDependencySelections] = useState<string[]>([""]);
   const [aiCommandSelection, setAiCommandSelection] = useState(aiCommandOptions[0] || "codex --yolo {prompt}");
@@ -82,12 +83,6 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
       setParentNodeId("");
     }
   }, [nodeTier, parentNodeId, parentOptions]);
-
-  useEffect(() => {
-    if (nodeTier !== "task") {
-      setAutoMerge(false);
-    }
-  }, [nodeTier]);
 
   useEffect(() => {
     const nextDefault = aiCommandOptions[0] || "codex --yolo {prompt}";
@@ -124,7 +119,8 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
       taskPrompt: taskPrompt.trim(),
       nodeTier,
       aiCommand,
-      autoMerge: nodeTier === "task" ? autoMerge : undefined,
+      autoMerge,
+      autoMergeOnComplete: nodeTier === "task" ? undefined : autoMergeOnComplete,
       parentNodeId: parentNodeId || undefined,
       dependencyNodeRefs
     });
@@ -132,7 +128,8 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
     setTitle("");
     setTaskPrompt("");
     setNodeTier(presetTier);
-    setAutoMerge(false);
+    setAutoMerge(true);
+    setAutoMergeOnComplete(true);
     setParentNodeId("");
     setDependencySelections([""]);
     setAiCommandSelection(aiCommandOptions[0] || "codex --yolo {prompt}");
@@ -246,9 +243,16 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
         </FormControl>
         <FormControl>
           <FormLabel>Automation</FormLabel>
-          <Checkbox isChecked={autoMerge} isDisabled={nodeTier !== "task"} onChange={(event) => setAutoMerge(event.target.checked)}>
-            Auto-merge when waiting for input
-          </Checkbox>
+          <Stack spacing={2}>
+            <Checkbox isChecked={autoMerge} onChange={(event) => setAutoMerge(event.target.checked)}>
+              {nodeTier === "task" ? "Auto-merge this node" : "Auto-merge child execution nodes by default"}
+            </Checkbox>
+            {nodeTier !== "task" && (
+              <Checkbox isChecked={autoMergeOnComplete} onChange={(event) => setAutoMergeOnComplete(event.target.checked)}>
+                Auto-merge this node when complete
+              </Checkbox>
+            )}
+          </Stack>
         </FormControl>
         <FormControl gridColumn={{ md: "1 / span 2" }} isRequired>
           <FormLabel>Prompt</FormLabel>
