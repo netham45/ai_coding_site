@@ -14,6 +14,11 @@ import { workspaceRoot } from "./utils/paths.js";
 import { collectProjectDbDiagnosticsHealth } from "./db/projectDbDiagnostics.js";
 import { collectProjectMigrationHealth } from "./db/projectDataMigration.js";
 import { logEndpoint } from "./utils/backendLogger.js";
+import type { DiagnosticsProfiler } from "./services/diagnosticsProfiler.js";
+
+type CreateAppOptions = {
+  profiler?: DiagnosticsProfiler | null;
+};
 
 function redactHeaders(headers: express.Request["headers"]): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
@@ -28,7 +33,7 @@ function redactHeaders(headers: express.Request["headers"]): Record<string, unkn
   return redacted;
 }
 
-export function createApp(): express.Express {
+export function createApp(options: CreateAppOptions = {}): express.Express {
   const app = express();
 
   app.use(cors());
@@ -97,6 +102,37 @@ export function createApp(): express.Express {
         migration: collectProjectMigrationHealth(appDb)
       }
     });
+  }));
+  app.get("/api/debug/profiler/status", endpointWorkerHandler((_req: express.Request, res: express.Response) => {
+    const status = options.profiler?.status ?? null;
+    res.json({
+      enabled: Boolean(status),
+      status
+    });
+  }));
+  app.post("/api/debug/profiler/snapshot", endpointWorkerHandler(async (req: express.Request, res: express.Response) => {
+    const profiler = options.profiler;
+    if (!profiler) {
+      res.status(404).json({ error: "Profiler is disabled. Set AI_CODING_PROFILER_ENABLED=1." });
+      return;
+    }
+
+    const reason = typeof req.body?.reason === "string" ? req.body.reason : "http-snapshot";
+    const filePath = await profiler.captureSnapshot(reason);
+    res.status(202).json({ ok: true, filePath });
+  }));
+  app.post("/api/debug/profiler/cpu", endpointWorkerHandler(async (req: express.Request, res: express.Response) => {
+    const profiler = options.profiler;
+    if (!profiler) {
+      res.status(404).json({ error: "Profiler is disabled. Set AI_CODING_PROFILER_ENABLED=1." });
+      return;
+    }
+
+    const reason = typeof req.body?.reason === "string" ? req.body.reason : "http-cpu-profile";
+    const rawDurationMs = Number(req.body?.durationMs);
+    const durationMs = Number.isFinite(rawDurationMs) ? rawDurationMs : undefined;
+    const filePath = await profiler.captureCpuProfile(durationMs, reason);
+    res.status(202).json({ ok: true, filePath });
   }));
 
   app.use("/api/projects", wrapRouterHandlersInAsyncWorkers(projectsRouter));

@@ -11,13 +11,14 @@ import {
   cloneLocalBaseToWorkspace,
   createTaskBranch,
   getHeadCommitSha,
+  getWorkspaceGitStatusCached,
   getWorkspaceGitStatus,
   mergeTaskWorkspaceIntoTarget,
   pullRemoteRefIntoTaskWorkspace,
   refreshBaseFromOrigin,
   taskBranchName
 } from "../services/git.js";
-import { ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
+import { buildIdeResumeCommand, ideSessionRunning, ideSessionTarget, prepareIdeWorkspace, startIdeSession, stopIdeSession } from "../services/ide.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { triggerAutoMergeIfEligible } from "../services/runtime.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
@@ -25,11 +26,7 @@ import { hasSession, killSession } from "../services/tmux.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
 import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
-import {
-  buildDependencyDiagnostics,
-  partitionDependenciesByTier,
-  resolveAndValidateNodeDependencies
-} from "../services/orchestration/dependencyGraph.js";
+import { buildDependencyDiagnostics, partitionDependenciesByTier, resolveAndValidateNodeDependencies } from "../services/orchestration/dependencyGraph.js";
 import { readReplanControl } from "../services/orchestration/idempotency.js";
 import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
 import { orchestrationActionsApiEnabled, orchestrationHierarchyApiEnabled } from "../config/featureFlags.js";
@@ -47,6 +44,7 @@ import type {
 } from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
+import { logEndpoint } from "../utils/backendLogger.js";
 
 const createTaskSchema = z.object({
   title: z.string().min(2).max(160),
@@ -130,6 +128,49 @@ function respondFeatureDisabled(res: any, feature: string): void {
 }
 
 const mergeLocks = new Set<string>();
+const TASK_DETAIL_INCLUDE_GIT_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_GIT_DEFAULT ?? "");
+const TASK_DETAIL_INCLUDE_HEAVY_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_HEAVY_DEFAULT ?? "");
+
+function queryBoolFlag(input: unknown, fallback: boolean): boolean {
+  if (typeof input !== "string") return fallback;
+  const normalized = input.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function durationFrom(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+}
+
+function logRouteStage(route: string, stage: string, startedAt: bigint, fields?: Record<string, unknown>): void {
+  logEndpoint("http.route.stage", {
+    route,
+    stage,
+    durationMs: durationFrom(startedAt),
+    ...(fields ?? {})
+  });
+}
+
+function parseTime(value: string | null | undefined): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+type ChronoTaskRow = TaskRow & { __rowid?: number };
+
+function compareTaskRowsChronological(a: ChronoTaskRow, b: ChronoTaskRow): number {
+  const createdDiff = parseTime(b.created_at) - parseTime(a.created_at);
+  if (createdDiff !== 0) return createdDiff;
+  const updatedDiff = parseTime(b.updated_at) - parseTime(a.updated_at);
+  if (updatedDiff !== 0) return updatedDiff;
+  const rowidDiff = (b.__rowid ?? Number.NEGATIVE_INFINITY) - (a.__rowid ?? Number.NEGATIVE_INFINITY);
+  if (rowidDiff !== 0) return rowidDiff;
+  const titleDiff = a.title.localeCompare(b.title);
+  if (titleDiff !== 0) return titleDiff;
+  return a.id.localeCompare(b.id);
+}
 
 function isSafeTaskWorkspacePath(workspacePath: string, projectBasePath: string): boolean {
   const resolvedWorkspacePath = path.resolve(workspacePath);
@@ -267,7 +308,14 @@ function latestIde(projectDb: Database.Database, taskId: string): IdeInstanceRow
     .get(taskId) as IdeInstanceRow | undefined;
 }
 
-function serializeTask(projectDb: Database.Database, task: TaskRow) {
+function serializeTask(
+  projectDb: Database.Database,
+  task: TaskRow,
+  options: {
+    includeCompletion?: boolean;
+  } = {}
+) {
+  const includeCompletion = options.includeCompletion ?? true;
   const dependencyTaskIds = projectDb
     .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as Array<{ dependency_task_id: string }>;
@@ -289,7 +337,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
   const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
     ? Boolean(nodeMetadata.custom?.auto_mode)
     : true;
-  const completion = buildCompletionEvidence(projectDb, task, nodeMetadata);
+  const completion = includeCompletion ? buildCompletionEvidence(projectDb, task, nodeMetadata) : undefined;
 
   return {
     id: task.id,
@@ -327,7 +375,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
         gapHashesSeen: replan.gapHashesSeen
       }
     },
-    completion,
+    ...(completion ? { completion } : {}),
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
@@ -473,17 +521,205 @@ function directDependencies(projectDb: Database.Database, task: TaskRow): {
   return { nodeTier, dependencies };
 }
 
+type HierarchyDependencyDetail = {
+  id: string;
+  tier: NodeTier;
+  reason: string | null;
+  status: TaskStatus | null;
+};
+
+type HierarchyDependencyMapRow = {
+  task_id: string;
+  dependency_task_id: string;
+  dependency_status: TaskStatus | null;
+};
+
+function buildHierarchyWaitingState(params: {
+  status: TaskStatus;
+  blockedByTaskIds: string[];
+  unresolvedDependencyDetails: HierarchyDependencyDetail[];
+}) {
+  const unresolvedDependencyIds = params.unresolvedDependencyDetails.map((dep) => dep.id);
+  const dependencyBlockerTaskId = params.blockedByTaskIds[0] ?? null;
+
+  if (params.status === "queued" && params.blockedByTaskIds.length > 0) {
+    return {
+      waiting: true,
+      reasonCode: "blocked_dependencies",
+      reason: "Task is queued but blocked by unmerged dependencies.",
+      dependencyBlockerTaskId,
+      unresolvedDependencyIds,
+      unresolvedDependencyDetails: params.unresolvedDependencyDetails
+    };
+  }
+  if (params.status === "awaiting_children") {
+    return {
+      waiting: true,
+      reasonCode: "awaiting_children",
+      reason: "Plan is waiting for child tasks to merge.",
+      dependencyBlockerTaskId,
+      unresolvedDependencyIds,
+      unresolvedDependencyDetails: params.unresolvedDependencyDetails
+    };
+  }
+  if (params.status === "waiting_input") {
+    return {
+      waiting: true,
+      reasonCode: "waiting_input",
+      reason: "Task is waiting for runtime input or follow-up automation.",
+      dependencyBlockerTaskId,
+      unresolvedDependencyIds,
+      unresolvedDependencyDetails: params.unresolvedDependencyDetails
+    };
+  }
+  if (params.status === "merge_conflict") {
+    return {
+      waiting: true,
+      reasonCode: "merge_conflict",
+      reason: "Task is waiting for merge conflict resolution.",
+      dependencyBlockerTaskId,
+      unresolvedDependencyIds,
+      unresolvedDependencyDetails: params.unresolvedDependencyDetails
+    };
+  }
+  return {
+    waiting: params.status === "queued" || params.status === "in_progress",
+    reasonCode: params.status,
+    reason: `Task is currently ${params.status}.`,
+    dependencyBlockerTaskId,
+    unresolvedDependencyIds,
+    unresolvedDependencyDetails: params.unresolvedDependencyDetails
+  };
+}
+
 function projectHierarchy(projectDb: Database.Database, projectId: string) {
-  const tasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
-    .all(projectId) as TaskRow[];
+  const tasks = (projectDb
+    .prepare(
+      `SELECT *
+       , rowid AS __rowid
+       FROM tasks
+       WHERE project_id = ?`
+    )
+    .all(projectId) as ChronoTaskRow[]).sort(compareTaskRowsChronological);
+  const dependencyRows = projectDb
+    .prepare(
+      `SELECT
+         td.task_id,
+         td.dependency_task_id,
+         dep.status AS dependency_status
+       FROM task_dependencies td
+       JOIN tasks owner ON owner.id = td.task_id
+       LEFT JOIN tasks dep ON dep.id = td.dependency_task_id
+       WHERE owner.project_id = ?
+       ORDER BY td.created_at ASC`
+    )
+    .all(projectId) as HierarchyDependencyMapRow[];
+
+  const dependencyTaskIdsByTaskId = new Map<string, string[]>();
+  const blockedByTaskIdsByTaskId = new Map<string, string[]>();
+  const dependencyStatusByTaskId = new Map<string, Map<string, TaskStatus | null>>();
+  for (const row of dependencyRows) {
+    const depList = dependencyTaskIdsByTaskId.get(row.task_id) ?? [];
+    depList.push(row.dependency_task_id);
+    dependencyTaskIdsByTaskId.set(row.task_id, depList);
+
+    const statusMap = dependencyStatusByTaskId.get(row.task_id) ?? new Map<string, TaskStatus | null>();
+    statusMap.set(row.dependency_task_id, row.dependency_status ?? null);
+    dependencyStatusByTaskId.set(row.task_id, statusMap);
+
+    if (row.dependency_status !== "merged") {
+      const blockedList = blockedByTaskIdsByTaskId.get(row.task_id) ?? [];
+      blockedList.push(row.dependency_task_id);
+      blockedByTaskIdsByTaskId.set(row.task_id, blockedList);
+    }
+  }
+
   const nodesByParent = new Map<string | null, any[]>();
   const nodeRows = tasks.map((task) => {
-    const visibility = buildAutomationVisibility(projectDb, task);
+    const dependencyTaskIds = dependencyTaskIdsByTaskId.get(task.id) ?? [];
+    const blockedByTaskIds = blockedByTaskIdsByTaskId.get(task.id) ?? [];
+    const dependencyStatuses = dependencyStatusByTaskId.get(task.id) ?? new Map<string, TaskStatus | null>();
+    const { metadata: nodeMetadata } = readNodeMetadata({
+      projectDb,
+      task,
+      dependencyTaskIds
+    });
+    const nodeTier = nodeMetadata.tier;
+    const replan = readReplanControl(nodeMetadata);
+    const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+      ? Boolean(nodeMetadata.custom?.auto_mode)
+      : true;
+    const refs = [
+      ...(nodeMetadata.dependencies?.same_tier ?? []).map((dep) => ({
+        id: dep.id,
+        tier: dep.tier ?? nodeTier,
+        reason: dep.reason ?? null
+      })),
+      ...(nodeMetadata.dependencies?.cross_tier ?? []).map((dep) => ({
+        id: dep.id,
+        tier: dep.tier ?? "task",
+        reason: dep.reason ?? null
+      }))
+    ];
+    const unresolvedDependencyDetails = refs
+      .filter((dep) => (dependencyStatuses.get(dep.id) ?? null) !== "merged")
+      .filter((dep, index, source) =>
+        source.findIndex((candidate) => candidate.id === dep.id && candidate.tier === dep.tier) === index
+      )
+      .map((dep) => ({
+        id: dep.id,
+        tier: dep.tier,
+        reason: dep.reason,
+        status: dependencyStatuses.get(dep.id) ?? null
+      }));
+    const waiting = buildHierarchyWaitingState({
+      status: task.status,
+      blockedByTaskIds,
+      unresolvedDependencyDetails
+    });
     return {
-      task: serializeTask(projectDb, task),
-      tier: directDependencies(projectDb, task).nodeTier,
-      waiting: visibility.waiting
+      task: {
+        id: task.id,
+        projectId: task.project_id,
+        title: task.title,
+        taskPrompt: task.task_prompt,
+        result: task.result,
+        effectivePrompt: task.effective_prompt,
+        aiCommand: task.ai_command,
+        autoMerge: Boolean(task.auto_merge),
+        autoStart: Boolean(task.auto_start),
+        autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
+        mode: task.mode,
+        nodeMetadata,
+        parentPlanTaskId: task.parent_plan_task_id,
+        sourcePlanRevisionId: task.source_plan_revision_id,
+        sourcePlanItemKey: task.source_plan_item_key,
+        status: task.status,
+        workspacePath: task.workspace_path,
+        baseCommitShaAtCreate: task.base_commit_sha_at_create,
+        headCommitSha: task.head_commit_sha,
+        cancelReason: task.cancel_reason,
+        mergedAt: task.merged_at,
+        mergedByUserId: task.merged_by_user_id,
+        dependencyTaskIds,
+        blockedByTaskIds,
+        isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+        orchestrationControls: {
+          autoMode,
+          replan: {
+            maxIterations: replan.maxIterations,
+            iterationsUsed: replan.iterationsUsed,
+            remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+            budgetOverride: replan.budgetOverride,
+            gapHashesSeen: replan.gapHashesSeen
+          }
+        },
+        createdByUserId: task.created_by_user_id,
+        createdAt: task.created_at,
+        updatedAt: task.updated_at
+      },
+      tier: nodeTier,
+      waiting
     };
   });
 
@@ -647,13 +883,33 @@ function issueIdeLaunchUrl(params: {
 async function buildIdeLaunchUrl(projectDb: Database.Database, task: TaskRow, ideId: string): Promise<string> {
   try {
     const session = latestSession(projectDb, task.id);
-    const attachableSession = session && ["starting", "running", "waiting_input"].includes(session.status) ? session : null;
+    let attachableSession: TaskSessionRow | null = null;
+    let resumeCommand: string | null = session
+      ? buildIdeResumeCommand({
+          detectedTool: session.detected_tool,
+          backendCommand: session.backend_command
+        })
+      : null;
+    if (session && ["starting", "running", "waiting_input"].includes(session.status)) {
+      const alive = await hasSession(session.tmux_socket_path, session.tmux_session_name);
+      if (alive) {
+        attachableSession = session;
+      } else {
+        const now = nowIso();
+        projectDb
+          .prepare(
+            "UPDATE task_sessions SET status = 'crashed', ended_at = COALESCE(ended_at, ?), last_heartbeat_at = ?, failure_reason = COALESCE(failure_reason, 'ide_open_missing_tmux') WHERE id = ?"
+          )
+          .run(now, now, session.id);
+      }
+    }
     const openPath = await prepareIdeWorkspace({
       taskId: task.id,
       workspacePath: task.workspace_path,
       hasSessionHistory: Boolean(session) && task.status !== "queued",
       tmuxSocketPath: attachableSession?.tmux_socket_path,
-      tmuxSessionName: attachableSession?.tmux_session_name
+      tmuxSessionName: attachableSession?.tmux_session_name,
+      resumeCommand
     });
     if (openPath.endsWith(".code-workspace")) {
       return issueIdeLaunchUrl({ projectDb, taskId: task.id, ideId, workspacePath: openPath });
@@ -1185,9 +1441,14 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
   if (!scopedProject) return;
   const { project, projectDb } = scopedProject;
 
-  const tasks = projectDb
-    .prepare("SELECT * FROM tasks WHERE project_id = ? AND parent_plan_task_id IS NULL ORDER BY created_at DESC")
-    .all(project.id) as TaskRow[];
+  const tasks = (projectDb
+    .prepare(
+      `SELECT *
+       , rowid AS __rowid
+       FROM tasks
+       WHERE project_id = ? AND parent_plan_task_id IS NULL`
+    )
+    .all(project.id) as ChronoTaskRow[]).sort(compareTaskRowsChronological);
 
   res.json({ tasks: tasks.map((task) => serializeTask(projectDb, task)) });
 });
@@ -1219,6 +1480,9 @@ tasksRouter.get("/projects/:projectId/dependency-graph", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
+  const includeGitStatus = queryBoolFlag(req.query.includeGitStatus, TASK_DETAIL_INCLUDE_GIT_DEFAULT);
+  const includeHeavy = queryBoolFlag(req.query.includeHeavy, TASK_DETAIL_INCLUDE_HEAVY_DEFAULT);
+  const startedAt = process.hrtime.bigint();
   const scopedTask = getTaskAccessOrRespond(
     { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
     res
@@ -1226,33 +1490,83 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   if (!scopedTask) return;
   const { task, projectDb } = scopedTask;
 
+  const dbStartedAt = process.hrtime.bigint();
   const transitions = projectDb
     .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as TaskTransitionRow[];
   const mergeRecords = projectDb
     .prepare("SELECT * FROM merge_records WHERE task_id = ? ORDER BY created_at DESC")
     .all(task.id) as MergeRecordRow[];
+  logRouteStage("/tasks/:taskId", "db-fetch", dbStartedAt, {
+    taskId: task.id,
+    transitionsCount: transitions.length,
+    mergeRecordCount: mergeRecords.length
+  });
 
   let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
-  try {
-    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
-  } catch {
-    gitStatus = null;
+  if (includeGitStatus) {
+    const gitStartedAt = process.hrtime.bigint();
+    try {
+      gitStatus = await getWorkspaceGitStatusCached(task.workspace_path);
+    } catch {
+      gitStatus = null;
+    }
+    logRouteStage("/tasks/:taskId", "git-status", gitStartedAt, {
+      taskId: task.id,
+      included: true,
+      available: Boolean(gitStatus)
+    });
+  } else {
+    logRouteStage("/tasks/:taskId", "git-status", startedAt, {
+      taskId: task.id,
+      included: false
+    });
   }
+  const visibilityStartedAt = process.hrtime.bigint();
   const visibility = buildAutomationVisibility(projectDb, task);
-  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
+  logRouteStage("/tasks/:taskId", "automation-visibility", visibilityStartedAt, { taskId: task.id });
+  const serializeStartedAt = process.hrtime.bigint();
+  const serializedTask = serializeTask(projectDb, task, { includeCompletion: includeHeavy });
+  logRouteStage("/tasks/:taskId", "serialize-task", serializeStartedAt, { taskId: task.id, includeHeavy });
 
   res.json({
-    task: serializeTask(projectDb, task),
+    task: serializedTask,
     transitions: transitions.map(serializeTransition),
     session: serializeSession(latestSession(projectDb, task.id)),
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord),
-    dependencyDiagnostics,
+    dependencyDiagnostics: visibility.dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
+  });
+  logRouteStage("/tasks/:taskId", "response", startedAt, {
+    taskId: task.id,
+    includeGitStatus,
+    includeHeavy
+  });
+});
+
+tasksRouter.get("/tasks/:taskId/poll", (req, res) => {
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+
+  res.json({
+    task: {
+      id: task.id,
+      projectId: task.project_id,
+      status: task.status,
+      mode: task.mode,
+      isBlocked: task.status === "queued" && taskIsBlocked(projectDb, task.id),
+      updatedAt: task.updated_at
+    },
+    session: serializeSession(latestSession(projectDb, task.id)),
+    ide: serializeIde(latestIde(projectDb, task.id))
   });
 });
 
@@ -1272,15 +1586,15 @@ tasksRouter.get("/nodes/:nodeId", async (req, res) => {
     .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
     .all(task.id) as TaskTransitionRow[];
   const visibility = buildAutomationVisibility(projectDb, task);
-  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
   const children = projectDb
-    .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
-    .all(task.id) as TaskRow[];
+    .prepare("SELECT *, rowid AS __rowid FROM tasks WHERE parent_plan_task_id = ?")
+    .all(task.id) as ChronoTaskRow[];
+  children.sort(compareTaskRowsChronological);
 
   res.json({
     node: serializeTask(projectDb, task),
     transitions: transitions.map(serializeTransition),
-    dependencyDiagnostics,
+    dependencyDiagnostics: visibility.dependencyDiagnostics,
     waiting: visibility.waiting,
     automation: visibility.automation,
     orchestration: visibility.orchestration,
@@ -2123,7 +2437,7 @@ tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
 
   let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
   try {
-    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+    gitStatus = await getWorkspaceGitStatusCached(task.workspace_path);
   } catch {
     gitStatus = null;
   }
@@ -2135,6 +2449,7 @@ tasksRouter.get("/tasks/:taskId/ide", async (req, res) => {
 });
 
 tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
+  const routeStartedAt = process.hrtime.bigint();
   const scopedTask = getTaskAccessOrRespond(
     { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "write" },
     res
@@ -2149,12 +2464,15 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 
   const current = latestIde(projectDb, task.id);
   if (current && current.status === "running" && ideSessionRunning(task.id)) {
+    const launchUrlStartedAt = process.hrtime.bigint();
     const launchUrl = await buildIdeLaunchUrl(projectDb, task, current.id);
+    logRouteStage("/tasks/:taskId/ide/start", "reuse-running", launchUrlStartedAt, { taskId: task.id });
     res.json({ ide: serializeIde(current), launchUrl });
     return;
   }
 
   let launched: Awaited<ReturnType<typeof startIdeSession>>;
+  const startIdeSessionStartedAt = process.hrtime.bigint();
   try {
     launched = await startIdeSession({
       taskId: task.id,
@@ -2164,6 +2482,10 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
     res.status(409).json({ error: String(error?.message ?? "Failed to start IDE session") });
     return;
   }
+  logRouteStage("/tasks/:taskId/ide/start", "start-ide-session", startIdeSessionStartedAt, {
+    taskId: task.id,
+    provider: launched.provider
+  });
 
   const now = nowIso();
   const ideId = makeId();
@@ -2182,7 +2504,9 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
     ).run(ideId, task.id, launched.provider, launched.url, hashToken("pending"), now, now);
   })();
 
+  const launchUrlStartedAt = process.hrtime.bigint();
   const launchUrl = await buildIdeLaunchUrl(projectDb, task, ideId);
+  logRouteStage("/tasks/:taskId/ide/start", "build-launch-url", launchUrlStartedAt, { taskId: task.id });
   recordEvent({
     projectId: task.project_id,
     taskId: task.id,
@@ -2197,6 +2521,7 @@ tasksRouter.post("/tasks/:taskId/ide/start", async (req, res) => {
 
   const ide = projectDb.prepare("SELECT * FROM ide_instances WHERE id = ?").get(ideId) as IdeInstanceRow | undefined;
   res.json({ ide: serializeIde(ide), launchUrl });
+  logRouteStage("/tasks/:taskId/ide/start", "response", routeStartedAt, { taskId: task.id });
 });
 
 tasksRouter.post("/tasks/:taskId/ide/token", async (req, res) => {

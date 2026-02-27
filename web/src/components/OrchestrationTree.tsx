@@ -1,6 +1,6 @@
 import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from "@chakra-ui/icons";
 import { Badge, Box, Button, Flex, Heading, HStack, Link, Stack, Text } from "@chakra-ui/react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link as RouterLink } from "react-router-dom";
 import type { HierarchyNode, HierarchyNodeRow, NodeTier, TaskStatus } from "../api/types";
 
@@ -20,22 +20,66 @@ function tierColor(tier: NodeTier) {
   return "teal";
 }
 
+function taskIdFor(node: HierarchyNode | HierarchyNodeRow): string {
+  const fallback = node as unknown as { id?: unknown };
+  return node.task.id ?? (typeof fallback.id === "string" ? fallback.id : "");
+}
+
+function taskTitleFor(node: HierarchyNode | HierarchyNodeRow): string {
+  const fallback = node as unknown as { title?: unknown };
+  return node.task.title ?? (typeof fallback.title === "string" ? fallback.title : "");
+}
+
 function nodeRoute(node: HierarchyNode) {
+  const taskId = taskIdFor(node);
   if (node.tier === "task" || node.tier === "exec" || node.task.mode === "execution") {
-    return `/tasks/${node.task.id}?tab=ide`;
+    return `/tasks/${taskId}?tab=ide`;
   }
-  return `/plans/${node.task.id}?tab=ide`;
+  return `/plans/${taskId}?tab=ide`;
+}
+
+type ChildStatusKey = TaskStatus | "blocked";
+
+const CHILD_STATUS_ORDER: ChildStatusKey[] = [
+  "blocked",
+  "awaiting_children",
+  "queued",
+  "in_progress",
+  "waiting_input",
+  "merge_ready",
+  "merged",
+  "failed",
+  "cancelled",
+  "merge_conflict"
+];
+
+const CHILD_STATUS_LABELS: Record<ChildStatusKey, string> = {
+  blocked: "blocked",
+  awaiting_children: "awaiting children",
+  queued: "queued",
+  in_progress: "in progress",
+  waiting_input: "waiting input",
+  merge_ready: "merge ready",
+  merged: "merged",
+  failed: "failed",
+  cancelled: "cancelled",
+  merge_conflict: "merge conflict"
+};
+
+function childStatusKey(node: HierarchyNode): ChildStatusKey {
+  const isBlocked = node.task.isBlocked || node.waiting?.waiting === true;
+  return isBlocked ? "blocked" : node.task.status;
 }
 
 function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
   const byId = new Map<string, HierarchyNode>();
   rows.forEach((row) => {
-    byId.set(row.task.id, { ...row, children: [] });
+    byId.set(taskIdFor(row), { ...row, children: [] });
   });
 
   const roots: HierarchyNode[] = [];
   rows.forEach((row) => {
-    const node = byId.get(row.task.id);
+    const node = byId.get(taskIdFor(row));
     if (!node) return;
     const parentId = row.task.parentPlanTaskId;
     const parent = parentId ? byId.get(parentId) : undefined;
@@ -46,6 +90,7 @@ function buildFallbackTree(rows: HierarchyNodeRow[]): HierarchyNode[] {
     }
   });
 
+  // Order is backend-defined; do not re-sort client-side.
   return roots;
 }
 
@@ -63,15 +108,7 @@ export function OrchestrationTree({
   onToggleCollapse?: () => void;
 }) {
   const treeRoots = useMemo(() => (roots.length ? roots : buildFallbackTree(fallbackRows)), [fallbackRows, roots]);
-  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set(treeRoots.map((node) => node.task.id)));
-
-  useEffect(() => {
-    setExpandedNodeIds((previous) => {
-      const next = new Set(previous);
-      treeRoots.forEach((root) => next.add(root.task.id));
-      return next;
-    });
-  }, [treeRoots]);
+  const [expandedNodeIds, setExpandedNodeIds] = useState<Set<string>>(() => new Set());
 
   function toggleNode(nodeId: string) {
     setExpandedNodeIds((previous) => {
@@ -131,7 +168,7 @@ export function OrchestrationTree({
         <Stack spacing={1}>
           {treeRoots.map((root) => (
             <TreeRow
-              key={root.task.id}
+              key={`${taskIdFor(root)}:${root.tier}`}
               node={root}
               depth={0}
               expandedNodeIds={expandedNodeIds}
@@ -158,11 +195,34 @@ function TreeRow({
   onToggle: (nodeId: string) => void;
   selectedNodeId?: string | null;
 }) {
-  const hasChildren = node.children.length > 0;
-  const isExpanded = hasChildren && expandedNodeIds.has(node.task.id);
-  const unresolvedDependencyCount = node.waiting.unresolvedDependencyDetails.length;
-  const dependencyCount = node.task.dependencyTaskIds.length;
-  const isBlocked = node.task.isBlocked || node.waiting.waiting;
+  const children = node.children ?? [];
+  const waiting = node.waiting ?? {
+    waiting: false,
+    reasonCode: "",
+    reason: "",
+    dependencyBlockerTaskId: null,
+    unresolvedDependencyIds: [],
+    unresolvedDependencyDetails: []
+  };
+  const dependencyTaskIds = node.task.dependencyTaskIds ?? [];
+  const taskId = taskIdFor(node);
+  const taskTitle = taskTitleFor(node);
+
+  const hasChildren = children.length > 0;
+  const isExpanded = hasChildren && expandedNodeIds.has(taskId);
+  const unresolvedDependencyCount = waiting.unresolvedDependencyDetails.length;
+  const dependencyCount = dependencyTaskIds.length;
+  const isBlocked = node.task.isBlocked || waiting.waiting;
+  const childStatusSummary = hasChildren
+    ? CHILD_STATUS_ORDER
+      .map((status) => {
+        const count = children.reduce((sum, child) => {
+          return sum + (childStatusKey(child) === status ? 1 : 0);
+        }, 0);
+        return count > 0 ? `${count} ${CHILD_STATUS_LABELS[status]}` : null;
+      })
+      .filter((value): value is string => Boolean(value))
+    : [];
 
   return (
     <Box>
@@ -171,8 +231,8 @@ function TreeRow({
           <Button
             size="xs"
             variant="ghost"
-            onClick={() => onToggle(node.task.id)}
-            aria-label={isExpanded ? `Collapse ${node.task.title}` : `Expand ${node.task.title}`}
+            onClick={() => onToggle(taskId)}
+            aria-label={isExpanded ? `Collapse ${taskTitle}` : `Expand ${taskTitle}`}
             minW="24px"
             px={0}
             mt="4px"
@@ -183,7 +243,7 @@ function TreeRow({
           <Box w="24px" />
         )}
 
-        <Box flex="1" minW={0} border="1px solid" borderColor={selectedNodeId === node.task.id ? "teal.300" : "blackAlpha.200"} borderRadius="md" p={2}>
+        <Box flex="1" minW={0} border="1px solid" borderColor={selectedNodeId === taskId ? "teal.300" : "blackAlpha.200"} borderRadius="md" p={2}>
           <Link
             as={RouterLink}
             to={nodeRoute(node)}
@@ -194,37 +254,36 @@ function TreeRow({
               if (!hasChildren) return;
               if (event.key === "ArrowRight" && !isExpanded) {
                 event.preventDefault();
-                onToggle(node.task.id);
+                onToggle(taskId);
               }
               if (event.key === "ArrowLeft" && isExpanded) {
                 event.preventDefault();
-                onToggle(node.task.id);
+                onToggle(taskId);
               }
             }}
           >
-            {node.task.title}
+            {taskTitle}
           </Link>
           <Flex mt={1} wrap="wrap" gap={1}>
             <Badge colorScheme={tierColor(node.tier)}>{node.tier}</Badge>
             <Badge colorScheme={statusColor(node.task.status)}>{node.task.status}</Badge>
-            <Badge colorScheme={node.task.autoMerge ? "green" : "gray"}>auto-merge: {node.task.autoMerge ? "on" : "off"}</Badge>
-            {node.task.mode === "plan" ? (
-              <Badge colorScheme={node.task.autoMergeOnComplete ? "green" : "gray"}>
-                auto-merge on complete: {node.task.autoMergeOnComplete ? "on" : "off"}
-              </Badge>
-            ) : null}
             {isBlocked ? <Badge colorScheme="orange">blocked</Badge> : null}
             {unresolvedDependencyCount > 0 ? <Badge colorScheme="red">deps {unresolvedDependencyCount}</Badge> : null}
             {unresolvedDependencyCount === 0 && dependencyCount > 0 ? <Badge colorScheme="gray">deps {dependencyCount}</Badge> : null}
+            {childStatusSummary.length ? (
+              <Badge colorScheme="blue" variant="subtle">
+                children: {childStatusSummary.join(" ")}
+              </Badge>
+            ) : null}
           </Flex>
         </Box>
       </HStack>
 
       {isExpanded ? (
         <Stack spacing={1} mt={1}>
-          {node.children.map((child) => (
+          {children.map((child) => (
             <TreeRow
-              key={child.task.id}
+              key={`${taskIdFor(child)}:${child.tier}`}
               node={child}
               depth={depth + 1}
               expandedNodeIds={expandedNodeIds}

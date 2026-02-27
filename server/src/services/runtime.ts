@@ -526,6 +526,8 @@ async function ensureTaskSummaryCaptured(taskId: string, actorUserId: string, co
       "Include:",
       "- Goal and outcome",
       "- Key code changes",
+      "- Research performed for this task and the key findings",
+      "- Questions answered during this task, including each answer",
       "- Tests/validation performed",
       "- Remaining risks or follow-ups",
       "After writing the file, wait for further input."

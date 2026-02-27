@@ -232,6 +232,9 @@ export type WorkspaceGitStatus = {
   clean: boolean;
 };
 
+const GIT_STATUS_CACHE_TTL_MS = Math.max(0, Number(process.env.AI_CODING_GIT_STATUS_CACHE_TTL_MS ?? 5000));
+const gitStatusCache = new Map<string, { expiresAt: number; value: WorkspaceGitStatus }>();
+
 export async function getWorkspaceGitStatus(workspacePath: string): Promise<WorkspaceGitStatus> {
   try {
     const { stdout } = await execGit(["-C", workspacePath, "status", "--porcelain=v1", "--branch"], {
@@ -316,6 +319,25 @@ export async function getWorkspaceGitStatus(workspacePath: string): Promise<Work
     const message = stderr.trim() || error?.message || "failed to read git status";
     throw new Error(message);
   }
+}
+
+export async function getWorkspaceGitStatusCached(workspacePath: string, forceRefresh = false): Promise<WorkspaceGitStatus> {
+  if (GIT_STATUS_CACHE_TTL_MS <= 0 || forceRefresh) {
+    return getWorkspaceGitStatus(workspacePath);
+  }
+
+  const now = Date.now();
+  const cached = gitStatusCache.get(workspacePath);
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  const value = await getWorkspaceGitStatus(workspacePath);
+  gitStatusCache.set(workspacePath, {
+    value,
+    expiresAt: now + GIT_STATUS_CACHE_TTL_MS
+  });
+  return value;
 }
 
 export type PullMainResult = {

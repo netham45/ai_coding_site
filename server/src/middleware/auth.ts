@@ -12,8 +12,7 @@ declare global {
 
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   const headerUserId = req.header("x-user-id");
-  const fallbackId = ensureLocalUser();
-  const userId = headerUserId || fallbackId;
+  const userId = headerUserId || ensureLocalUser();
 
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRow | undefined;
   if (!user) {

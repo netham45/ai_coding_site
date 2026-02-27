@@ -4,6 +4,7 @@ import { logDb } from "../utils/backendLogger.js";
 import { runningTests, workspaceRoot } from "../utils/paths.js";
 
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
+const DB_TRACE_ENABLED = /^(1|true|yes)$/i.test(process.env.AI_CODING_DB_TRACE_ENABLED ?? "");
 const INSTRUMENTED_DB = Symbol("instrumented_db");
 const INSTRUMENTED_STATEMENT = Symbol("instrumented_statement");
 const STATIC_PROTECTED_TEST_ROOTS = [path.resolve(path.sep, "repo"), path.resolve(path.sep, "repos"), path.resolve(path.sep, "data")];
@@ -226,7 +227,7 @@ export function openSqliteDatabase(dbPath: string): Database.Database {
   assertTestSafeSqlitePath(dbPath);
   logDb("db.open.start", { dbPath });
   const started = process.hrtime.bigint();
-  const db = instrumentDatabase(new Database(dbPath), dbPath);
+  const db = DB_TRACE_ENABLED ? instrumentDatabase(new Database(dbPath), dbPath) : new Database(dbPath);
   logDb("db.open.success", { dbPath, durationMs: durationMs(started) });
   applyStandardSqlitePragmas(db);
   return db;

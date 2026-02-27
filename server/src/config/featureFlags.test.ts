@@ -1,0 +1,60 @@
+import assert from "node:assert/strict";
+import { afterEach, describe, test } from "node:test";
+import {
+  orchestrationActionsApiEnabled,
+  orchestrationCompatibilityModeEnabled,
+  orchestrationHierarchyApiEnabled,
+  orchestrationWorkersEnabled
+} from "./featureFlags.js";
+
+const ORIGINAL_ENV = { ...process.env };
+
+function resetEnv() {
+  for (const key of Object.keys(process.env)) {
+    delete process.env[key];
+  }
+  Object.assign(process.env, ORIGINAL_ENV);
+}
+
+describe("feature flags", () => {
+  afterEach(() => {
+    resetEnv();
+  });
+
+  test("compatibility mode hard-disables orchestration APIs and workers", () => {
+    process.env.ORCHESTRATION_COMPATIBILITY_MODE = "true";
+    process.env.ORCHESTRATION_WORKERS_ENABLED = "true";
+    process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "true";
+    process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "true";
+
+    assert.equal(orchestrationCompatibilityModeEnabled(), true);
+    assert.equal(orchestrationWorkersEnabled(), false);
+    assert.equal(orchestrationHierarchyApiEnabled(), false);
+    assert.equal(orchestrationActionsApiEnabled(), false);
+  });
+
+  test("defaults to workers/apis enabled when env vars are unset or invalid", () => {
+    delete process.env.ORCHESTRATION_COMPATIBILITY_MODE;
+    delete process.env.ORCHESTRATION_WORKERS_ENABLED;
+    delete process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
+    delete process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
+
+    assert.equal(orchestrationCompatibilityModeEnabled(), false);
+    assert.equal(orchestrationWorkersEnabled(), true);
+    assert.equal(orchestrationHierarchyApiEnabled(), true);
+    assert.equal(orchestrationActionsApiEnabled(), true);
+
+    process.env.ORCHESTRATION_WORKERS_ENABLED = "invalid";
+    assert.equal(orchestrationWorkersEnabled(), true);
+  });
+
+  test("parses boolean-like env values for granular toggles", () => {
+    process.env.ORCHESTRATION_WORKERS_ENABLED = "off";
+    process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "0";
+    process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "no";
+
+    assert.equal(orchestrationWorkersEnabled(), false);
+    assert.equal(orchestrationHierarchyApiEnabled(), false);
+    assert.equal(orchestrationActionsApiEnabled(), false);
+  });
+});

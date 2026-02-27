@@ -46,6 +46,7 @@ import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { recordEvent } from "./services/events.js";
+import { buildIdeResumeCommand, prepareIdeWorkspace } from "./services/ide.js";
 import { runRuntimeTaskWorker } from "./services/runtimeWorker.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
 import type { TaskRow, TaskStatus } from "./types.js";
@@ -911,6 +912,37 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
       .prepare("SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?")
       .get(taskId) as { count: number };
     assert.equal(sessionCount.count, 0);
+  });
+
+  test("ide workspace task uses codex resume command for historical codex sessions", async () => {
+    const workspacePath = randomPath("ide-resume-command");
+    const taskId = randomUUID();
+    const resumeCommand = buildIdeResumeCommand({
+      detectedTool: "codex",
+      backendCommand: "codex --yolo"
+    });
+    assert.equal(resumeCommand, "'codex' resume");
+
+    const openPath = await prepareIdeWorkspace({
+      taskId,
+      workspacePath,
+      hasSessionHistory: true,
+      resumeCommand
+    });
+
+    assert.equal(openPath.endsWith(".code-workspace"), true);
+    const workspaceSpec = JSON.parse(fs.readFileSync(openPath, "utf8")) as {
+      tasks: { tasks: Array<{ command: string }> };
+    };
+    assert.equal(workspaceSpec.tasks.tasks[0]?.command.includes("'codex' resume"), true);
+  });
+
+  test("ide resume command builder ignores non-codex tools", () => {
+    const resumeCommand = buildIdeResumeCommand({
+      detectedTool: "custom",
+      backendCommand: "some-tool run"
+    });
+    assert.equal(resumeCommand, null);
   });
 
   test("start endpoint does not hang when a same-task runtime worker is already wedged", async () => {
@@ -3343,6 +3375,129 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         localServer.close(() => resolve());
       });
     }
+  });
+
+  test("tasks and hierarchy endpoints preserve shared node ordering for epoch->phase->plan->task hierarchies", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hierarchy-order-parity");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const tiedTimestamp = "2026-02-27T00:00:00.000Z";
+
+    const chainA = {
+      epochId: insertTask({ projectDb, projectId, userId, title: "A Epoch", mode: "plan", status: "queued" }),
+      phaseId: "",
+      planId: "",
+      taskId: ""
+    };
+    chainA.phaseId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "A Phase",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: chainA.epochId
+    });
+    chainA.planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "A Plan",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: chainA.phaseId
+    });
+    chainA.taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "A Task",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: chainA.planId
+    });
+
+    const chainB = {
+      epochId: insertTask({ projectDb, projectId, userId, title: "B Epoch", mode: "plan", status: "queued" }),
+      phaseId: "",
+      planId: "",
+      taskId: ""
+    };
+    chainB.phaseId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "B Phase",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: chainB.epochId
+    });
+    chainB.planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "B Plan",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: chainB.phaseId
+    });
+    chainB.taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "B Task",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: chainB.planId
+    });
+
+    const tierById = new Map<string, "epoch" | "phase" | "plan" | "task">([
+      [chainA.epochId, "epoch"],
+      [chainA.phaseId, "phase"],
+      [chainA.planId, "plan"],
+      [chainA.taskId, "task"],
+      [chainB.epochId, "epoch"],
+      [chainB.phaseId, "phase"],
+      [chainB.planId, "plan"],
+      [chainB.taskId, "task"]
+    ]);
+    for (const [taskId, tier] of tierById.entries()) {
+      projectDb.prepare("UPDATE tasks SET metadata_json = ?, created_at = ?, updated_at = ? WHERE id = ?").run(
+        JSON.stringify({ schema_version: 1, tier }),
+        tiedTimestamp,
+        tiedTimestamp,
+        taskId
+      );
+    }
+
+    const tasksResponse = await callApi(`/api/projects/${projectId}/tasks`, { userId });
+    assert.equal(tasksResponse.status, 200);
+    const taskListIds = (tasksResponse.json?.tasks ?? []).map((task: any) => task.id);
+    assert.equal(taskListIds.length, 2);
+    assert.deepEqual(new Set(taskListIds), new Set([chainA.epochId, chainB.epochId]));
+
+    const hierarchyResponse = await callApi(`/api/projects/${projectId}/hierarchy`, { userId });
+    assert.equal(hierarchyResponse.status, 200);
+    const hierarchyRootIds = (hierarchyResponse.json?.hierarchy?.roots ?? []).map((node: any) => node.task.id);
+    assert.deepEqual(hierarchyRootIds, taskListIds);
+
+    const chainByRootId = new Map<string, { epochId: string; phaseId: string; planId: string; taskId: string }>([
+      [chainA.epochId, chainA],
+      [chainB.epochId, chainB]
+    ]);
+    const flattenHierarchy = (nodes: any[]): string[] => nodes.flatMap((node) => [node.task.id, ...flattenHierarchy(node.children ?? [])]);
+    const hierarchyDfsIds = flattenHierarchy(hierarchyResponse.json?.hierarchy?.roots ?? []);
+    const expectedHierarchyDfsIds = taskListIds.flatMap((rootId: string) => {
+      const chain = chainByRootId.get(rootId);
+      if (!chain) throw new Error(`Missing chain for root ${rootId}`);
+      return [chain.epochId, chain.phaseId, chain.planId, chain.taskId];
+    });
+    assert.deepEqual(hierarchyDfsIds, expectedHierarchyDfsIds);
+
+    const hierarchyNodeIds = (hierarchyResponse.json?.hierarchy?.nodes ?? []).map((node: any) => node.task.id);
+    const sharedIdsFromHierarchyNodes = hierarchyNodeIds.filter((id: string) => taskListIds.includes(id));
+    assert.deepEqual(sharedIdsFromHierarchyNodes, taskListIds);
   });
 
   test("manual orchestration override actions validate input and are audited", async () => {
