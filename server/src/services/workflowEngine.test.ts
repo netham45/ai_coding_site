@@ -1,20 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import { projectBaselineMigration } from "../db/migrations.js";
-import type { TaskRow } from "../types.js";
 import {
   createWorkflowDefinition,
   createWorkflowRun,
+  createWorkflowStageRun,
   getWorkflowRunById,
+  listWorkflowCheckResultsByStageRun,
   listWorkflowEventsByStageRun,
   listWorkflowStageRunsByRun
 } from "./workflowRepository.js";
 import { handleEvent, startWorkflowRun, tickWorkflowRun } from "./workflowEngine.js";
-import { makeId } from "../utils/id.js";
-import { nowIso } from "../utils/time.js";
 
 function createTestDb(): Database.Database {
   const db = new Database(":memory:");
@@ -38,40 +35,6 @@ function seedDefinition(db: Database.Database, definitionYaml: string): string {
     projectId: "project-1"
   });
   return run.id;
-}
-
-function insertTaskRow(db: Database.Database, input: Partial<TaskRow> & { id: string; projectId: string; userId: string }): TaskRow {
-  const now = nowIso();
-  const workspacePath = input.workspace_path ?? path.join("/tmp", `workflow-engine-test-${input.id}`);
-  fs.mkdirSync(workspacePath, { recursive: true });
-  db.prepare(
-    `INSERT INTO tasks (
-      id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-      auto_merge, auto_start, auto_merge_on_complete, metadata_json,
-      mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
-      status, workspace_path, base_commit_sha_at_create, head_commit_sha,
-      cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, '', ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-  ).run(
-    input.id,
-    input.projectId,
-    input.title ?? "Task",
-    input.task_prompt ?? "Prompt",
-    input.effective_prompt ?? "Prompt",
-    input.ai_command ?? "codex --yolo {prompt}",
-    input.metadata_json ?? JSON.stringify({ schema_version: 1, tier: "plan" }),
-    input.mode ?? "plan",
-    input.parent_plan_task_id ?? null,
-    input.source_plan_revision_id ?? null,
-    input.source_plan_item_key ?? null,
-    input.status ?? "queued",
-    workspacePath,
-    input.base_commit_sha_at_create ?? "base-sha",
-    input.created_by_user_id ?? input.userId,
-    now,
-    now
-  );
-  return db.prepare("SELECT * FROM tasks WHERE id = ?").get(input.id) as TaskRow;
 }
 
 describe("workflowEngine", () => {
@@ -255,76 +218,120 @@ stages:
     db.close();
   });
 
-  test("ingest/wait stages are blocked by plan and child-completion rules", () => {
+  test("stage_complete and node_merged checks unblock via event-driven rechecks", () => {
     const db = createTestDb();
-    const workspace = path.join("/tmp", `wf-engine-stage-rules-${makeId()}`);
-    const parent = insertTaskRow(db, {
-      id: "parent-plan",
+    db.prepare(
+      `INSERT INTO tasks (
+         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+         auto_merge, auto_start, auto_merge_on_complete, metadata_json, mode,
+         parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
+         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+       ) VALUES (
+         'task-wf', 'project-1', 'task-wf', 'prompt', '', 'effective', 'codex --yolo {prompt}',
+         0, 0, 0, '{}', 'execution',
+         NULL, NULL, NULL,
+         'in_progress', '/tmp/workspace', 'base-sha', NULL,
+         NULL, NULL, NULL, 'user-1', datetime('now'), datetime('now')
+       )`
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (
+         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+         auto_merge, auto_start, auto_merge_on_complete, metadata_json, mode,
+         parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
+         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+       ) VALUES (
+         'node-target', 'project-1', 'node-target', 'prompt', '', 'effective', 'codex --yolo {prompt}',
+         0, 0, 0, '{}', 'execution',
+         NULL, NULL, NULL,
+         'merge_ready', '/tmp/workspace', 'base-sha', NULL,
+         NULL, NULL, NULL, 'user-1', datetime('now'), datetime('now')
+       )`
+    ).run();
+
+    createWorkflowDefinition(db, {
+      id: "wf-def-check-unblock",
       projectId: "project-1",
-      userId: "user-1",
-      workspace_path: workspace,
-      status: "in_progress"
+      name: "check-unblock",
+      version: 1,
+      definitionYaml: JSON.stringify({
+        version: 1,
+        stages: [
+          { id: "build", max_attempts: 1 },
+          {
+            id: "gate",
+            max_attempts: 1,
+            deterministic_checks: [
+              { type: "stage_complete", name: "wait-build", stageRunId: "wf-stage-build-check" },
+              { type: "node_merged", name: "wait-node-merge", nodeId: "node-target" }
+            ]
+          }
+        ]
+      }),
+      createdByUserId: "user-1"
     });
-    const runId = seedDefinition(
-      db,
-      `version: 1
-stages:
-  - id: generate_plan_yaml
-  - id: ingest_child_nodes
-    depends_on: [generate_plan_yaml]
-  - id: wait_for_child_completion
-    depends_on: [ingest_child_nodes]
-`
-    );
-    db.prepare("UPDATE workflow_runs SET task_id = ? WHERE id = ?").run(parent.id, runId);
-    startWorkflowRun({ db, workflowRunId: runId });
-    const stageRuns = listWorkflowStageRunsByRun(db, runId);
-    const generate = stageRuns.find((row) => row.stage_key === "generate_plan_yaml")!;
-    const ingest = stageRuns.find((row) => row.stage_key === "ingest_child_nodes")!;
-    const wait = stageRuns.find((row) => row.stage_key === "wait_for_child_completion")!;
+    const run = createWorkflowRun(db, {
+      id: "wf-run-check-unblock",
+      workflowDefinitionId: "wf-def-check-unblock",
+      projectId: "project-1",
+      taskId: "task-wf"
+    });
+    createWorkflowStageRun(db, {
+      id: "wf-stage-build-check",
+      workflowRunId: run.id,
+      stageKey: "build",
+      ordinal: 1,
+      status: "pending"
+    });
+    createWorkflowStageRun(db, {
+      id: "wf-stage-gate-check",
+      workflowRunId: run.id,
+      stageKey: "gate",
+      ordinal: 2,
+      status: "pending"
+    });
+
+    startWorkflowRun({ db, workflowRunId: run.id });
+    const initialStages = listWorkflowStageRunsByRun(db, run.id);
+    const build = initialStages.find((stage) => stage.stage_key === "build")!;
+    const gate = initialStages.find((stage) => stage.stage_key === "gate")!;
+
+    assert.equal(build.status, "running");
+    assert.equal(gate.status, "pending");
+    const initialGateChecks = listWorkflowCheckResultsByStageRun(db, gate.id);
+    assert.equal(initialGateChecks.length > 0, true);
+    assert.equal(initialGateChecks.some((row) => row.check_name === "wait-build" && row.status === "fail"), true);
+    assert.equal(initialGateChecks.some((row) => row.check_name === "wait-node-merge" && row.status === "fail"), true);
+
     handleEvent({
       db,
-      workflowRunId: runId,
-      stageRunId: generate.id,
+      workflowRunId: run.id,
+      stageRunId: build.id,
       eventType: "workflow.stage.verify_succeeded"
     });
-    const blockedIngest = listWorkflowEventsByStageRun(db, ingest.id)
-      .filter((event) => event.event_type === "workflow.stage.lifecycle")
-      .map((event) => JSON.parse(event.payload));
-    assert.equal(blockedIngest.some((event) => event.state === "blocked" && event.unresolvedStageRules?.includes("missing_plan_yaml")), true);
+    const afterBuild = listWorkflowStageRunsByRun(db, run.id);
+    const gateAfterBuild = afterBuild.find((stage) => stage.id === gate.id)!;
+    assert.equal(gateAfterBuild.status, "pending");
+    const buildPassedChecks = listWorkflowCheckResultsByStageRun(db, gate.id);
+    assert.equal(buildPassedChecks.some((row) => row.check_name === "wait-build" && row.status === "pass"), true);
+    assert.equal(buildPassedChecks.some((row) => row.check_name === "wait-node-merge" && row.status === "fail"), true);
 
-    fs.mkdirSync(path.join(workspace, ".ai-plan"), { recursive: true });
-    fs.writeFileSync(path.join(workspace, ".ai-plan", "latest-plan.yaml"), "tasks:\n  - id: child_a\n    title: Child A\n    prompt: A\n", "utf8");
-    tickWorkflowRun({ db, workflowRunId: runId });
-    const afterYaml = listWorkflowStageRunsByRun(db, runId);
-    assert.equal(afterYaml.find((row) => row.id === ingest.id)?.status, "running");
-
+    db.prepare("UPDATE tasks SET status = 'merged' WHERE id = 'node-target'").run();
     handleEvent({
       db,
-      workflowRunId: runId,
-      stageRunId: ingest.id,
-      eventType: "workflow.stage.verify_succeeded"
+      workflowRunId: run.id,
+      eventType: "workflow.node.merged",
+      payload: { nodeId: "node-target" }
     });
+    const afterNodeMerge = listWorkflowStageRunsByRun(db, run.id);
+    const gateRunning = afterNodeMerge.find((stage) => stage.id === gate.id)!;
+    assert.equal(gateRunning.status, "running");
+    const mergedChecks = listWorkflowCheckResultsByStageRun(db, gate.id);
+    assert.equal(mergedChecks.some((row) => row.check_name === "wait-build" && row.status === "pass"), true);
+    assert.equal(mergedChecks.some((row) => row.check_name === "wait-node-merge" && row.status === "pass"), true);
 
-    insertTaskRow(db, {
-      id: "child-1",
-      projectId: "project-1",
-      userId: "user-1",
-      parent_plan_task_id: parent.id,
-      mode: "execution",
-      metadata_json: JSON.stringify({ schema_version: 1, tier: "exec" }),
-      status: "in_progress"
-    });
-    tickWorkflowRun({ db, workflowRunId: runId });
-    const blockedWait = listWorkflowEventsByStageRun(db, wait.id)
-      .filter((event) => event.event_type === "workflow.stage.lifecycle")
-      .map((event) => JSON.parse(event.payload));
-    assert.equal(blockedWait.some((event) => event.state === "blocked"), true);
-
-    db.prepare("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = 'child-1'").run(nowIso());
-    tickWorkflowRun({ db, workflowRunId: runId });
-    const afterMerged = listWorkflowStageRunsByRun(db, runId);
-    assert.equal(afterMerged.find((row) => row.id === wait.id)?.status, "running");
     db.close();
   });
 });
