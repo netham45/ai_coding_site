@@ -1,0 +1,98 @@
+tasks:
+  - id: baseline-behavior-audit
+    title: Confirm and document the pre-regression orchestration paradigm
+    item_type: execution_task
+    prompt: |
+      Audit the existing implementation and recent regressions to lock the target behavior:
+      - non-exec node start triggers AI runtime session
+      - runtime writes YAML artifact
+      - user reads YAML and explicitly extracts/approves to materialize children
+      - no deterministic mirrored child auto-creation
+      Deliverable: short behavior matrix (expected vs current) with file-level references.
+
+  - id: remove-deterministic-decompose-regression
+    title: Eliminate deterministic mirrored child creation from decompose flow
+    item_type: execution_task
+    depends_on:
+      - baseline-behavior-audit
+    prompt: |
+      Remove regression logic that hardcodes one child per tier and mirrored titles.
+      Ensure decompose no longer synthesizes placeholder children directly.
+
+  - id: restore-start-to-runtime-for-non-exec
+    title: Reconcile start semantics with prior runtime-driven decomposition
+    item_type: execution_task
+    depends_on:
+      - remove-deterministic-decompose-regression
+    prompt: |
+      Ensure non-exec start path (API + CLI) triggers runtime AI session for decomposition.
+      Exec tier keeps normal execution start behavior.
+      No decomposition side-effect should occur on node creation alone.
+
+  - id: restore-yaml-artifact-contract
+    title: Reinstate YAML-first decomposition artifact workflow
+    item_type: execution_task
+    depends_on:
+      - restore-start-to-runtime-for-non-exec
+    prompt: |
+      Restore artifact path and output contract so decomposition emits YAML that users can inspect.
+      Keep explicit extract/approve step as the materialization gate.
+      Validate YAML contract errors are surfaced clearly.
+
+  - id: align-prompt-routing
+    title: Reconcile tier prompt selection with decomposition templates
+    item_type: execution_task
+    depends_on:
+      - restore-yaml-artifact-contract
+    prompt: |
+      Ensure decomposition jobs use intended tier decomposition prompts
+      (epoch->phases, phase->plans, plan->subplans/tasks, task->exec tasks),
+      and do not route decomposition through execution-only templates.
+
+  - id: preserve-existing-plan-paradigm
+    title: Reuse existing extract/approve machinery instead of introducing new orchestration model
+    item_type: execution_task
+    depends_on:
+      - align-prompt-routing
+    prompt: |
+      Reuse current parser/extract/approve pipeline and only patch regressions.
+      Avoid introducing net-new orchestration system behavior outside intended paradigm.
+
+  - id: replace-regression-tests
+    title: Update tests to enforce prior working behavior and reject deterministic fallback
+    item_type: execution_task
+    depends_on:
+      - preserve-existing-plan-paradigm
+    prompt: |
+      Replace tests that currently expect deterministic tier-chain child generation.
+      Add tests for:
+      - start triggers runtime session for non-exec
+      - YAML artifact is generated and readable
+      - extract shows proposed children from YAML
+      - approve creates children from YAML
+      - no mirrored placeholder child is auto-created.
+
+  - id: cli-parity-tests
+    title: Enforce API/CLI parity for start and YAML decomposition workflow
+    item_type: execution_task
+    depends_on:
+      - replace-regression-tests
+    prompt: |
+      Add CLI integration coverage proving same behavior as API:
+      - node start launches runtime decomposition session
+      - decomposition output is inspectable
+      - extract/approve lifecycle behaves identically.
+      Ensure tests assert real side effects (DB/events/artifacts), not no-op outputs.
+
+  - id: final-acceptance-gates
+    title: Define hard acceptance gates for merge
+    item_type: execution_task
+    depends_on:
+      - cli-parity-tests
+    prompt: |
+      Merge only if all gates pass:
+      - no deterministic mirrored child creation path remains
+      - non-exec start is runtime/YAML-driven
+      - extract/approve flow works end-to-end
+      - API and CLI parity tests pass
+      - regression suite prevents reintroduction.
