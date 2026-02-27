@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { WorkflowRunRow, WorkflowStageRunRow } from "../types.js";
+import fs from "node:fs";
+import path from "node:path";
+import type { TaskRow, WorkflowRunRow, WorkflowStageRunRow } from "../types.js";
 import {
   createWorkflowEvent,
   createWorkflowStageRun,
@@ -11,6 +14,8 @@ import {
   transitionWorkflowRunStatus,
   transitionWorkflowStageRunStatus
 } from "./workflowRepository.js";
+import type { DeterministicWorkflowCheck } from "./workflowChecks.js";
+import { runDeterministicChecksForStageRun } from "./workflowChecks.js";
 
 export type WorkflowStageLifecycleState = "blocked" | "ready" | "running" | "waiting_input" | "verifying";
 
@@ -18,6 +23,7 @@ export type WorkflowEngineStageDefinition = {
   key: string;
   dependsOn: string[];
   maxAttempts: number;
+  expectedResults: DeterministicWorkflowCheck[];
 };
 
 export type WorkflowEngineHandleEventInput = {
@@ -76,6 +82,113 @@ function normalizeMaxAttempts(raw: unknown): number {
   return 1;
 }
 
+function normalizeExpectedResults(raw: unknown): DeterministicWorkflowCheck[] {
+  if (!Array.isArray(raw)) return [];
+  const checks: DeterministicWorkflowCheck[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const type = typeof row.type === "string" ? row.type : "";
+    const name = typeof row.name === "string" ? row.name : "";
+    if (!type || !name) continue;
+
+    if (type === "file_created" && typeof row.relativePath === "string") {
+      checks.push({
+        type,
+        name,
+        relativePath: row.relativePath,
+        baselineExists: typeof row.baselineExists === "boolean" ? row.baselineExists : undefined,
+        since: typeof row.since === "string" ? row.since : undefined
+      });
+      continue;
+    }
+    if (type === "file_exists" && typeof row.relativePath === "string") {
+      checks.push({
+        type,
+        name,
+        relativePath: row.relativePath
+      });
+      continue;
+    }
+    if (type === "file_modified_within" && typeof row.relativePath === "string" && typeof row.withinSeconds === "number") {
+      checks.push({
+        type,
+        name,
+        relativePath: row.relativePath,
+        withinSeconds: row.withinSeconds,
+        now: typeof row.now === "string" ? row.now : undefined
+      });
+      continue;
+    }
+    if (type === "line_present_in_file" && typeof row.relativePath === "string" && typeof row.line === "string") {
+      checks.push({
+        type,
+        name,
+        relativePath: row.relativePath,
+        line: row.line,
+        caseSensitive: typeof row.caseSensitive === "boolean" ? row.caseSensitive : undefined
+      });
+      continue;
+    }
+    if (type === "json_path_equals" && typeof row.relativePath === "string" && typeof row.jsonPath === "string") {
+      checks.push({
+        type,
+        name,
+        relativePath: row.relativePath,
+        jsonPath: row.jsonPath,
+        expected: row.expected
+      });
+      continue;
+    }
+    if (
+      type === "command_exit_code" &&
+      Array.isArray(row.command) &&
+      row.command.every((entry) => typeof entry === "string") &&
+      typeof row.expectedExitCode === "number"
+    ) {
+      checks.push({
+        type,
+        name,
+        command: row.command as string[],
+        expectedExitCode: row.expectedExitCode,
+        cwdRelative: typeof row.cwdRelative === "string" ? row.cwdRelative : undefined,
+        timeoutMs: typeof row.timeoutMs === "number" ? row.timeoutMs : undefined
+      });
+      continue;
+    }
+    if (type === "stage_complete" && typeof row.stageRunId === "string") {
+      checks.push({
+        type,
+        name,
+        stageRunId: row.stageRunId,
+        expectedStatus:
+          row.expectedStatus === "succeeded" || row.expectedStatus === "failed" || row.expectedStatus === "skipped" || row.expectedStatus === "cancelled"
+            ? row.expectedStatus
+            : undefined
+      });
+      continue;
+    }
+    if (type === "node_merged" && typeof row.nodeId === "string") {
+      checks.push({
+        type,
+        name,
+        nodeId: row.nodeId
+      });
+      continue;
+    }
+    if (type === "child_nodes_created_count" && typeof row.parentNodeId === "string" && typeof row.expectedCount === "number") {
+      checks.push({
+        type,
+        name,
+        parentNodeId: row.parentNodeId,
+        expectedCount: row.expectedCount,
+        comparator: row.comparator === "gte" || row.comparator === "lte" || row.comparator === "eq" ? row.comparator : undefined
+      });
+    }
+  }
+  return checks;
+}
+
 function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefinition[] {
   const asJson = safeParseJson(definitionYaml);
   if (asJson && typeof asJson === "object" && Array.isArray((asJson as { stages?: unknown[] }).stages)) {
@@ -88,7 +201,8 @@ function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefin
         return {
           key,
           dependsOn: normalizeDependsOn(row.depends_on ?? row.dependsOn),
-          maxAttempts: normalizeMaxAttempts(row.max_attempts ?? row.maxAttempts)
+          maxAttempts: normalizeMaxAttempts(row.max_attempts ?? row.maxAttempts),
+          expectedResults: normalizeExpectedResults(row.expected_results ?? row.expectedResults)
         } satisfies WorkflowEngineStageDefinition;
       })
       .filter((entry): entry is WorkflowEngineStageDefinition => Boolean(entry));
@@ -108,7 +222,7 @@ function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefin
     }
     if (line.startsWith("- ")) {
       if (current && current.key) out.push(current);
-      current = { key: "", dependsOn: [], maxAttempts: 1 };
+      current = { key: "", dependsOn: [], maxAttempts: 1, expectedResults: [] };
       const content = line.slice(2).trim();
       if (content.startsWith("id:")) current.key = content.slice(3).trim();
       if (content.startsWith("key:")) current.key = content.slice(4).trim();
@@ -140,10 +254,136 @@ function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefin
       current.maxAttempts = normalizeMaxAttempts(line.slice("maxAttempts:".length).trim());
       continue;
     }
+    if (line.startsWith("expected_results:")) {
+      current.expectedResults = normalizeExpectedResults(safeParseJson(line.slice("expected_results:".length).trim()));
+      continue;
+    }
+    if (line.startsWith("expectedResults:")) {
+      current.expectedResults = normalizeExpectedResults(safeParseJson(line.slice("expectedResults:".length).trim()));
+      continue;
+    }
   }
 
   if (current && current.key) out.push(current);
   return out;
+}
+
+function getRunWorkspacePath(db: Database.Database, run: WorkflowRunRow): string {
+  if (!run.task_id) return process.cwd();
+  const row = db.prepare("SELECT workspace_path AS workspacePath FROM tasks WHERE id = ? LIMIT 1").get(run.task_id) as
+    | { workspacePath: string }
+    | undefined;
+  return row?.workspacePath ?? process.cwd();
+}
+
+function maybeEmitRuntimeInputFeedback(
+  db: Database.Database,
+  params: {
+    workflowRunId: string;
+    stageRunId: string;
+    failedChecks: Array<{ checkName: string; status: string; details: Record<string, unknown> }>;
+  }
+): boolean {
+  if (params.failedChecks.length === 0) return false;
+  const digest = createHash("sha256").update(JSON.stringify(params.failedChecks)).digest("hex");
+  if (
+    hasDuplicateEventByIdempotency(db, {
+      stageRunId: params.stageRunId,
+      eventType: "workflow.stage.runtime_input.required",
+      idempotencyKey: digest
+    })
+  ) {
+    return false;
+  }
+  createWorkflowEvent(db, {
+    workflowRunId: params.workflowRunId,
+    workflowStageRunId: params.stageRunId,
+    eventType: "workflow.stage.runtime_input.required",
+    payload: {
+      source: "expected_results",
+      idempotencyKey: digest,
+      feedback: params.failedChecks.map((check) => ({
+        check: check.checkName,
+        reason: `Check '${check.checkName}' returned ${check.status}`,
+        details: check.details
+      }))
+    }
+  });
+  return true;
+}
+
+function evaluateExpectedResultsOnTick(
+  db: Database.Database,
+  params: {
+    run: WorkflowRunRow;
+    stageRun: WorkflowStageRunRow;
+    stageDefinition: WorkflowEngineStageDefinition | undefined;
+  }
+): { progressed: boolean; stageCompleted: boolean } {
+  const expectedResults = params.stageDefinition?.expectedResults ?? [];
+  if (expectedResults.length === 0) return { progressed: false, stageCompleted: false };
+
+  const lifecycle = latestLifecycleState(db, params.stageRun.id);
+  const shouldEvaluate = lifecycle === "waiting_input";
+  if (!shouldEvaluate) return { progressed: false, stageCompleted: false };
+
+  const progressedToVerifying = createLifecycleEventIfChanged(db, {
+    workflowRunId: params.run.id,
+    stageRunId: params.stageRun.id,
+    state: "verifying",
+    reason: "expected_results_idle_evaluation"
+  });
+
+  const result = runDeterministicChecksForStageRun({
+    db,
+    workflowStageRunId: params.stageRun.id,
+    workspacePath: getRunWorkspacePath(db, params.run),
+    checks: expectedResults
+  });
+
+  if (result.allPassed) {
+    createWorkflowEvent(db, {
+      workflowRunId: params.run.id,
+      workflowStageRunId: params.stageRun.id,
+      eventType: "workflow.stage.verify_succeeded",
+      payload: {
+        source: "expected_results",
+        checkCount: result.checkResults.length
+      }
+    });
+    transitionWorkflowStageRunStatus(db, {
+      stageRunId: params.stageRun.id,
+      toStatus: "succeeded",
+      reason: "expected_results_passed"
+    });
+    return { progressed: true, stageCompleted: true };
+  }
+
+  const failedChecks = result.checkResults
+    .filter((check) => check.status !== "pass")
+    .map((check) => ({
+      checkName: check.check_name,
+      status: check.status,
+      details: safeParseJson(check.details_json) as Record<string, unknown>
+    }));
+  const emittedFeedback = maybeEmitRuntimeInputFeedback(db, {
+    workflowRunId: params.run.id,
+    stageRunId: params.stageRun.id,
+    failedChecks
+  });
+  const movedToWaiting = createLifecycleEventIfChanged(db, {
+    workflowRunId: params.run.id,
+    stageRunId: params.stageRun.id,
+    state: "waiting_input",
+    reason: "expected_results_failed",
+    extra: {
+      failedChecks: failedChecks.map((check) => check.checkName)
+    }
+  });
+  return {
+    progressed: progressedToVerifying || emittedFeedback || movedToWaiting,
+    stageCompleted: false
+  };
 }
 
 function latestLifecycleState(db: Database.Database, stageRunId: string): WorkflowStageLifecycleState | null {
@@ -168,6 +408,41 @@ function stageAttemptCount(db: Database.Database, stageRunId: string): number {
 
 function stageDefinitionByKey(definitions: WorkflowEngineStageDefinition[]): Map<string, WorkflowEngineStageDefinition> {
   return new Map(definitions.map((row) => [row.key, row]));
+}
+
+function workflowTask(db: Database.Database, run: WorkflowRunRow): TaskRow | null {
+  if (!run.task_id) return null;
+  return db.prepare("SELECT * FROM tasks WHERE id = ? LIMIT 1").get(run.task_id) as TaskRow | null;
+}
+
+function planYamlExists(task: TaskRow): boolean {
+  const yamlPath = path.join(task.workspace_path, ".ai-plan", "latest-plan.yaml");
+  try {
+    const content = fs.readFileSync(yamlPath, "utf8").trim();
+    return content.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function unresolvedStageRules(db: Database.Database, run: WorkflowRunRow, stageKey: string): string[] {
+  if (!run.task_id) return [];
+  const task = workflowTask(db, run);
+  if (!task) {
+    return ["missing_parent_task"];
+  }
+  if (stageKey === "ingest_child_nodes" && !planYamlExists(task)) {
+    return ["missing_plan_yaml"];
+  }
+  if (stageKey === "wait_for_child_completion") {
+    const unresolved = db
+      .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' ORDER BY created_at ASC")
+      .all(task.id) as Array<{ id: string }>;
+    if (unresolved.length > 0) {
+      return unresolved.map((row) => `child_not_merged:${row.id}`);
+    }
+  }
+  return [];
 }
 
 function createLifecycleEventIfChanged(
@@ -281,25 +556,39 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
 
   const currentlyRunning = stageRuns.find((stage) => stage.status === "running");
   if (currentlyRunning) {
+    const evaluation = evaluateExpectedResultsOnTick(params.db, {
+      run,
+      stageRun: currentlyRunning,
+      stageDefinition: definitionsByKey.get(currentlyRunning.stage_key)
+    });
+    if (evaluation.stageCompleted) {
+      const continued = tickWorkflowRun({ db: params.db, workflowRunId: run.id });
+      return {
+        run: continued.run,
+        progressed: evaluation.progressed || continued.progressed
+      };
+    }
+
     let gatedStateChanged = false;
     for (const pending of stageRuns.filter((stage) => stage.status === "pending")) {
       const definitionForStage = definitionsByKey.get(pending.stage_key);
       const deps = definitionForStage?.dependsOn ?? [];
       const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-      if (unresolved.length === 0) continue;
+      const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
+      if (unresolved.length === 0 && unresolvedRules.length === 0) continue;
       if (
         createLifecycleEventIfChanged(params.db, {
           workflowRunId: run.id,
           stageRunId: pending.id,
           state: "blocked",
           reason: "dependency_gate",
-          extra: { unresolvedDependsOn: unresolved }
+          extra: { unresolvedDependsOn: unresolved, unresolvedStageRules: unresolvedRules }
         })
       ) {
         gatedStateChanged = true;
       }
     }
-    return { run: getWorkflowRunById(params.db, run.id)!, progressed: gatedStateChanged };
+    return { run: getWorkflowRunById(params.db, run.id)!, progressed: gatedStateChanged || evaluation.progressed };
   }
 
   const hasFailedStage = stageRuns.some((stage) => stage.status === "failed");
@@ -327,14 +616,15 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const definitionForStage = definitionsByKey.get(pending.stage_key);
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-    if (unresolved.length === 0) continue;
+    const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
+    if (unresolved.length === 0 && unresolvedRules.length === 0) continue;
     if (
       createLifecycleEventIfChanged(params.db, {
         workflowRunId: run.id,
         stageRunId: pending.id,
         state: "blocked",
         reason: "dependency_gate",
-        extra: { unresolvedDependsOn: unresolved }
+        extra: { unresolvedDependsOn: unresolved, unresolvedStageRules: unresolvedRules }
       })
     ) {
       progressed = true;
@@ -345,7 +635,8 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const definitionForStage = definitionsByKey.get(pending.stage_key);
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-    if (unresolved.length > 0) continue;
+    const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
+    if (unresolved.length > 0 || unresolvedRules.length > 0) continue;
 
     createLifecycleEventIfChanged(params.db, {
       workflowRunId: run.id,
