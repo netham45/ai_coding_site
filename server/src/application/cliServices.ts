@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { db as appDb, isProjectDbError, resolveProjectDatabase } from "../db/index.js";
+import { ensureDefaultExecWorkflowForTask } from "../services/defaultExecWorkflow.js";
 import { recordEvent } from "../services/events.js";
 import {
   cloneLocalBaseToWorkspace,
@@ -2625,6 +2626,15 @@ export async function approvePlan(params: {
       }
     }
   })();
+  for (const row of taskRows) {
+    if (row.mode !== "execution") continue;
+    await ensureDefaultExecWorkflowForTask({
+      db: projectDb,
+      projectId: project.id,
+      taskId: row.taskId,
+      createdByUserId: params.userId
+    });
+  }
   markPlanLifecycleFlags(projectDb, plan, {
     synthesisPassed: true,
     verificationPassed: true,

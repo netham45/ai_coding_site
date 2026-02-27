@@ -5,6 +5,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db as appDb, isProjectDbError, resolveProjectDatabase } from "../db/index.js";
 import { recordEvent } from "../services/events.js";
+import { ensureDefaultExecWorkflowForTask } from "../services/defaultExecWorkflow.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
@@ -1168,6 +1169,16 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       }
     }
   })();
+
+  for (const row of taskRows) {
+    if (row.mode !== "execution") continue;
+    await ensureDefaultExecWorkflowForTask({
+      db: projectDb,
+      projectId: project.id,
+      taskId: row.taskId,
+      createdByUserId: req.user.id
+    });
+  }
 
   recordEvent({
     projectId: project.id,
