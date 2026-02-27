@@ -3,14 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "../utils/time.js";
 import { logWarn } from "../utils/structuredLog.js";
-import { backfillDefaultWorkflowsForExistingTasks } from "../services/workflowBackfill.js";
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./migrations.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { assertTestSafeSqlitePath, openSqliteDatabase } from "./sqlite.js";
 
 export const PROJECT_DB_DIRNAME = ".ai-coding";
 export const PROJECT_DB_FILENAME = "project.sqlite";
-export const PROJECT_DB_SCHEMA_VERSION = 4;
+export const PROJECT_DB_SCHEMA_VERSION = 3;
 
 export type ProjectDbErrorCode = "PROJECT_DB_UNAVAILABLE" | "PROJECT_DB_CORRUPT";
 
@@ -251,10 +250,6 @@ function upgradeProjectDbToV3(db: Database.Database): void {
   db.exec("CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at ON workflow_events(created_at)");
 }
 
-function upgradeProjectDbToV4(db: Database.Database): void {
-  backfillDefaultWorkflowsForExistingTasks({ db });
-}
-
 function syncProjectMetadataSchemaVersion(db: Database.Database): void {
   if (!tableExists(db, "project_metadata")) {
     return;
@@ -275,10 +270,6 @@ function runProjectMigrationsIfNeeded(db: Database.Database): void {
   if (userVersion < 3) {
     upgradeProjectDbToV3(db);
     db.pragma("user_version = 3");
-  }
-  if (userVersion < 4) {
-    upgradeProjectDbToV4(db);
-    db.pragma("user_version = 4");
   }
   syncProjectMetadataSchemaVersion(db);
 }

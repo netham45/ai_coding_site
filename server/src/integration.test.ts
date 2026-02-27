@@ -494,11 +494,11 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.equal(tableExists(upgraded, "workflow_stage_runs"), true);
     assert.equal(tableExists(upgraded, "workflow_check_results"), true);
     assert.equal(tableExists(upgraded, "workflow_events"), true);
-    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 4);
+    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 3);
     const projectMetadata = upgraded
       .prepare("SELECT schema_version FROM project_metadata WHERE project_id = ?")
       .get(projectId) as { schema_version: number };
-    assert.equal(projectMetadata.schema_version, 4);
+    assert.equal(projectMetadata.schema_version, 3);
   });
 
   test("tasks metadata migration rolls back cleanly on transaction failure", () => {
@@ -2756,7 +2756,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     startHierarchicalOrchestrationJobs();
   });
 
-  test("start routes planning tiers through workflow runs and extract surfaces YAML proposed children", async () => {
+  test("start triggers runtime session for non-exec and extract surfaces YAML proposed children", async () => {
     const userId = createUser();
     const basePath = randomPath("runtime-decompose-session");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
@@ -2790,12 +2790,9 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     const started = await startNode({ userId, nodeId: planId, autoMode: true });
     assert.equal(started.tier, "phase");
 
-    const workflowRun = projectDb
-      .prepare("SELECT status FROM workflow_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
-      .get(planId) as { status: string } | undefined;
-    assert.equal(workflowRun?.status, "running");
-
-    const seededPlanYaml = [
+    const sessionId = await waitForLatestSessionId(projectDb, planId);
+    const runtimeYaml = [
+      "```yaml",
       "tasks:",
       "  - id: build_exec",
       "    title: Build execution task",
@@ -2805,17 +2802,17 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       "    title: Follow-up plan",
       "    prompt: Plan remaining work",
       "    depends_on: [build_exec]",
+      "```",
       ""
     ].join("\n");
-    const planArtifact = path.join(plan.workspace_path, ".ai-plan", "latest-plan.yaml");
-    fs.mkdirSync(path.dirname(planArtifact), { recursive: true });
-    fs.writeFileSync(planArtifact, seededPlanYaml, "utf8");
+    projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(runtimeYaml, nowIso(), sessionId);
 
     const extracted = await extractPlan({ userId, planId });
     assert.equal(extracted.ok, true);
-    assert.equal(extracted.source, "file");
+    assert.equal(extracted.source, "session_output");
     assert.equal(extracted.tasksExtracted, 2);
 
+    const planArtifact = path.join(plan.workspace_path, ".ai-plan", "latest-plan.yaml");
     assert.equal(fs.existsSync(planArtifact), true);
     const artifactYaml = fs.readFileSync(planArtifact, "utf8");
     assert.equal(artifactYaml.includes("id: build_exec"), true);
@@ -2830,11 +2827,9 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     );
 
     const manualStartEvent = projectDb
-      .prepare("SELECT event_type, payload FROM events WHERE task_id = ? AND event_type = 'orchestration.manual_start' LIMIT 1")
-      .get(planId) as { event_type: string; payload: string } | undefined;
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'orchestration.manual_start' LIMIT 1")
+      .get(planId) as { event_type: string } | undefined;
     assert.equal(manualStartEvent?.event_type, "orchestration.manual_start");
-    const manualStartPayload = manualStartEvent?.payload ? (JSON.parse(manualStartEvent.payload) as { strategy?: string }) : null;
-    assert.equal(manualStartPayload?.strategy, "workflow_engine");
   });
 
   test("approve creates children from extracted YAML without mirrored placeholder children", async () => {
@@ -2868,7 +2863,9 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     );
 
     await startNode({ userId, nodeId: planId, autoMode: true });
-    const seededPlanYaml = [
+    const sessionId = await waitForLatestSessionId(projectDb, planId);
+    const runtimeYaml = [
+      "```yaml",
       "tasks:",
       "  - id: implement_feature",
       "    title: Implement feature",
@@ -2877,11 +2874,10 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       "    title: Validate feature",
       "    prompt: Test the feature",
       "    depends_on: [implement_feature]",
+      "```",
       ""
     ].join("\n");
-    const planArtifact = path.join(plan.workspace_path, ".ai-plan", "latest-plan.yaml");
-    fs.mkdirSync(path.dirname(planArtifact), { recursive: true });
-    fs.writeFileSync(planArtifact, seededPlanYaml, "utf8");
+    projectDb.prepare("UPDATE task_sessions SET last_output = ?, last_heartbeat_at = ? WHERE id = ?").run(runtimeYaml, nowIso(), sessionId);
 
     const extracted = await extractPlan({ userId, planId });
     assert.equal(extracted.ok, true);

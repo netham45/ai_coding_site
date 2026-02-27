@@ -98,6 +98,10 @@ export type Task = {
   autoMerge: boolean;
   autoStart: boolean;
   autoMergeOnComplete: boolean;
+  nodeMetadata?: {
+    tier?: NodeTier;
+    custom?: Record<string, unknown>;
+  };
   mode: TaskMode;
   parentPlanTaskId: string | null;
   sourcePlanRevisionId: string | null;
@@ -116,6 +120,77 @@ export type Task = {
   createdByUserId: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type WorkflowStageStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
+export type WorkflowCheckStatus = "pass" | "fail" | "error";
+export type WorkflowLifecycleState = "blocked" | "ready" | "running" | "waiting_input" | "verifying" | null;
+
+export type WorkflowDefinition = {
+  id: string;
+  projectId: string;
+  name: string;
+  version: number;
+  definitionYaml: string;
+  createdByUserId: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WorkflowEvent = {
+  id: string;
+  eventType: string;
+  payload: unknown;
+  createdAt: string;
+};
+
+export type WorkflowCheckResult = {
+  id: string;
+  stageRunId: string;
+  checkName: string;
+  status: WorkflowCheckStatus;
+  details: unknown;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WorkflowStageDiagnostics = {
+  lifecycleState: WorkflowLifecycleState;
+  attemptsStarted: number;
+  blockedBy: string[];
+  checks: WorkflowCheckResult[];
+  recentEvents: WorkflowEvent[];
+};
+
+export type WorkflowStageState = {
+  id: string;
+  workflowRunId: string;
+  stageKey: string;
+  ordinal: number;
+  status: WorkflowStageStatus;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  diagnostics: WorkflowStageDiagnostics;
+};
+
+export type WorkflowRunState = {
+  run: {
+    id: string;
+    workflowDefinitionId: string;
+    projectId: string;
+    taskId: string | null;
+    status: WorkflowRunStatus;
+    startedAt: string | null;
+    completedAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+  };
+  definition: WorkflowDefinition;
+  stages: WorkflowStageState[];
+  events: WorkflowEvent[];
 };
 
 export type NodeDependencyRef = {

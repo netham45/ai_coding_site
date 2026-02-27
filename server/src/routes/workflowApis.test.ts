@@ -253,4 +253,48 @@ describe("workflow APIs", () => {
     assert.equal(Array.isArray(status.json?.workflow?.stages), true);
     assert.equal(typeof status.json?.workflow?.stages?.[0]?.diagnostics?.attemptsStarted, "number");
   });
+
+  test("node workflow assignment can be set to custom definition", async () => {
+    const userId = createUser();
+    const basePath = randomPath("workflow-api-assignment");
+    const projectId = createProject({ userId, basePath });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan Node",
+      status: "queued"
+    });
+    projectDb.prepare("UPDATE tasks SET mode = 'plan' WHERE id = ?").run(taskId);
+
+    const createDefinition = await callApi(`/api/projects/${projectId}/workflow-definitions`, {
+      method: "POST",
+      userId,
+      body: {
+        name: "custom-plan",
+        version: 1,
+        definitionYaml: "version: 1\nstages:\n  - id: custom"
+      }
+    });
+    assert.equal(createDefinition.status, 201);
+    const definitionId = createDefinition.json?.definition?.id as string;
+
+    const assign = await callApi(`/api/nodes/${taskId}/workflow-assignment`, {
+      method: "POST",
+      userId,
+      body: {
+        mode: "custom",
+        workflowDefinitionId: definitionId
+      }
+    });
+    assert.equal(assign.status, 200);
+    assert.equal(assign.json?.workflowAssignment?.mode, "custom");
+    assert.equal(assign.json?.workflowAssignment?.workflowDefinitionId, definitionId);
+
+    const taskDetail = await callApi(`/api/tasks/${taskId}`, { userId });
+    assert.equal(taskDetail.status, 200);
+    assert.equal(taskDetail.json?.task?.nodeMetadata?.custom?.workflow_assignment?.mode, "custom");
+    assert.equal(taskDetail.json?.task?.nodeMetadata?.custom?.workflow_assignment?.workflow_definition_id, definitionId);
+  });
 });
