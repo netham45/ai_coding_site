@@ -23,7 +23,7 @@ stages:
     max_attempts: 1
 `;
 
-function builtinWorkflowNameForTier(tier: BuiltinWorkflowTier): string {
+export function builtinWorkflowNameForTier(tier: BuiltinWorkflowTier): string {
   return `builtin.${tier}.workflow`;
 }
 
@@ -60,6 +60,15 @@ function ensureBuiltinDefinition(params: {
     definitionYaml: BUILTIN_WORKFLOW_DEFINITION_YAML,
     createdByUserId: params.createdByUserId
   });
+}
+
+export function ensureBuiltinWorkflowDefinitionForTier(params: {
+  db: Database.Database;
+  projectId: string;
+  tier: BuiltinWorkflowTier;
+  createdByUserId: string;
+}): WorkflowDefinitionRow {
+  return ensureBuiltinDefinition(params);
 }
 
 function activeWorkflowRunForTask(db: Database.Database, taskId: string): WorkflowRunRow | undefined {
