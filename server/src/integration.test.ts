@@ -2649,7 +2649,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     startHierarchicalOrchestrationJobs();
   });
 
-  test("decompose auto-mode derives missing lower tiers from epoch", async () => {
+  test("decompose does not synthesize placeholder descendants from epoch", async () => {
     const userId = createUser();
     const basePath = randomPath("decompose-epoch");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
@@ -2676,27 +2676,13 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
       autoMode: true
     });
 
-    const children = projectDb
-      .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
-      .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
-    const tiers = children
-      .map((row) => {
-        try {
-          return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
-        } catch {
-          return undefined;
-        }
-      })
-      .filter((tier): tier is string => Boolean(tier));
-
-    assert.ok(tiers.includes("epoch"));
-    assert.ok(tiers.includes("phase"));
-    assert.ok(tiers.includes("plan"));
-    assert.ok(tiers.includes("task"));
-    assert.ok(tiers.includes("exec"));
+    const childrenCount = projectDb
+      .prepare("SELECT COUNT(1) as count FROM tasks WHERE parent_plan_task_id = ?")
+      .get(epochId) as { count: number };
+    assert.equal(childrenCount.count, 0);
   });
 
-  test("decompose auto-mode derives only lower tiers from phase/plan/task starts", async () => {
+  test("decompose does not synthesize placeholder descendants from phase/plan/task starts", async () => {
     const fixtures: Array<{ tier: "phase" | "plan" | "task"; mode: "plan" | "execution"; expected: string[] }> = [
       { tier: "phase", mode: "plan", expected: ["plan", "task", "exec"] },
       { tier: "plan", mode: "plan", expected: ["task", "exec"] },
@@ -2728,36 +2714,10 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         taskId: rootId,
         autoMode: true
       });
-      const root = projectDb
-        .prepare("SELECT * FROM tasks WHERE title = ? ORDER BY created_at DESC LIMIT 1")
-        .get(`Root ${fixture.tier}`) as TaskRow;
-      const all = projectDb
-        .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
-        .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
-      const descendants: Array<{ metadata_json: string | null }> = [];
-      const queue = [root.id];
-      while (queue.length > 0) {
-        const parentId = queue.shift() as string;
-        const children = all.filter((row) => row.parent_plan_task_id === parentId);
-        for (const child of children) {
-          descendants.push({ metadata_json: child.metadata_json });
-          queue.push(child.id);
-        }
-      }
-      const tiers = new Set(
-        descendants
-          .map((row) => {
-            try {
-              return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
-            } catch {
-              return undefined;
-            }
-          })
-          .filter((value): value is string => Boolean(value))
-      );
-      for (const expectedTier of fixture.expected) {
-        assert.equal(tiers.has(expectedTier), true, `missing ${expectedTier} for ${fixture.tier}`);
-      }
+      const childrenCount = projectDb
+        .prepare("SELECT COUNT(1) as count FROM tasks WHERE parent_plan_task_id = ?")
+        .get(rootId) as { count: number };
+      assert.equal(childrenCount.count, 0, `unexpected synthesized child for ${fixture.tier}`);
     }
   });
 
