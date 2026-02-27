@@ -23,8 +23,8 @@ import {
 } from "@chakra-ui/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
-import { api, createNode, getDependencyGraph, getHierarchy } from "../api/client";
-import type { DependencyGraphEdge, DependencyGraphNode, HierarchyNode, HierarchyNodeRow, NodeTier, Project, Task, UserSettings } from "../api/types";
+import { api, createNode, getHierarchy } from "../api/client";
+import type { HierarchyNode, HierarchyNodeRow, NodeTier, Project, Task, UserSettings } from "../api/types";
 import { NodeCreateForm } from "../components/NodeCreateForm";
 import { OrchestrationTree } from "../components/OrchestrationTree";
 
@@ -61,8 +61,6 @@ export function ProjectDetailPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [hierarchyRoots, setHierarchyRoots] = useState<HierarchyNode[]>([]);
   const [hierarchyNodes, setHierarchyNodes] = useState<HierarchyNodeRow[]>([]);
-  const [dependencyGraphNodes, setDependencyGraphNodes] = useState<DependencyGraphNode[]>([]);
-  const [dependencyGraphEdges, setDependencyGraphEdges] = useState<DependencyGraphEdge[]>([]);
   const [taskAiCommandOptions, setTaskAiCommandOptions] = useState<string[]>(["codex --yolo {prompt}"]);
   const [instructionsForm, setInstructionsForm] = useState<ProjectInstructionsForm>({
     projectPrompt: "",
@@ -102,40 +100,14 @@ export function ProjectDetailPage() {
   );
 
   const nodeOptions = useMemo(() => {
-    const unresolvedByNodeId = new Map<string, number>();
-    for (const edge of dependencyGraphEdges) {
-      if (!edge.unresolved) continue;
-      unresolvedByNodeId.set(edge.fromId, (unresolvedByNodeId.get(edge.fromId) ?? 0) + 1);
-    }
-
-    const byId = new Map(
-      hierarchyRows.map((row) => [
-        row.task.id,
-        {
-          id: row.task.id,
-          title: row.task.title,
-          tier: row.tier,
-          status: row.task.status,
-          isBlocked: row.task.isBlocked || row.waiting.waiting,
-          unresolvedDependencyCount: row.waiting.unresolvedDependencyDetails.length || unresolvedByNodeId.get(row.task.id) || 0
-        }
-      ])
-    );
-
-    for (const node of dependencyGraphNodes) {
-      if (byId.has(node.id)) continue;
-      byId.set(node.id, {
-        id: node.id,
-        title: node.title,
-        tier: node.tier,
-        status: node.status,
-        isBlocked: unresolvedByNodeId.has(node.id),
-        unresolvedDependencyCount: unresolvedByNodeId.get(node.id) ?? 0
-      });
-    }
-
-    return Array.from(byId.values());
-  }, [dependencyGraphEdges, dependencyGraphNodes, hierarchyRows]);
+    return hierarchyRows.map((row) => ({
+      id: row.task.id,
+      title: row.task.title,
+      tier: row.tier,
+      status: row.task.status,
+      isBlocked: row.task.isBlocked
+    }));
+  }, [hierarchyRows]);
 
   const nodeTierById = useMemo(() => new Map(nodeOptions.map((node) => [node.id, node.tier])), [nodeOptions]);
 
@@ -146,12 +118,11 @@ export function ProjectDetailPage() {
 
   async function loadData() {
     if (!projectId) return;
-    const [projectRes, tasksRes, settingsRes, hierarchyRes, dependencyGraphRes] = await Promise.all([
+    const [projectRes, tasksRes, settingsRes, hierarchyRes] = await Promise.all([
       api<ProjectResponse>(`/api/projects/${projectId}`),
       api<TasksResponse>(`/api/projects/${projectId}/tasks`),
       api<SettingsResponse>("/api/users/me/settings"),
-      getHierarchy(projectId).catch(() => null),
-      getDependencyGraph(projectId).catch(() => null)
+      getHierarchy(projectId).catch(() => null)
     ]);
     setProject(projectRes.project);
     setInstructionsForm({
@@ -164,8 +135,6 @@ export function ProjectDetailPage() {
     setTasks(tasksRes.tasks);
     setHierarchyRoots(hierarchyRes?.hierarchy.roots ?? []);
     setHierarchyNodes(hierarchyRes?.hierarchy.nodes ?? []);
-    setDependencyGraphNodes(dependencyGraphRes?.graph.nodes ?? []);
-    setDependencyGraphEdges(dependencyGraphRes?.graph.edges ?? []);
     const commandOptions = settingsRes.settings.defaultAiCommands?.length
       ? settingsRes.settings.defaultAiCommands
       : [settingsRes.settings.defaultAiCommand || "codex --yolo {prompt}"];
@@ -234,8 +203,9 @@ export function ProjectDetailPage() {
     nodeTier: "epoch" | "phase" | "plan" | "task";
     aiCommand?: string;
     autoMerge?: boolean;
+    autoMergeOnComplete?: boolean;
     parentNodeId?: string;
-    dependencyNodeRefs?: Array<{ id: string; tier?: NodeTier; reason?: string }>;
+    dependencyNodeRefs?: Array<{ id: string; tier?: NodeTier }>;
   }) {
     if (!projectId) return;
     setCreatingNode(true);

@@ -887,9 +887,9 @@ export async function createProjectNode(params: CreateProjectNodeParams): Promis
   const id = makeId();
   const now = nowIso();
   const mode: TaskRow["mode"] = input.nodeTier === "task" ? "execution" : "plan";
-  const autoMerge = Boolean(input.autoMerge);
+  const autoMerge = input.autoMerge ?? true;
   const autoStart = mode === "plan" ? Boolean(input.autoStart) : false;
-  const autoMergeOnComplete = mode === "plan" ? Boolean(input.autoMergeOnComplete) : false;
+  const autoMergeOnComplete = mode === "plan" ? (input.autoMergeOnComplete ?? true) : false;
   const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
   const aiCommand = resolveAiCommand(input.aiCommand, userId);
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);

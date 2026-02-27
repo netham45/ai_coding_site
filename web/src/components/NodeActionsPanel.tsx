@@ -229,6 +229,12 @@ export function NodeActionsPanel({
           <Flex direction="row" align="center" gap={2} wrap="wrap">
             <Badge colorScheme="blue">tier: {tier}</Badge>
             <Badge colorScheme={node.mode === "plan" ? "purple" : "cyan"}>mode: {node.mode}</Badge>
+            <Badge colorScheme={node.autoMerge ? "green" : "gray"}>auto-merge: {node.autoMerge ? "on" : "off"}</Badge>
+            {node.mode === "plan" ? (
+              <Badge colorScheme={node.autoMergeOnComplete ? "green" : "gray"}>
+                auto-merge on complete: {node.autoMergeOnComplete ? "on" : "off"}
+              </Badge>
+            ) : null}
           </Flex>
           <Text fontSize="sm" color="gray.700">parent: {nodeDetail.parent ? nodeDetail.parent.title : "none"}</Text>
           {nodeDetail.parent && (

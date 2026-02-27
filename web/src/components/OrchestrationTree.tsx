@@ -207,6 +207,12 @@ function TreeRow({
           <Flex mt={1} wrap="wrap" gap={1}>
             <Badge colorScheme={tierColor(node.tier)}>{node.tier}</Badge>
             <Badge colorScheme={statusColor(node.task.status)}>{node.task.status}</Badge>
+            <Badge colorScheme={node.task.autoMerge ? "green" : "gray"}>auto-merge: {node.task.autoMerge ? "on" : "off"}</Badge>
+            {node.task.mode === "plan" ? (
+              <Badge colorScheme={node.task.autoMergeOnComplete ? "green" : "gray"}>
+                auto-merge on complete: {node.task.autoMergeOnComplete ? "on" : "off"}
+              </Badge>
+            ) : null}
             {isBlocked ? <Badge colorScheme="orange">blocked</Badge> : null}
             {unresolvedDependencyCount > 0 ? <Badge colorScheme="red">deps {unresolvedDependencyCount}</Badge> : null}
             {unresolvedDependencyCount === 0 && dependencyCount > 0 ? <Badge colorScheme="gray">deps {dependencyCount}</Badge> : null}
