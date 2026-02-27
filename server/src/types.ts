@@ -235,3 +235,61 @@ export type PlanOrchestrationStateRow = {
   created_at: string;
   updated_at: string;
 };
+
+export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type WorkflowStageRunStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "cancelled";
+export type WorkflowCheckStatus = "pass" | "fail" | "error";
+
+export type WorkflowDefinitionRow = {
+  id: string;
+  project_id: string;
+  name: string;
+  version: number;
+  definition_yaml: string;
+  created_by_user_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowRunRow = {
+  id: string;
+  workflow_definition_id: string;
+  project_id: string;
+  task_id: string | null;
+  status: WorkflowRunStatus;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowStageRunRow = {
+  id: string;
+  workflow_run_id: string;
+  stage_key: string;
+  ordinal: number;
+  status: WorkflowStageRunStatus;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowCheckResultRow = {
+  id: string;
+  workflow_stage_run_id: string;
+  check_name: string;
+  status: WorkflowCheckStatus;
+  details_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowEventRow = {
+  id: string;
+  workflow_run_id: string | null;
+  workflow_stage_run_id: string | null;
+  event_type: string;
+  payload: string;
+  created_at: string;
+};

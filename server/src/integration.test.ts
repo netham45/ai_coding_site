@@ -489,11 +489,16 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
 
     const upgraded = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
     assert.equal(tableHasColumn(upgraded, "tasks", "metadata_json"), true);
-    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 2);
+    assert.equal(tableExists(upgraded, "workflow_definitions"), true);
+    assert.equal(tableExists(upgraded, "workflow_runs"), true);
+    assert.equal(tableExists(upgraded, "workflow_stage_runs"), true);
+    assert.equal(tableExists(upgraded, "workflow_check_results"), true);
+    assert.equal(tableExists(upgraded, "workflow_events"), true);
+    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 3);
     const projectMetadata = upgraded
       .prepare("SELECT schema_version FROM project_metadata WHERE project_id = ?")
       .get(projectId) as { schema_version: number };
-    assert.equal(projectMetadata.schema_version, 2);
+    assert.equal(projectMetadata.schema_version, 3);
   });
 
   test("tasks metadata migration rolls back cleanly on transaction failure", () => {
