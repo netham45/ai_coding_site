@@ -12,6 +12,16 @@ export function runRuntimeTaskWorker<T>(taskId: string, job: () => Promise<T>): 
   return runInKeyedAsyncWorker(runtimeTaskWorkerKey(taskId), job);
 }
 
+function enqueueRuntimeTaskWorker(taskId: string, job: () => Promise<void>): Promise<void> {
+  void runRuntimeTaskWorker(taskId, job).catch((error: any) => {
+    console.error("[runtimeWorker] async runtime task worker failed", {
+      taskId,
+      error: String(error?.message ?? error)
+    });
+  });
+  return Promise.resolve();
+}
+
 function runWatchdogForContext(context?: RuntimeTaskContext): void {
   if (!context?.projectId) {
     return;
@@ -41,7 +51,7 @@ function runWatchdogForContext(context?: RuntimeTaskContext): void {
 }
 
 export function startTaskRuntimeWorker(taskId: string, actorUserId: string, context?: RuntimeTaskContext): Promise<void> {
-  return runRuntimeTaskWorker(taskId, async () => {
+  return enqueueRuntimeTaskWorker(taskId, async () => {
     await startTaskRuntime(taskId, actorUserId, context);
     runWatchdogForContext(context);
   });
@@ -53,7 +63,7 @@ export function sendTaskRuntimeInputWorker(
   text: string,
   context?: RuntimeTaskContext
 ): Promise<void> {
-  return runRuntimeTaskWorker(taskId, async () => {
+  return enqueueRuntimeTaskWorker(taskId, async () => {
     await sendTaskRuntimeInput(taskId, actorUserId, text, context);
     runWatchdogForContext(context);
   });

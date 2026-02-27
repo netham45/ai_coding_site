@@ -47,6 +47,7 @@ import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
 import { recordEvent } from "./services/events.js";
+import { runRuntimeTaskWorker } from "./services/runtimeWorker.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
 import type { TaskRow, TaskStatus } from "./types.js";
 import { nowIso } from "./utils/time.js";
@@ -765,6 +766,48 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
       .prepare("SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?")
       .get(taskId) as { count: number };
     assert.equal(sessionCount.count, 0);
+  });
+
+  test("start endpoint does not hang when a same-task runtime worker is already wedged", async () => {
+    const userId = createUser();
+    const basePath = randomPath("runtime-worker-deadlock");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = resolveProjectDatabase({
+      appDb,
+      projectId,
+      basePath,
+      intent: "write"
+    }).database;
+
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Deadlock Repro",
+      mode: "execution",
+      status: "queued"
+    });
+
+    void runRuntimeTaskWorker(taskId, async () => await new Promise<void>(() => undefined));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 800);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/tasks/${taskId}/start`, {
+        method: "POST",
+        headers: { "x-user-id": userId },
+        signal: controller.signal
+      });
+      assert.notEqual(response.status, 404);
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        assert.fail("Request hung behind a wedged runtime task worker key (deadlock regression)");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   });
 
   test("cached project DB handle reuse does not rerun baseline migrations", () => {

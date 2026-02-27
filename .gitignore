@@ -13,3 +13,4 @@ repos/*
 
 server/.tmp/
 .ai-task-summary.md
+**/.tmp
