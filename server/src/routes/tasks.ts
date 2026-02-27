@@ -24,7 +24,27 @@ import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/
 import { hasSession, killSession } from "../services/tmux.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
-import type { IdeInstanceRow, MergeRecordRow, ProjectRow, TaskRow, TaskSessionRow, TaskStatus, TaskTransitionRow } from "../types.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
+import {
+  buildDependencyDiagnostics,
+  partitionDependenciesByTier,
+  resolveAndValidateNodeDependencies
+} from "../services/orchestration/dependencyGraph.js";
+import { readReplanControl } from "../services/orchestration/idempotency.js";
+import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
+import { orchestrationActionsApiEnabled, orchestrationHierarchyApiEnabled } from "../config/featureFlags.js";
+import type {
+  IdeInstanceRow,
+  MergeRecordRow,
+  NodeDependencyRef,
+  NodeMetadata,
+  NodeTier,
+  ProjectRow,
+  TaskRow,
+  TaskSessionRow,
+  TaskStatus,
+  TaskTransitionRow
+} from "../types.js";
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 
@@ -33,8 +53,25 @@ const createTaskSchema = z.object({
   taskPrompt: z.string().min(1).max(12000),
   aiCommand: z.string().min(1).max(500).optional(),
   autoMerge: z.boolean().optional(),
-  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional()
+  allowReplanBudgetOverride: z.boolean().optional(),
+  dependencyTaskIds: z.array(z.string().uuid()).max(200).optional(),
+  dependencyNodeRefs: z.array(z.object({
+    id: z.string().min(1).max(200),
+    tier: z.enum(["epoch", "phase", "plan", "task", "exec"]).optional(),
+    reason: z.string().min(1).max(500).optional()
+  })).max(200).optional()
 });
+
+function withReplanBudgetOverride(metadata: any, enabled: boolean) {
+  if (!enabled) return metadata;
+  return {
+    ...metadata,
+    custom: {
+      ...(metadata.custom ?? {}),
+      replan_budget_override: true
+    }
+  };
+}
 
 const patchTaskSchema = z.object({
   aiCommand: z.string().min(1).max(500).optional()
@@ -47,6 +84,32 @@ const inputSchema = z.object({
 const cancelTaskSchema = z.object({
   reason: z.string().min(1).max(1000)
 });
+
+const startNodeSchema = z.object({
+  autoMode: z.boolean().optional()
+});
+
+const autoModeSchema = z.object({
+  enabled: z.boolean()
+});
+
+const autoMergeSchema = z.object({
+  enabled: z.boolean(),
+  onComplete: z.boolean().optional()
+});
+
+const forceReReviewSchema = z.object({
+  reason: z.string().min(1).max(1000).optional()
+});
+
+const approveBudgetOverrideSchema = z.object({
+  reason: z.string().min(1).max(1000).optional(),
+  enabled: z.boolean().optional()
+});
+
+function respondFeatureDisabled(res: any, feature: string): void {
+  res.status(404).json({ error: `Feature disabled: ${feature}`, code: "FEATURE_DISABLED" });
+}
 
 const mergeLocks = new Set<string>();
 
@@ -199,6 +262,16 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
        ORDER BY dep.created_at ASC`
     )
     .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata: nodeMetadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
+  });
+  const replan = readReplanControl(nodeMetadata);
+  const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+    ? Boolean(nodeMetadata.custom?.auto_mode)
+    : true;
+  const completion = buildCompletionEvidence(projectDb, task, nodeMetadata);
 
   return {
     id: task.id,
@@ -212,6 +285,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     autoStart: Boolean(task.auto_start),
     autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
+    nodeMetadata,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
     sourcePlanItemKey: task.source_plan_item_key,
@@ -225,37 +299,229 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
     blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
     isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+    orchestrationControls: {
+      autoMode,
+      replan: {
+        maxIterations: replan.maxIterations,
+        iterationsUsed: replan.iterationsUsed,
+        remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+        budgetOverride: replan.budgetOverride,
+        gapHashesSeen: replan.gapHashesSeen
+      }
+    },
+    completion,
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
   };
 }
 
-function resolveTaskDependencies(params: {
-  projectDb: Database.Database;
-  projectId: string;
-  dependencyTaskIds: string[];
-  taskId?: string;
-}): TaskRow[] {
-  const unique = [...new Set(params.dependencyTaskIds)];
-  if (unique.length !== params.dependencyTaskIds.length) {
-    throw new Error("Duplicate dependency ids are not allowed");
+type CompletionEvidenceView = {
+  synthesisArtifactEventId: string | null;
+  verificationArtifactEventId: string | null;
+  verificationVerdict: "pass" | "fail" | null;
+  summary: string | null;
+  synthesisArtifact: Record<string, unknown> | null;
+  verificationArtifact: Record<string, unknown> | null;
+  deltaLoopHistory: Array<Record<string, unknown>>;
+};
+
+function parseJsonObject(input: unknown): Record<string, unknown> | null {
+  if (typeof input !== "string") return null;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
   }
-  if (params.taskId && unique.includes(params.taskId)) {
-    throw new Error("A task cannot depend on itself");
-  }
-  if (unique.length === 0) {
-    return [];
+}
+
+function readEventArtifact(
+  projectDb: Database.Database,
+  eventId: string | null,
+  expectedType: string
+): Record<string, unknown> | null {
+  if (!eventId) return null;
+  const row = projectDb
+    .prepare("SELECT event_type, payload FROM events WHERE id = ? LIMIT 1")
+    .get(eventId) as { event_type: string; payload: string } | undefined;
+  if (!row || row.event_type !== expectedType) return null;
+  const parsed = parseJsonObject(row.payload);
+  const artifact = parsed?.artifact;
+  return artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : null;
+}
+
+function readVerificationHistory(projectDb: Database.Database, taskId: string): Array<Record<string, unknown>> {
+  const rows = projectDb
+    .prepare(
+      `SELECT id, payload
+       FROM events
+       WHERE task_id = ? AND event_type = 'orchestration.verify.completed'
+       ORDER BY created_at ASC`
+    )
+    .all(taskId) as Array<{ id: string; payload: string }>;
+  return rows
+    .map((row) => {
+      const parsed = parseJsonObject(row.payload);
+      const artifact = parsed?.artifact;
+      if (!artifact || typeof artifact !== "object") return null;
+      return {
+        generated_at: (artifact as Record<string, unknown>).generated_at ?? null,
+        verdict: (artifact as Record<string, unknown>).verdict ?? null,
+        reasons: Array.isArray((artifact as Record<string, unknown>).reasons)
+          ? ((artifact as Record<string, unknown>).reasons as unknown[])
+          : [],
+        failing_requirements: Array.isArray((artifact as Record<string, unknown>).failing_requirements)
+          ? ((artifact as Record<string, unknown>).failing_requirements as unknown[])
+          : [],
+        delta_plan_enqueued: Boolean((artifact as Record<string, unknown>).delta_plan_enqueued),
+        budget_exhausted: Boolean((artifact as Record<string, unknown>).budget_exhausted),
+        verification_artifact_event_id: row.id
+      } as Record<string, unknown>;
+    })
+    .filter((value): value is Record<string, unknown> => Boolean(value))
+    .slice(-20);
+}
+
+function buildCompletionEvidence(projectDb: Database.Database, task: TaskRow, nodeMetadata: NodeMetadata): CompletionEvidenceView {
+  const custom = ((nodeMetadata.custom ?? {}) as Record<string, unknown>) ?? {};
+  const completionArtifacts =
+    custom.completion_artifacts && typeof custom.completion_artifacts === "object"
+      ? (custom.completion_artifacts as Record<string, unknown>)
+      : {};
+  const synthesisArtifactEventId = typeof custom.synthesis_artifact_event_id === "string"
+    ? custom.synthesis_artifact_event_id
+    : null;
+  const verificationArtifactEventId = typeof custom.verification_artifact_event_id === "string"
+    ? custom.verification_artifact_event_id
+    : null;
+  const verificationVerdict = custom.verification_verdict === "pass" || custom.verification_verdict === "fail"
+    ? custom.verification_verdict
+    : null;
+
+  const synthesisArtifact = completionArtifacts.synthesis && typeof completionArtifacts.synthesis === "object"
+    ? (completionArtifacts.synthesis as Record<string, unknown>)
+    : readEventArtifact(projectDb, synthesisArtifactEventId, "orchestration.synthesize.completed");
+  const verificationArtifact = completionArtifacts.verification && typeof completionArtifacts.verification === "object"
+    ? (completionArtifacts.verification as Record<string, unknown>)
+    : readEventArtifact(projectDb, verificationArtifactEventId, "orchestration.verify.completed");
+  const deltaLoopHistory = Array.isArray(completionArtifacts.delta_loop_history)
+    ? (completionArtifacts.delta_loop_history as Array<Record<string, unknown>>).slice(-20)
+    : readVerificationHistory(projectDb, task.id);
+
+  return {
+    synthesisArtifactEventId,
+    verificationArtifactEventId,
+    verificationVerdict,
+    summary: typeof synthesisArtifact?.summary === "string" ? synthesisArtifact.summary : null,
+    synthesisArtifact,
+    verificationArtifact,
+    deltaLoopHistory
+  };
+}
+
+function directDependencies(projectDb: Database.Database, task: TaskRow): {
+  nodeTier: NodeTier;
+  dependencies: NodeDependencyRef[];
+} {
+  const dependencyTaskIds = projectDb
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((row) => row.dependency_task_id)
+  }).metadata;
+  const nodeTier = metadata.tier;
+  const refs = [
+    ...(metadata.dependencies?.same_tier ?? []).map((dep) => ({
+      id: dep.id,
+      tier: dep.tier ?? nodeTier,
+      reason: dep.reason
+    })),
+    ...(metadata.dependencies?.cross_tier ?? []).map((dep) => ({
+      id: dep.id,
+      tier: dep.tier ?? "task",
+      reason: dep.reason
+    }))
+  ];
+  const seen = new Set<string>();
+  const dependencies = refs.filter((dep) => {
+    const key = `${dep.tier}:${dep.id}`;
+    if (!dep.id || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { nodeTier, dependencies };
+}
+
+function projectHierarchy(projectDb: Database.Database, projectId: string) {
+  const tasks = projectDb
+    .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+    .all(projectId) as TaskRow[];
+  const nodesByParent = new Map<string | null, any[]>();
+  const nodeRows = tasks.map((task) => {
+    const visibility = buildAutomationVisibility(projectDb, task);
+    return {
+      task: serializeTask(projectDb, task),
+      tier: directDependencies(projectDb, task).nodeTier,
+      waiting: visibility.waiting
+    };
+  });
+
+  for (const row of nodeRows) {
+    const parentId = row.task.parentPlanTaskId ?? null;
+    if (!nodesByParent.has(parentId)) {
+      nodesByParent.set(parentId, []);
+    }
+    nodesByParent.get(parentId)?.push(row);
   }
 
-  const placeholders = unique.map(() => "?").join(", ");
-  const rows = params.projectDb
-    .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
-    .all(params.projectId, ...unique) as TaskRow[];
-  if (rows.length !== unique.length) {
-    throw new Error("One or more dependencies were not found in this project");
-  }
-  return rows;
+  const attachChildren = (row: any): any => ({
+    ...row,
+    children: (nodesByParent.get(row.task.id) ?? []).map(attachChildren)
+  });
+
+  const roots = (nodesByParent.get(null) ?? []).map(attachChildren);
+  return {
+    projectId,
+    roots,
+    nodes: nodeRows
+  };
+}
+
+function projectDependencyGraph(projectDb: Database.Database, projectId: string) {
+  const tasks = projectDb
+    .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+    .all(projectId) as TaskRow[];
+  const statusById = new Map(tasks.map((task) => [task.id, task.status]));
+
+  const nodes = tasks.map((task) => {
+    const deps = directDependencies(projectDb, task);
+    return {
+      id: task.id,
+      title: task.title,
+      mode: task.mode,
+      status: task.status,
+      tier: deps.nodeTier,
+      dependencyCount: deps.dependencies.length
+    };
+  });
+
+  const edges = tasks.flatMap((task) => {
+    const deps = directDependencies(projectDb, task);
+    return deps.dependencies.map((dep) => ({
+      fromId: task.id,
+      fromTier: deps.nodeTier,
+      toId: dep.id,
+      toTier: dep.tier ?? "task",
+      toStatus: statusById.get(dep.id) ?? null,
+      unresolved: statusById.get(dep.id) !== "merged",
+      reason: dep.reason ?? null
+    }));
+  });
+
+  return { projectId, nodes, edges };
 }
 
 function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
@@ -595,17 +861,27 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   const effectivePrompt = buildEffectivePrompt(project, input.taskPrompt);
   const dependencyTaskIds = input.dependencyTaskIds ?? [];
   const autoMerge = Boolean(input.autoMerge);
+  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
 
-  let dependencies: TaskRow[];
+  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
   try {
-    dependencies = resolveTaskDependencies({ projectDb, projectId: project.id, dependencyTaskIds, taskId: id });
+    dependencyResolution = resolveAndValidateNodeDependencies({
+      projectDb,
+      projectId: project.id,
+      nodeId: id,
+      nodeTier: "task",
+      dependencyTaskIds,
+      dependencyNodeRefs: input.dependencyNodeRefs
+    });
   } catch (error: any) {
     res.status(400).json({ error: String(error?.message ?? "Invalid dependencies") });
     return;
   }
 
-  const unresolvedDependencies = dependencies.filter((x) => x.status !== "merged");
+  const dependencies = dependencyResolution.taskDependencies;
+  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
   const isBlocked = unresolvedDependencies.length > 0;
+  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, "task");
 
   let baseCommitSha: string;
   try {
@@ -621,14 +897,34 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      withReplanBudgetOverride(buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "execution",
+          metadata_json: null,
+          auto_merge: autoMerge ? 1 : 0,
+          auto_start: 0,
+          auto_merge_on_complete: 0,
+          parent_plan_task_id: null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: dependencies.map((dependency) => dependency.id),
+        tier: "task",
+        sameTierDependencies: partitionedDeps.sameTierDependencies,
+        crossTierDependencies: partitionedDeps.crossTierDependencies
+      }), allowReplanBudgetOverride)
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge,
+        auto_merge, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -637,6 +933,7 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       effectivePrompt,
       aiCommand,
       autoMerge ? 1 : 0,
+      metadataJson,
       workspacePath,
       baseCommitSha,
       req.user.id,
@@ -668,8 +965,10 @@ tasksRouter.post("/projects/:projectId/tasks", async (req, res) => {
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha,
       dependencyTaskIds: dependencies.map((x) => x.id),
+      dependencyNodeRefs: dependencyResolution.normalizedDependencies,
       blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
-      blocked: isBlocked
+      blocked: isBlocked,
+      allowReplanBudgetOverride
     }
   });
 
@@ -691,6 +990,32 @@ tasksRouter.get("/projects/:projectId/tasks", (req, res) => {
     .all(project.id) as TaskRow[];
 
   res.json({ tasks: tasks.map((task) => serializeTask(projectDb, task)) });
+});
+
+tasksRouter.get("/projects/:projectId/hierarchy", (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  res.json({ hierarchy: projectHierarchy(scopedProject.projectDb, scopedProject.project.id) });
+});
+
+tasksRouter.get("/projects/:projectId/dependency-graph", (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
+  const scopedProject = getProjectAccessOrRespond(
+    { projectId: req.params.projectId, userId: req.user.id, notFoundMessage: "Project not found", intent: "read" },
+    res
+  );
+  if (!scopedProject) return;
+  res.json({ graph: projectDependencyGraph(scopedProject.projectDb, scopedProject.project.id) });
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
@@ -715,6 +1040,7 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     gitStatus = null;
   }
   const visibility = buildAutomationVisibility(projectDb, task);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
 
   res.json({
     task: serializeTask(projectDb, task),
@@ -723,10 +1049,351 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
   });
+});
+
+tasksRouter.get("/nodes/:nodeId", async (req, res) => {
+  if (!orchestrationHierarchyApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_hierarchy_api");
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "read" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+
+  const transitions = projectDb
+    .prepare("SELECT * FROM task_state_transitions WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as TaskTransitionRow[];
+  const visibility = buildAutomationVisibility(projectDb, task);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
+  const children = projectDb
+    .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as TaskRow[];
+
+  res.json({
+    node: serializeTask(projectDb, task),
+    transitions: transitions.map(serializeTransition),
+    dependencyDiagnostics,
+    waiting: visibility.waiting,
+    automation: visibility.automation,
+    orchestration: visibility.orchestration,
+    parent: (() => {
+      if (!task.parent_plan_task_id) return null;
+      const parent = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.parent_plan_task_id) as TaskRow | undefined;
+      return parent ? serializeTask(projectDb, parent) : null;
+    })(),
+    children: children.map((child) => serializeTask(projectDb, child))
+  });
+});
+
+tasksRouter.get("/tasks/:taskId/dependency-diagnostics", (req, res) => {
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.taskId, userId: req.user.id, notFoundMessage: "Task not found", intent: "read" },
+    res
+  );
+  if (!scopedTask) return;
+  const diagnostics = buildDependencyDiagnostics({ projectDb: scopedTask.projectDb, task: scopedTask.task });
+  res.json({ diagnostics });
+});
+
+tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
+  const parsed = startNodeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, project, projectDb } = scopedTask;
+  const depState = directDependencies(projectDb, task);
+  const diagnostics = buildDependencyDiagnostics({ projectDb, task });
+  if (diagnostics.unresolved.length > 0) {
+    res.status(409).json({
+      error: "Node is blocked by unresolved dependencies",
+      blockedBy: diagnostics.unresolved
+    });
+    return;
+  }
+
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: (
+      projectDb
+        .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+        .all(task.id) as Array<{ dependency_task_id: string }>
+    ).map((row) => row.dependency_task_id)
+  }).metadata;
+  const autoMode = parsed.data.autoMode
+    ?? (typeof metadata.custom?.auto_mode === "boolean" ? Boolean(metadata.custom?.auto_mode) : true);
+
+  if (depState.nodeTier === "exec") {
+    try {
+      await startTaskRuntimeWorker(task.id, req.user.id, {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb
+      });
+    } catch (error: any) {
+      res.status(409).json({ error: String(error?.message ?? "Failed to start node") });
+      return;
+    }
+  } else {
+    const { pendingEventId } = enqueueOrchestrationJob({
+      database: projectDb,
+      projectId: task.project_id,
+      taskId: task.id,
+      jobType: "decompose",
+      idempotencyKey: `manual_start:${task.id}:${makeId()}`,
+      debounceMs: 0,
+      dedupeWindowMs: 250,
+      metadata: {
+        source: "api.manual_start",
+        actorUserId: req.user.id,
+        autoMode
+      }
+    });
+    kickOrchestrationJobQueueProcessing();
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "orchestration.manual_start",
+      database: projectDb,
+      payload: {
+        pendingEventId,
+        autoMode,
+        actorUserId: req.user.id
+      }
+    });
+  }
+
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ node: serializeTask(projectDb, updated), started: true, tier: depState.nodeTier });
+});
+
+tasksRouter.post("/nodes/:nodeId/auto-mode", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
+  const parsed = autoModeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+  const dependencyTaskIds = projectDb
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((row) => row.dependency_task_id)
+  });
+  const nextMetadata = {
+    ...metadata,
+    orchestration: {
+      ...(metadata.orchestration ?? {}),
+      auto_start: parsed.data.enabled
+    },
+    custom: {
+      ...(metadata.custom ?? {}),
+      auto_mode: parsed.data.enabled
+    }
+  };
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: nextMetadata
+  });
+  projectDb.prepare("UPDATE tasks SET auto_start = ?, updated_at = ? WHERE id = ?").run(parsed.data.enabled ? 1 : 0, nowIso(), task.id);
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_mode",
+    database: projectDb,
+    payload: {
+      enabled: parsed.data.enabled,
+      actorUserId: req.user.id
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ node: serializeTask(projectDb, updated) });
+});
+
+tasksRouter.post("/nodes/:nodeId/auto-merge", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
+  const parsed = autoMergeSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+  const updateOnComplete = parsed.data.onComplete ?? task.mode === "plan";
+  if (updateOnComplete) {
+    projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = ?, updated_at = ? WHERE id = ?").run(
+      parsed.data.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  } else {
+    projectDb.prepare("UPDATE tasks SET auto_merge = ?, updated_at = ? WHERE id = ?").run(
+      parsed.data.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  }
+
+  const dependencyTaskIds = projectDb
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((row) => row.dependency_task_id)
+  });
+  const nextMetadata = {
+    ...metadata,
+    orchestration: {
+      ...(metadata.orchestration ?? {}),
+      auto_merge: updateOnComplete ? metadata.orchestration?.auto_merge : parsed.data.enabled,
+      auto_merge_on_complete: updateOnComplete ? parsed.data.enabled : metadata.orchestration?.auto_merge_on_complete
+    }
+  };
+  writeNodeMetadata({ projectDb, taskId: task.id, metadata: nextMetadata });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_merge",
+    database: projectDb,
+    payload: {
+      enabled: parsed.data.enabled,
+      onComplete: updateOnComplete,
+      actorUserId: req.user.id
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ node: serializeTask(projectDb, updated) });
+});
+
+tasksRouter.post("/nodes/:nodeId/force-re-review", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
+  const parsed = forceReReviewSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+  const { pendingEventId } = enqueueOrchestrationJob({
+    database: projectDb,
+    projectId: task.project_id,
+    taskId: task.id,
+    jobType: "re_review",
+    idempotencyKey: `manual_re_review:${task.id}:${makeId()}`,
+    debounceMs: 0,
+    dedupeWindowMs: 250,
+    metadata: {
+      source: "api.manual_re_review",
+      reason: parsed.data.reason ?? null,
+      actorUserId: req.user.id
+    }
+  });
+  kickOrchestrationJobQueueProcessing();
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.force_re_review",
+    database: projectDb,
+    payload: {
+      reason: parsed.data.reason ?? null,
+      pendingEventId,
+      actorUserId: req.user.id
+    }
+  });
+  res.status(202).json({ ok: true, pendingEventId });
+});
+
+tasksRouter.post("/nodes/:nodeId/approve-budget-override", (req, res) => {
+  if (!orchestrationActionsApiEnabled()) {
+    respondFeatureDisabled(res, "orchestration_actions_api");
+    return;
+  }
+  const parsed = approveBudgetOverrideSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb } = scopedTask;
+  const enabled = parsed.data.enabled ?? true;
+  const dependencyTaskIds = projectDb
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((row) => row.dependency_task_id)
+  });
+  const nextMetadata = {
+    ...metadata,
+    custom: {
+      ...(metadata.custom ?? {}),
+      replan_budget_override: enabled
+    }
+  };
+  writeNodeMetadata({ projectDb, taskId: task.id, metadata: nextMetadata });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.replan_budget",
+    database: projectDb,
+    payload: {
+      enabled,
+      reason: parsed.data.reason ?? null,
+      actorUserId: req.user.id
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  res.json({ node: serializeTask(projectDb, updated) });
 });
 
 tasksRouter.patch("/tasks/:taskId", (req, res) => {

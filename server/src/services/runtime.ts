@@ -7,6 +7,7 @@ import type { AppProjectRow, ProjectRow, TaskRow, TaskStatus } from "../types.js
 import { makeId } from "../utils/id.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
+import { observeNodeOutputMaterialChange } from "./orchestration/outputMonitor.js";
 import {
   cloneLocalBaseToWorkspace,
   createTaskBranch,
@@ -447,6 +448,18 @@ function transitionTaskIfNeeded(
     reason: params.reason,
     actorUserId: params.actorUserId
   });
+  recordEvent({
+    projectId: row.project_id,
+    taskId: row.id,
+    eventType: "task.status_changed",
+    payload: {
+      fromStatus: row.status,
+      toStatus: params.toStatus,
+      reasonCode: params.reason,
+      source: "runtime.transitionTaskIfNeeded"
+    },
+    database: projectDb
+  });
 }
 
 function sleep(ms: number): Promise<void> {
@@ -589,6 +602,18 @@ function updateTaskStatus(
     toStatus: params.toStatus,
     reason: params.reason,
     actorUserId: params.actorUserId
+  });
+  recordEvent({
+    projectId: row.project_id,
+    taskId: row.id,
+    eventType: "task.status_changed",
+    payload: {
+      fromStatus: row.status,
+      toStatus: params.toStatus,
+      reasonCode: params.reason,
+      source: "runtime.updateTaskStatus"
+    },
+    database: projectDb
   });
 }
 
@@ -1215,6 +1240,27 @@ async function monitorSession(context: RuntimeProjectContext, session: SessionRo
   }
 
   const output = await capturePane(session.tmux_socket_path, session.tmux_session_name);
+  const outputMonitor = observeNodeOutputMaterialChange({
+    projectDb,
+    taskId: session.task_id,
+    source: "runtime_session",
+    rawOutput: output,
+    debounceMs: 2_000
+  });
+  if (outputMonitor.materialChanged) {
+    recordEvent({
+      projectId: context.project.id,
+      taskId: session.task_id,
+      sessionId: session.id,
+      eventType: "task.output.material_changed",
+      payload: {
+        source: outputMonitor.source,
+        outputHash: outputMonitor.outputHash,
+        previousOutputHash: outputMonitor.previousOutputHash
+      },
+      database: projectDb
+    });
+  }
   const signal = parseLifecycleSignals(output);
   const now = Date.now();
   const persistedHeartbeatMs = session.last_heartbeat_at ? Date.parse(session.last_heartbeat_at) : Number.NaN;

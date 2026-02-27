@@ -572,7 +572,10 @@ export function TaskDetailPage() {
   const dependencyTitles = task.dependencyTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const blockedByTitles = task.blockedByTaskIds.map((id) => projectTasks.find((x) => x.id === id)?.title || id);
   const isPlanOwnedExecutionTask = task.mode === "execution" && !!task.parentPlanTaskId;
-  const completionSummary = task.result.trim();
+  const completionSummary = task.completion?.summary?.trim() || task.result.trim();
+  const synthesisArtifact = task.completion?.synthesisArtifact;
+  const verificationArtifact = task.completion?.verificationArtifact;
+  const deltaLoopHistory = task.completion?.deltaLoopHistory ?? [];
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -781,6 +784,100 @@ export function TaskDetailPage() {
                     <Code display="block" whiteSpace="pre-wrap" width="full" p={4} borderRadius="md">
                       {completionSummary}
                     </Code>
+                  </Box>
+                )}
+
+                {!!synthesisArtifact && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Completion Evidence
+                    </Heading>
+                    <Stack spacing={3}>
+                      <Text fontSize="sm" color="gray.700">
+                        Generated: {new Date(synthesisArtifact.generated_at).toLocaleString()}
+                      </Text>
+                      <Stack spacing={2}>
+                        {synthesisArtifact.coverage_matrix.map((row) => (
+                          <Box key={row.requirement_id} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                            <Stack direction={{ base: "column", md: "row" }} justify="space-between" align={{ base: "start", md: "center" }} mb={2}>
+                              <Text fontWeight="600">{row.requirement_text}</Text>
+                              <Badge colorScheme={row.coverage_status === "covered" ? "green" : row.coverage_status === "partial" ? "yellow" : "red"}>
+                                {row.coverage_status}
+                              </Badge>
+                            </Stack>
+                            <Stack spacing={2}>
+                              {row.evidence.map((evidence, idx) => (
+                                <Box key={`${row.requirement_id}-${evidence.child_task_id}-${idx}`} bg="gray.50" borderRadius="md" p={2}>
+                                  <Text fontSize="sm" color="gray.800">{evidence.snippet}</Text>
+                                  <Text fontSize="xs" color="gray.700">source: {evidence.artifact_ref}</Text>
+                                  {!!evidence.repo_path && <Text fontSize="xs" color="gray.700">repo path: {evidence.repo_path}</Text>}
+                                  {!!evidence.module_ref && <Text fontSize="xs" color="gray.700">module: {evidence.module_ref}</Text>}
+                                  {!!evidence.test_ref && <Text fontSize="xs" color="gray.700">test: {evidence.test_ref}</Text>}
+                                </Box>
+                              ))}
+                              {!row.evidence.length && (
+                                <Text fontSize="sm" color="orange.700">
+                                  Unresolved gap: {row.gap_reason || "missing evidence"}
+                                </Text>
+                              )}
+                            </Stack>
+                          </Box>
+                        ))}
+                      </Stack>
+                    </Stack>
+                  </Box>
+                )}
+
+                {!!verificationArtifact && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Verification Outcome
+                    </Heading>
+                    <Stack spacing={2}>
+                      <Badge alignSelf="start" colorScheme={verificationArtifact.verdict === "pass" ? "green" : "red"}>
+                        {verificationArtifact.verdict}
+                      </Badge>
+                      <Text fontSize="sm" color="gray.700">
+                        Generated: {new Date(verificationArtifact.generated_at).toLocaleString()}
+                      </Text>
+                      {!!verificationArtifact.reasons.length && (
+                        <Text fontSize="sm" color={verificationArtifact.verdict === "pass" ? "gray.700" : "red.700"}>
+                          Reasons: {verificationArtifact.reasons.join(", ")}
+                        </Text>
+                      )}
+                      {!!verificationArtifact.failing_requirements.length && (
+                        <Text fontSize="sm" color="orange.700">
+                          Unresolved requirements: {verificationArtifact.failing_requirements.join(", ")}
+                        </Text>
+                      )}
+                    </Stack>
+                  </Box>
+                )}
+
+                {!!deltaLoopHistory.length && (
+                  <Box>
+                    <Heading size="sm" mb={2}>
+                      Gap Closure History
+                    </Heading>
+                    <Stack spacing={2}>
+                      {deltaLoopHistory.map((entry, idx) => (
+                        <Box key={`${entry.verification_artifact_event_id}-${idx}`} border="1px solid" borderColor="blackAlpha.200" borderRadius="md" p={3}>
+                          <Stack direction={{ base: "column", md: "row" }} justify="space-between" align={{ base: "start", md: "center" }}>
+                            <Badge colorScheme={entry.verdict === "pass" ? "green" : "red"}>{entry.verdict}</Badge>
+                            <Text fontSize="xs" color="gray.600">{new Date(entry.generated_at).toLocaleString()}</Text>
+                          </Stack>
+                          {!!entry.reasons.length && <Text fontSize="sm" mt={1}>reasons: {entry.reasons.join(", ")}</Text>}
+                          {!!entry.failing_requirements.length && (
+                            <Text fontSize="sm" color="orange.700">
+                              gaps: {entry.failing_requirements.join(", ")}
+                            </Text>
+                          )}
+                          <Text fontSize="xs" color="gray.600">
+                            delta planned: {entry.delta_plan_enqueued ? "yes" : "no"} | budget exhausted: {entry.budget_exhausted ? "yes" : "no"}
+                          </Text>
+                        </Box>
+                      ))}
+                    </Stack>
                   </Box>
                 )}
 

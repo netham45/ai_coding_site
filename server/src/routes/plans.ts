@@ -9,9 +9,14 @@ import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { parsePlanOutput } from "../services/planParser.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata } from "../services/orchestration/metadata.js";
+import { readReplanControl } from "../services/orchestration/idempotency.js";
+import { buildDependencyDiagnostics, partitionDependenciesByTier, validateProposedNodeGraph } from "../services/orchestration/dependencyGraph.js";
 import { cloneLocalBaseToWorkspace, createTaskBranch, getHeadCommitSha, taskBranchName } from "../services/git.js";
 import { sendTaskRuntimeInputWorker } from "../services/runtimeWorker.js";
 import type {
+  NodeDependencyRef,
+  NodeMetadata,
   PlanRevisionItemDependencyRow,
   PlanRevisionItemRow,
   PlanRevisionRow,
@@ -28,6 +33,7 @@ const createPlanSchema = z.object({
   aiCommand: z.string().min(1).max(500).optional(),
   autoStart: z.boolean().optional(),
   autoMergeOnComplete: z.boolean().optional(),
+  allowReplanBudgetOverride: z.boolean().optional(),
   parentPlanTaskId: z.string().min(1).max(200).optional()
 });
 
@@ -51,12 +57,24 @@ const approvePlanSchema = z.object({
         aiCommand: z.string().min(1).max(500).optional(),
         parentPlanTaskId: z.string().min(1).max(200).nullable().optional(),
         autoStart: z.boolean().optional(),
-        autoMergeOnComplete: z.boolean().optional()
+        autoMergeOnComplete: z.boolean().optional(),
+        allowReplanBudgetOverride: z.boolean().optional()
       })
     )
     .max(1000)
     .optional()
 });
+
+function withReplanBudgetOverride(metadata: any, enabled: boolean) {
+  if (!enabled) return metadata;
+  return {
+    ...metadata,
+    custom: {
+      ...(metadata.custom ?? {}),
+      replan_budget_override: true
+    }
+  };
+}
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 
@@ -230,6 +248,16 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
        ORDER BY dep.created_at ASC`
     )
     .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata: nodeMetadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
+  });
+  const replan = readReplanControl(nodeMetadata);
+  const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+    ? Boolean(nodeMetadata.custom?.auto_mode)
+    : true;
+  const completion = buildCompletionEvidence(projectDb, task, nodeMetadata);
 
   return {
     id: task.id,
@@ -243,6 +271,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     autoStart: Boolean(task.auto_start),
     autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
+    nodeMetadata,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
     sourcePlanItemKey: task.source_plan_item_key,
@@ -256,9 +285,124 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
     blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
     isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+    orchestrationControls: {
+      autoMode,
+      replan: {
+        maxIterations: replan.maxIterations,
+        iterationsUsed: replan.iterationsUsed,
+        remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+        budgetOverride: replan.budgetOverride,
+        gapHashesSeen: replan.gapHashesSeen
+      }
+    },
+    completion,
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
+  };
+}
+
+type CompletionEvidenceView = {
+  synthesisArtifactEventId: string | null;
+  verificationArtifactEventId: string | null;
+  verificationVerdict: "pass" | "fail" | null;
+  summary: string | null;
+  synthesisArtifact: Record<string, unknown> | null;
+  verificationArtifact: Record<string, unknown> | null;
+  deltaLoopHistory: Array<Record<string, unknown>>;
+};
+
+function parseJsonObject(input: unknown): Record<string, unknown> | null {
+  if (typeof input !== "string") return null;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readEventArtifact(
+  projectDb: Database.Database,
+  eventId: string | null,
+  expectedType: string
+): Record<string, unknown> | null {
+  if (!eventId) return null;
+  const row = projectDb
+    .prepare("SELECT event_type, payload FROM events WHERE id = ? LIMIT 1")
+    .get(eventId) as { event_type: string; payload: string } | undefined;
+  if (!row || row.event_type !== expectedType) return null;
+  const parsed = parseJsonObject(row.payload);
+  const artifact = parsed?.artifact;
+  return artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : null;
+}
+
+function readVerificationHistory(projectDb: Database.Database, taskId: string): Array<Record<string, unknown>> {
+  const rows = projectDb
+    .prepare(
+      `SELECT id, payload
+       FROM events
+       WHERE task_id = ? AND event_type = 'orchestration.verify.completed'
+       ORDER BY created_at ASC`
+    )
+    .all(taskId) as Array<{ id: string; payload: string }>;
+  return rows
+    .map((row) => {
+      const parsed = parseJsonObject(row.payload);
+      const artifact = parsed?.artifact;
+      if (!artifact || typeof artifact !== "object") return null;
+      return {
+        generated_at: (artifact as Record<string, unknown>).generated_at ?? null,
+        verdict: (artifact as Record<string, unknown>).verdict ?? null,
+        reasons: Array.isArray((artifact as Record<string, unknown>).reasons)
+          ? ((artifact as Record<string, unknown>).reasons as unknown[])
+          : [],
+        failing_requirements: Array.isArray((artifact as Record<string, unknown>).failing_requirements)
+          ? ((artifact as Record<string, unknown>).failing_requirements as unknown[])
+          : [],
+        delta_plan_enqueued: Boolean((artifact as Record<string, unknown>).delta_plan_enqueued),
+        budget_exhausted: Boolean((artifact as Record<string, unknown>).budget_exhausted),
+        verification_artifact_event_id: row.id
+      } as Record<string, unknown>;
+    })
+    .filter((value): value is Record<string, unknown> => Boolean(value))
+    .slice(-20);
+}
+
+function buildCompletionEvidence(projectDb: Database.Database, task: TaskRow, nodeMetadata: NodeMetadata): CompletionEvidenceView {
+  const custom = ((nodeMetadata.custom ?? {}) as Record<string, unknown>) ?? {};
+  const completionArtifacts =
+    custom.completion_artifacts && typeof custom.completion_artifacts === "object"
+      ? (custom.completion_artifacts as Record<string, unknown>)
+      : {};
+  const synthesisArtifactEventId = typeof custom.synthesis_artifact_event_id === "string"
+    ? custom.synthesis_artifact_event_id
+    : null;
+  const verificationArtifactEventId = typeof custom.verification_artifact_event_id === "string"
+    ? custom.verification_artifact_event_id
+    : null;
+  const verificationVerdict = custom.verification_verdict === "pass" || custom.verification_verdict === "fail"
+    ? custom.verification_verdict
+    : null;
+
+  const synthesisArtifact = completionArtifacts.synthesis && typeof completionArtifacts.synthesis === "object"
+    ? (completionArtifacts.synthesis as Record<string, unknown>)
+    : readEventArtifact(projectDb, synthesisArtifactEventId, "orchestration.synthesize.completed");
+  const verificationArtifact = completionArtifacts.verification && typeof completionArtifacts.verification === "object"
+    ? (completionArtifacts.verification as Record<string, unknown>)
+    : readEventArtifact(projectDb, verificationArtifactEventId, "orchestration.verify.completed");
+  const deltaLoopHistory = Array.isArray(completionArtifacts.delta_loop_history)
+    ? (completionArtifacts.delta_loop_history as Array<Record<string, unknown>>).slice(-20)
+    : readVerificationHistory(projectDb, task.id);
+
+  return {
+    synthesisArtifactEventId,
+    verificationArtifactEventId,
+    verificationVerdict,
+    summary: typeof synthesisArtifact?.summary === "string" ? synthesisArtifact.summary : null,
+    synthesisArtifact,
+    verificationArtifact,
+    deltaLoopHistory
   };
 }
 
@@ -391,6 +535,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   const effectivePrompt = buildEffectivePrompt(project, plannerPrompt);
   const autoStart = Boolean(input.autoStart);
   const autoMergeOnComplete = Boolean(input.autoMergeOnComplete);
+  const allowReplanBudgetOverride = Boolean(input.allowReplanBudgetOverride);
 
   let parentPlanTask: TaskRow | undefined;
   if (input.parentPlanTaskId) {
@@ -416,14 +561,33 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      withReplanBudgetOverride(buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "plan",
+          metadata_json: null,
+          auto_merge: 0,
+          auto_start: autoStart ? 1 : 0,
+          auto_merge_on_complete: autoMergeOnComplete ? 1 : 0,
+          parent_plan_task_id: parentPlanTask?.id ?? null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: [],
+        tier: "plan",
+        crossTierDependencies: parentPlanTask ? [{ id: parentPlanTask.id, tier: "plan", reason: "parent_plan" }] : []
+      }), allowReplanBudgetOverride)
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge, auto_start, auto_merge_on_complete,
+        auto_merge, auto_start, auto_merge_on_complete, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -433,6 +597,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
       aiCommand,
       autoStart ? 1 : 0,
       autoMergeOnComplete ? 1 : 0,
+      metadataJson,
       parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitSha,
@@ -457,6 +622,7 @@ plansRouter.post("/projects/:projectId/plans", async (req, res) => {
       aiCommand,
       autoStart,
       autoMergeOnComplete,
+      allowReplanBudgetOverride,
       parentPlanTaskId: parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha
@@ -538,6 +704,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
     .prepare("SELECT * FROM tasks WHERE parent_plan_task_id = ? ORDER BY created_at ASC")
     .all(plan.id) as TaskRow[];
   const visibility = buildAutomationVisibility(projectDb, plan);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task: plan });
 
   res.json({
     plan: serializeTask(projectDb, plan),
@@ -556,6 +723,7 @@ plansRouter.get("/plans/:planId", (req, res) => {
       items: (itemsByRevision.get(revision.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)
     })),
     approvedTasks: approvedTasks.map((task) => serializeTask(projectDb, task)),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
@@ -807,6 +975,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
     taskId: string;
     workspacePath: string;
     dependencyTaskIds: string[];
+    dependencyNodeRefs: NodeDependencyRef[];
     mode: "execution" | "plan";
     parentPlanTaskId: string | null;
     autoStart: boolean;
@@ -859,6 +1028,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       taskId,
       workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
       dependencyTaskIds: [],
+      dependencyNodeRefs: [],
       mode,
       parentPlanTaskId,
       autoStart,
@@ -879,6 +1049,29 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       }
       return depTaskId;
     });
+    row.dependencyNodeRefs = depKeys.map((depKey, idx) => {
+      const depTaskId = row.dependencyTaskIds[idx];
+      const depRow = taskRows.find((candidate) => candidate.taskId === depTaskId);
+      return {
+        id: depTaskId,
+        tier: depRow?.mode === "plan" ? "plan" : "exec",
+        reason: `plan_item:${depKey}`
+      };
+    });
+  }
+  try {
+    validateProposedNodeGraph({
+      projectDb,
+      projectId: project.id,
+      proposedNodes: taskRows.map((row) => ({
+        id: row.taskId,
+        tier: row.mode === "plan" ? "plan" : "exec",
+        dependencies: row.dependencyNodeRefs
+      }))
+    });
+  } catch (error: any) {
+    res.status(400).json({ error: String(error?.message ?? "Invalid dependency graph") });
+    return;
   }
 
   try {
@@ -913,15 +1106,41 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
       const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
       const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, req.user.id);
+      const nodeTier = row.mode === "plan" ? "plan" : "exec";
+      const materializedDependencies = [
+        ...row.dependencyNodeRefs,
+        { id: plan.id, tier: "plan" as const, reason: "created_from_plan_revision" }
+      ];
+      const partitionedDeps = partitionDependenciesByTier(materializedDependencies, nodeTier);
+      const metadataJson = serializeNodeMetadata(
+        withReplanBudgetOverride(buildInitialNodeMetadata({
+          task: {
+            id: row.taskId,
+            project_id: project.id,
+            mode: row.mode,
+            metadata_json: null,
+            auto_merge: row.autoMerge ? 1 : 0,
+            auto_start: row.autoStart ? 1 : 0,
+            auto_merge_on_complete: row.autoMergeOnComplete ? 1 : 0,
+            parent_plan_task_id: row.parentPlanTaskId,
+            source_plan_revision_id: latestRevision.id,
+            source_plan_item_key: row.item.item_key
+          },
+          dependencyTaskIds: row.dependencyTaskIds,
+          tier: nodeTier,
+          sameTierDependencies: partitionedDeps.sameTierDependencies,
+          crossTierDependencies: partitionedDeps.crossTierDependencies
+        }), Boolean(edit?.allowReplanBudgetOverride))
+      );
 
       projectDb.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-          auto_merge, auto_start, auto_merge_on_complete,
+          auto_merge, auto_start, auto_merge_on_complete, metadata_json,
           mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
           status, workspace_path, base_commit_sha_at_create, head_commit_sha,
           cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
       ).run(
         row.taskId,
         project.id,
@@ -932,6 +1151,7 @@ plansRouter.post("/plans/:planId/approve", async (req, res) => {
         row.autoMerge ? 1 : 0,
         row.autoStart ? 1 : 0,
         row.autoMergeOnComplete ? 1 : 0,
+        metadataJson,
         row.mode,
         row.parentPlanTaskId,
         latestRevision.id,

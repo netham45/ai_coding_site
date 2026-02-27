@@ -12,6 +12,45 @@ export type TaskStatus =
   | "merge_conflict";
 
 export type TaskMode = "execution" | "plan";
+export type NodeTier = "epoch" | "phase" | "plan" | "task" | "exec";
+
+export type NodeDependencyRef = {
+  id: string;
+  tier?: NodeTier;
+  reason?: string;
+};
+
+export type NodeMetadata = {
+  schema_version: 1;
+  tier: NodeTier;
+  lifecycle?: {
+    synthesis_passed?: boolean;
+    verification_passed?: boolean;
+    last_transition_reason_code?: string;
+  };
+  orchestration?: {
+    auto_merge?: boolean;
+    auto_start?: boolean;
+    auto_merge_on_complete?: boolean;
+    hints?: string[];
+  };
+  budgets?: {
+    max_retries?: number;
+    max_replans?: number;
+    max_children?: number;
+    token_budget?: number;
+  };
+  idempotency?: {
+    fingerprint?: string;
+    decomposition_fingerprint?: string;
+    gap_hash?: string;
+  };
+  dependencies?: {
+    same_tier?: NodeDependencyRef[];
+    cross_tier?: NodeDependencyRef[];
+  };
+  custom?: Record<string, unknown>;
+};
 
 export type AppProjectRow = {
   id: string;
@@ -48,6 +87,7 @@ export type TaskRow = {
   auto_merge: number;
   auto_start: number;
   auto_merge_on_complete: number;
+  metadata_json?: string | null;
   mode: TaskMode;
   parent_plan_task_id: string | null;
   source_plan_revision_id: string | null;

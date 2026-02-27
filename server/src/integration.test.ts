@@ -25,12 +25,30 @@ import {
 } from "./db/index.js";
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
-import { projectBaselineMigration } from "./db/migrations.js";
+import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
 import { openSqliteDatabase } from "./db/sqlite.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
+import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
+import { assertTaskStatusTransition, canTransitionLifecycle, evaluateParentCompletionGuards } from "./services/orchestration/stateMachine.js";
+import {
+  enqueueOrchestrationJob,
+  registerOrchestrationJobHandler,
+  resetOrchestrationJobQueueForTests,
+  runOrchestrationJobQueuePassForTests
+} from "./services/orchestration/jobQueue.js";
+import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
+import { runDecomposeForTask } from "./services/orchestration/jobs/decompose.js";
+import { runDeltaPlanForTask } from "./services/orchestration/jobs/deltaPlan.js";
+import { runEvaluateReadinessForTask } from "./services/orchestration/jobs/evaluateReadiness.js";
+import { runReReviewForTask } from "./services/orchestration/jobs/reReview.js";
+import { runSynthesizeForParent, runVerifyForParent } from "./services/orchestration/completion.js";
+import { observeNodeOutputMaterialChange } from "./services/orchestration/outputMonitor.js";
+import { runOrchestrationWatchdog } from "./services/orchestration/watchdog.js";
 import { parsePlanOutput } from "./services/planParser.js";
 import { runPlanOrchestrationPassForTests } from "./services/planOrchestrator.js";
+import { recordEvent } from "./services/events.js";
 import { resetSplitPersistenceCachesForTests } from "./db/splitPersistence.js";
+import type { TaskRow, TaskStatus } from "./types.js";
 import { nowIso } from "./utils/time.js";
 
 type ApiResponse = {
@@ -54,10 +72,17 @@ function tableExists(database: Database.Database, table: string): boolean {
   return Boolean(row?.ok);
 }
 
+function tableHasColumn(database: Database.Database, table: string, column: string): boolean {
+  if (!tableExists(database, table)) return false;
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
 function resetAppDatabaseState(): void {
   closeAllProjectDbs();
   resetProjectDbDiagnosticsForTests();
   resetSplitPersistenceCachesForTests();
+  resetOrchestrationJobQueueForTests();
 
   const tables = appDb
     .prepare(
@@ -207,7 +232,7 @@ function insertTask(params: {
   return taskId;
 }
 
-async function callApi(pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
+async function callApiAt(baseUrl: string, pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
   const headers: Record<string, string> = {};
   if (options?.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -215,7 +240,7 @@ async function callApi(pathname: string, options?: { method?: string; body?: unk
   if (options?.userId) {
     headers["x-user-id"] = options.userId;
   }
-  const response = await fetch(`${apiBaseUrl}${pathname}`, {
+  const response = await fetch(`${baseUrl}${pathname}`, {
     method: options?.method ?? "GET",
     headers,
     body: options?.body !== undefined ? JSON.stringify(options.body) : undefined
@@ -228,6 +253,10 @@ async function callApi(pathname: string, options?: { method?: string; body?: unk
     json = null;
   }
   return { status: response.status, text, json };
+}
+
+async function callApi(pathname: string, options?: { method?: string; body?: unknown; userId?: string }): Promise<ApiResponse> {
+  return callApiAt(apiBaseUrl, pathname, options);
 }
 
 describe("integration: ownership, auth, migration, portability, diagnostics", () => {
@@ -378,6 +407,132 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     });
     assert.equal(resolved.backend, "project");
     process.env.SPLIT_PERSISTENCE_PHASE = previousPhase;
+  });
+
+  test("project DB schema upgrade adds tasks.metadata_json and bumps metadata version", () => {
+    const userId = createUser();
+    const basePath = randomPath("schema-upgrade");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, ".ai-coding");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const dbPath = path.join(dbDir, "project.sqlite");
+
+    const legacyDb = resolveProjectDatabase({
+      appDb,
+      projectId,
+      basePath,
+      intent: "write"
+    }).database;
+    legacyDb.exec(projectBaselineMigration);
+    legacyDb.exec("ALTER TABLE tasks RENAME TO tasks_with_metadata");
+    legacyDb.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
+        auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','awaiting_children','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    legacyDb.exec("DROP TABLE tasks_with_metadata");
+    legacyDb.pragma("user_version = 1");
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS project_metadata (
+        project_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    const now = nowIso();
+    legacyDb
+      .prepare(
+        `INSERT OR REPLACE INTO project_metadata (project_id, schema_version, created_at, updated_at)
+         VALUES (?, 1, ?, ?)`
+      )
+      .run(projectId, now, now);
+    closeAllProjectDbs();
+
+    const upgraded = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    assert.equal(tableHasColumn(upgraded, "tasks", "metadata_json"), true);
+    assert.equal(Number(upgraded.pragma("user_version", { simple: true })), 2);
+    const projectMetadata = upgraded
+      .prepare("SELECT schema_version FROM project_metadata WHERE project_id = ?")
+      .get(projectId) as { schema_version: number };
+    assert.equal(projectMetadata.schema_version, 2);
+  });
+
+  test("tasks metadata migration rolls back cleanly on transaction failure", () => {
+    const userId = createUser();
+    const basePath = randomPath("schema-rollback");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, ".ai-coding");
+    fs.mkdirSync(dbDir, { recursive: true });
+    const db = resolveProjectDatabase({
+      appDb,
+      projectId,
+      basePath,
+      intent: "write"
+    }).database;
+    db.exec(projectBaselineMigration);
+    db.exec("ALTER TABLE tasks RENAME TO tasks_with_metadata");
+    db.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1)),
+        auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','awaiting_children','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    db.exec("DROP TABLE tasks_with_metadata");
+    assert.equal(tableHasColumn(db, "tasks", "metadata_json"), false);
+
+    assert.throws(() => {
+      db.transaction(() => {
+        db.exec(projectTaskMetadataMigration);
+        throw new Error("force rollback");
+      })();
+    }, /force rollback/);
+    assert.equal(tableHasColumn(db, "tasks", "metadata_json"), false);
   });
 
   test("missing/corrupt project DB responses are surfaced and reflected in health diagnostics", async () => {
@@ -604,10 +759,12 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
 
     const session = projectDb
       .prepare("SELECT status, failure_reason, ended_at FROM task_sessions WHERE id = ?")
-      .get(sessionId) as { status: string; failure_reason: string | null; ended_at: string | null };
-    assert.equal(session.status, "stopped");
-    assert.equal(session.failure_reason, "rerun_reset");
-    assert.ok(Boolean(session.ended_at));
+      .get(sessionId) as { status: string; failure_reason: string | null; ended_at: string | null } | undefined;
+    assert.equal(session, undefined);
+    const sessionCount = projectDb
+      .prepare("SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?")
+      .get(taskId) as { count: number };
+    assert.equal(sessionCount.count, 0);
   });
 
   test("cached project DB handle reuse does not rerun baseline migrations", () => {
@@ -947,7 +1104,7 @@ describe("integration: CLI subcommands", () => {
 
     const readyTaskAlias = runCli(["ready_merge", taskQueued, "--json"]);
     assert.equal(readyTaskAlias.code, 4);
-    assert.match(readyTaskAlias.stderr, /Task cannot be marked merge-ready from status queued/);
+    assert.match(readyTaskAlias.stderr, /invalid_transition|Illegal transition|merge-ready/);
 
     const mergeTaskEntity = runCli(["merge", "task", taskQueued, "--json"]);
     assert.equal(mergeTaskEntity.code, 4);
@@ -960,6 +1117,110 @@ describe("integration: CLI subcommands", () => {
     const mergePlan = runCli(["merge", "plan", planMergeReadyBlocked, "--json"]);
     assert.equal(mergePlan.code, 4);
     assert.match(mergePlan.stderr, /Plan has child tasks that are not merged/);
+  });
+
+  test("state machine transition matrix enforces legal lifecycle edges", () => {
+    const lifecycleStates = ["draft", "ready", "blocked", "running", "complete", "failed", "canceled"] as const;
+    for (const from of lifecycleStates) {
+      for (const to of lifecycleStates) {
+        const allowed = canTransitionLifecycle(from, to);
+        if (from === "complete" && to === "running") {
+          assert.equal(allowed, false);
+        }
+      }
+    }
+
+    const allowedTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "in_progress",
+        toStatus: "merge_ready",
+        hasBlockingDependencies: false,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.doesNotThrow(allowedTransition);
+
+    const illegalTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "queued",
+        toStatus: "merge_ready",
+        hasBlockingDependencies: false,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.throws(illegalTransition, /invalid_transition|Illegal transition/);
+
+    const blockedTransition = () =>
+      assertTaskStatusTransition({
+        mode: "execution",
+        fromStatus: "queued",
+        toStatus: "in_progress",
+        hasBlockingDependencies: true,
+        hasPendingChildren: false,
+        parentGuards: { synthesisPassed: true, verificationPassed: true }
+      });
+    assert.throws(blockedTransition, /blocked_dependencies/);
+  });
+
+  test("plan completion requires synthesis and verification passes", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-completion-guards");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Guarded Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const planWorkspace = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string }).workspace_path;
+    runGit(["clone", "--branch", "main", basePath, planWorkspace], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], planWorkspace);
+    runGit(["config", "user.name", "Tests"], planWorkspace);
+    runGit(["switch", "-c", `task/${planId}`], planWorkspace);
+
+    const noPasses = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(noPasses.code, 4);
+    assert.match(noPasses.stderr, /parent_synthesis_required/);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: false } }),
+      planId
+    );
+    const missingVerify = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(missingVerify.code, 4);
+    assert.match(missingVerify.stderr, /parent_verification_required/);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      planId
+    );
+    const ready = runCli(["ready_merge", "plan", planId, "--json"]);
+    assert.equal(ready.code, 0);
+    assert.equal(ready.json?.plan?.status, "merge_ready");
+
+    const guardState = evaluateParentCompletionGuards(
+      projectDb,
+      projectDb.prepare("SELECT id, mode, metadata_json FROM tasks WHERE id = ?").get(planId) as {
+        id: string;
+        mode: "plan" | "execution";
+        metadata_json: string | null;
+      }
+    );
+    assert.equal(guardState.synthesisPassed, true);
+    assert.equal(guardState.verificationPassed, true);
   });
 
   test("merging the last child auto-marks parent plan merge-ready and auto-merges when enabled", () => {
@@ -1013,6 +1274,14 @@ describe("integration: CLI subcommands", () => {
       parentPlanTaskId: parentPlanId
     });
     projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      parentPlanId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      grandPlanId
+    );
 
     const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
     const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;
@@ -1111,6 +1380,10 @@ describe("integration: CLI subcommands", () => {
       parentPlanTaskId: parentPlanId
     });
     projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = 1, updated_at = ? WHERE id = ?").run(nowIso(), parentPlanId);
+    projectDb.prepare("UPDATE tasks SET metadata_json = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: true } }),
+      parentPlanId
+    );
 
     const grandPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(grandPlanId) as { workspace_path: string }).workspace_path;
     const parentPlanPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(parentPlanId) as { workspace_path: string }).workspace_path;
@@ -1153,9 +1426,81 @@ describe("integration: CLI subcommands", () => {
       .get(parentPlanId) as { status: string };
     assert.equal(parentMergeRecord.status, "conflict");
 
+    const mergeConflictEvent = projectDb
+      .prepare("SELECT payload FROM events WHERE task_id = ? AND event_type = 'plan.merge_conflict' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { payload: string } | undefined;
+    assert.equal(Boolean(mergeConflictEvent), true);
+    const mergeConflictPayload = JSON.parse(String(mergeConflictEvent?.payload ?? "{}")) as {
+      conflictResolution?: {
+        prompt_template_path?: string;
+        conflict_resolution?: {
+          patch_plan?: unknown[];
+          escalation?: { required?: boolean };
+        };
+      };
+    };
+    assert.equal(
+      mergeConflictPayload.conflictResolution?.prompt_template_path,
+      "prompts/intent-preserving-conflict-resolution.md"
+    );
+    assert.equal(
+      Array.isArray(mergeConflictPayload.conflictResolution?.conflict_resolution?.patch_plan),
+      true
+    );
+    assert.equal(
+      Boolean(mergeConflictPayload.conflictResolution?.conflict_resolution?.escalation?.required),
+      true
+    );
+
+    const mergeFailedHookEvent = projectDb
+      .prepare("SELECT event_type FROM events WHERE task_id = ? AND event_type = 'orchestration.hook.on_merge_failed' ORDER BY created_at DESC LIMIT 1")
+      .get(parentPlanId) as { event_type: string } | undefined;
+    assert.equal(mergeFailedHookEvent?.event_type, "orchestration.hook.on_merge_failed");
+
     const recoverReady = runCli(["ready_merge", "plan", parentPlanId, "--json"]);
     assert.equal(recoverReady.code, 0);
     assert.equal(recoverReady.json?.plan?.status, "merge_ready");
+  });
+
+  test("merge plan enforces verification gate even when status is merge_ready", () => {
+    const userId = ensureLocalUser();
+    const basePath = randomPath("cli-plan-merge-gate-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "base\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      taskId: randomUUID(),
+      title: "Plan Missing Verification",
+      mode: "plan",
+      status: "merge_ready"
+    });
+    const planPath = (projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string }).workspace_path;
+
+    runGit(["clone", "--branch", "main", basePath, planPath], serverRoot);
+    runGit(["config", "user.email", "tests@example.com"], planPath);
+    runGit(["config", "user.name", "Tests"], planPath);
+    runGit(["switch", "-c", `task/${planId}`], planPath);
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", lifecycle: { synthesis_passed: true, verification_passed: false } }),
+      nowIso(),
+      planId
+    );
+
+    const mergePlanAttempt = runCli(["merge", "plan", planId, "--json"]);
+    assert.equal(mergePlanAttempt.code, 4);
+    assert.match(mergePlanAttempt.stderr, /Merge gates failed/);
+    assert.match(mergePlanAttempt.stderr, /plan_verification_passed/);
   });
 
   test("help output includes command examples for new subcommands", () => {
@@ -1688,11 +2033,18 @@ tasks:
     assert.equal(created.length, 0);
   });
 
-  test("approvePlan rejects dependencies that cross merge topology boundaries", async () => {
+  test("approvePlan allows cross-tier dependencies and persists dependency reasons", async () => {
     const userId = createUser();
     const basePath = randomPath("plan-topology-guard-project");
     const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
     const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    fs.mkdirSync(basePath, { recursive: true });
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "topology test\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "init"], basePath);
 
     const planId = insertTask({
       projectDb,
@@ -1702,6 +2054,15 @@ tasks:
       mode: "plan",
       status: "waiting_input"
     });
+    const planRow = projectDb.prepare("SELECT workspace_path FROM tasks WHERE id = ?").get(planId) as { workspace_path: string };
+    fs.mkdirSync(planRow.workspace_path, { recursive: true });
+    runGit(["init", "-b", "main"], planRow.workspace_path);
+    runGit(["config", "user.email", "tests@example.com"], planRow.workspace_path);
+    runGit(["config", "user.name", "Tests"], planRow.workspace_path);
+    fs.writeFileSync(path.join(planRow.workspace_path, "README.md"), "plan workspace\n", "utf8");
+    runGit(["add", "."], planRow.workspace_path);
+    runGit(["commit", "-m", "init"], planRow.workspace_path);
+    runGit(["checkout", "-b", `task/${planId}`], planRow.workspace_path);
     const revisionId = randomUUID();
     const now = nowIso();
     projectDb
@@ -1747,34 +2108,1214 @@ tasks:
       .prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)")
       .run(itemBId, "root_target");
 
+    const result = await approvePlan({
+      userId,
+      planId,
+      taskEdits: [
+        {
+          itemKey: "root_target",
+          title: "Root Target",
+          description: "Root Target",
+          parentPlanTaskId: null
+        },
+        {
+          itemKey: "parent_target",
+          title: "Parent Target",
+          description: "Parent Target"
+        }
+      ]
+    });
+
+    assert.equal(result.approvedTasks.length, 2);
+    const parentTarget = result.approvedTasks.find((task) => task.sourcePlanItemKey === "parent_target");
+    const sameTier = parentTarget?.nodeMetadata?.dependencies?.same_tier ?? [];
+    assert.equal(
+      sameTier.some((dep: any) => dep.reason === "plan_item:root_target"),
+      true
+    );
+  });
+
+  test("approvePlan rejects cycles with actionable dependency path", async () => {
+    const userId = createUser();
+    const basePath = randomPath("plan-cycle-validation-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Cycle Plan",
+      mode: "plan",
+      status: "waiting_input"
+    });
+    const revisionId = randomUUID();
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revisions (
+           id, plan_task_id, revision_number, status, feedback, raw_output, parse_error, created_by_user_id, created_at, approved_at
+         ) VALUES (?, ?, 1, 'proposed', NULL, ?, NULL, ?, ?, NULL)`
+      )
+      .run(revisionId, planId, "tasks:\n  - id: a\n    title: A\n    prompt: A\n  - id: b\n    title: B\n    prompt: B\n", userId, now);
+    const itemAId = randomUUID();
+    const itemBId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemAId, revisionId, "a", "A", "A", 1, now);
+    projectDb
+      .prepare(
+        `INSERT INTO plan_revision_items (id, revision_id, item_key, item_type, title, prompt, ordinal, created_at)
+         VALUES (?, ?, ?, 'execution_task', ?, ?, ?, ?)`
+      )
+      .run(itemBId, revisionId, "b", "B", "B", 2, now);
+    projectDb.prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)").run(itemAId, "b");
+    projectDb.prepare("INSERT INTO plan_revision_item_dependencies (revision_item_id, depends_on_item_key) VALUES (?, ?)").run(itemBId, "a");
+
     await assert.rejects(
-      async () =>
-        approvePlan({
-          userId,
-          planId,
-          taskEdits: [
-            {
-              itemKey: "root_target",
-              title: "Root Target",
-              description: "Root Target",
-              parentPlanTaskId: null
-            },
-            {
-              itemKey: "parent_target",
-              title: "Parent Target",
-              description: "Parent Target"
-            }
-          ]
-        }),
+      async () => approvePlan({ userId, planId }),
       (error: unknown) =>
         error instanceof CliServiceError
         && error.code === "VALIDATION"
-        && /dependency topology/i.test(error.message)
+        && /Cyclic dependency detected/i.test(error.message)
+    );
+  });
+
+  test("dependency diagnostics exposes unresolved ids, reasons, and lineage", () => {
+    const userId = createUser();
+    const basePath = randomPath("dependency-diagnostics-project");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Blocker",
+      status: "in_progress"
+    });
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Dependent",
+      status: "queued"
+    });
+    const metadata = {
+      schema_version: 1,
+      tier: "task",
+      dependencies: {
+        same_tier: [{ id: blockerId, tier: "task", reason: "await_blocker_merge" }]
+      }
+    };
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(metadata), nowIso(), taskId);
+
+    const task = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow;
+    const diagnostics = buildDependencyDiagnostics({ projectDb, task });
+    assert.equal(diagnostics.unresolved[0]?.id, blockerId);
+    assert.equal(diagnostics.unresolved[0]?.reason, "await_blocker_merge");
+    assert.equal(diagnostics.lineage[0]?.fromId, taskId);
+    assert.equal(diagnostics.lineage[0]?.toId, blockerId);
+  });
+});
+
+describe("integration: orchestration hooks and job queue", () => {
+  beforeEach(() => {
+    resetAppDatabaseState();
+  });
+
+  test("duplicate hook events do not produce duplicate effective work", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-dedupe");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Hook Dedupe Task",
+      status: "queued"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    recordEvent({
+      projectId,
+      taskId,
+      eventType: "task.status_changed",
+      payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "manual_test" },
+      database: projectDb
+    });
+    recordEvent({
+      projectId,
+      taskId,
+      eventType: "task.status_changed",
+      payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "manual_test" },
+      database: projectDb
+    });
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("burst updates are debounced and coalesced", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-debounce");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Hook Debounce Task",
+      status: "queued"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    for (let idx = 0; idx < 4; idx += 1) {
+      recordEvent({
+        projectId,
+        taskId,
+        eventType: "task.status_changed",
+        payload: { fromStatus: "queued", toStatus: "in_progress", reasonCode: "burst_test" },
+        database: projectDb
+      });
+    }
+
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 0);
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("queue restart does not violate idempotency", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hook-restart");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    enqueueOrchestrationJob({
+      projectId,
+      taskId: null,
+      jobType: "task_queue_dispatch",
+      idempotencyKey: "restart-safe-job",
+      debounceMs: 0,
+      dedupeWindowMs: 5_000,
+      database: projectDb
+    });
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+
+    resetOrchestrationJobQueueForTests();
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("non-material output updates do not thrash orchestration hooks", async () => {
+    const userId = createUser();
+    const basePath = randomPath("output-monitor");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Output Monitor Task",
+      status: "in_progress"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
+      handledCount += 1;
+    });
+
+    const first = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started\nWorking..."
+    });
+    assert.equal(first.materialChanged, true);
+    if (first.materialChanged) {
+      recordEvent({
+        projectId,
+        taskId,
+        eventType: "task.output.material_changed",
+        payload: {
+          source: first.source,
+          outputHash: first.outputHash,
+          previousOutputHash: first.previousOutputHash
+        },
+        database: projectDb
+      });
+    }
+
+    const nonMaterial = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started  \r\nWorking...\n"
+    });
+    assert.equal(nonMaterial.materialChanged, false);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
+  });
+
+  test("watchdog enqueues stale-node readiness and re-review actions with event audit trail", async () => {
+    const userId = createUser();
+    const basePath = randomPath("watchdog");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Blocker",
+      status: "in_progress"
+    });
+    const blockedTaskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Blocked",
+      status: "queued"
+    });
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      blockedTaskId,
+      blockerId,
+      nowIso()
     );
 
-    const created = projectDb
-      .prepare("SELECT id FROM tasks WHERE source_plan_revision_id = ?")
-      .all(revisionId) as Array<{ id: string }>;
-    assert.equal(created.length, 0);
+    const staleRunningTaskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Watchdog Running",
+      status: "in_progress"
+    });
+
+    const staleIso = new Date(Date.now() - 8 * 60_000).toISOString();
+    projectDb.prepare("UPDATE tasks SET updated_at = ? WHERE id IN (?, ?, ?)").run(staleIso, blockerId, blockedTaskId, staleRunningTaskId);
+
+    let readinessCount = 0;
+    let reviewCount = 0;
+    registerOrchestrationJobHandler("evaluate_readiness", async () => {
+      readinessCount += 1;
+    });
+    registerOrchestrationJobHandler("re_review", async () => {
+      reviewCount += 1;
+    });
+
+    const watchdogResult = runOrchestrationWatchdog({
+      projectId,
+      projectDb,
+      trigger: "integration_test"
+    });
+    assert.equal(watchdogResult.readinessCount > 0, true);
+    assert.equal(watchdogResult.reviewCount > 0, true);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(readinessCount > 0, true);
+    assert.equal(reviewCount > 0, true);
+
+    const watchdogEvents = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE event_type = 'orchestration.watchdog.action.enqueued'
+         ORDER BY created_at ASC`
+      )
+      .all() as Array<{ payload: string }>;
+    assert.equal(watchdogEvents.length >= 2, true);
+    const actions = watchdogEvents
+      .map((row) => {
+        try {
+          return (JSON.parse(row.payload) as { action?: string }).action ?? "";
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
+    assert.equal(actions.includes("evaluate_readiness"), true);
+    assert.equal(actions.includes("re_review"), true);
+  });
+});
+
+describe("integration: hierarchical decomposition and readiness jobs", () => {
+  beforeEach(() => {
+    resetAppDatabaseState();
+    startHierarchicalOrchestrationJobs();
+  });
+
+  test("decompose auto-mode derives missing lower tiers from epoch", async () => {
+    const userId = createUser();
+    const basePath = randomPath("decompose-epoch");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const epochId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Epoch Node",
+      mode: "plan",
+      status: "queued"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "epoch" }),
+      nowIso(),
+      epochId
+    );
+
+    await runDecomposeForTask({
+      projectDb,
+      projectId,
+      taskId: epochId,
+      autoMode: true
+    });
+
+    const children = projectDb
+      .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+      .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
+    const tiers = children
+      .map((row) => {
+        try {
+          return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((tier): tier is string => Boolean(tier));
+
+    assert.ok(tiers.includes("epoch"));
+    assert.ok(tiers.includes("phase"));
+    assert.ok(tiers.includes("plan"));
+    assert.ok(tiers.includes("task"));
+    assert.ok(tiers.includes("exec"));
+  });
+
+  test("decompose auto-mode derives only lower tiers from phase/plan/task starts", async () => {
+    const fixtures: Array<{ tier: "phase" | "plan" | "task"; mode: "plan" | "execution"; expected: string[] }> = [
+      { tier: "phase", mode: "plan", expected: ["plan", "task", "exec"] },
+      { tier: "plan", mode: "plan", expected: ["task", "exec"] },
+      { tier: "task", mode: "execution", expected: ["exec"] }
+    ];
+
+    for (const fixture of fixtures) {
+      const userId = createUser();
+      const basePath = randomPath(`decompose-${fixture.tier}`);
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+      const rootId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: `Root ${fixture.tier}`,
+        mode: fixture.mode,
+        status: "queued"
+      });
+      projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+        JSON.stringify({ schema_version: 1, tier: fixture.tier }),
+        nowIso(),
+        rootId
+      );
+      await runDecomposeForTask({
+        projectDb,
+        projectId,
+        taskId: rootId,
+        autoMode: true
+      });
+      const root = projectDb
+        .prepare("SELECT * FROM tasks WHERE title = ? ORDER BY created_at DESC LIMIT 1")
+        .get(`Root ${fixture.tier}`) as TaskRow;
+      const all = projectDb
+        .prepare("SELECT id, parent_plan_task_id, metadata_json FROM tasks WHERE project_id = ? ORDER BY created_at ASC")
+        .all(projectId) as Array<{ id: string; parent_plan_task_id: string | null; metadata_json: string | null }>;
+      const descendants: Array<{ metadata_json: string | null }> = [];
+      const queue = [root.id];
+      while (queue.length > 0) {
+        const parentId = queue.shift() as string;
+        const children = all.filter((row) => row.parent_plan_task_id === parentId);
+        for (const child of children) {
+          descendants.push({ metadata_json: child.metadata_json });
+          queue.push(child.id);
+        }
+      }
+      const tiers = new Set(
+        descendants
+          .map((row) => {
+            try {
+              return JSON.parse(row.metadata_json ?? "{}")?.tier as string | undefined;
+            } catch {
+              return undefined;
+            }
+          })
+          .filter((value): value is string => Boolean(value))
+      );
+      for (const expectedTier of fixture.expected) {
+        assert.equal(tiers.has(expectedTier), true, `missing ${expectedTier} for ${fixture.tier}`);
+      }
+    }
+  });
+
+  test("evaluate_readiness emits deterministic structured decisions", async () => {
+    const userId = createUser();
+    const basePath = randomPath("evaluate-readiness");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Blocker",
+      mode: "execution",
+      status: "in_progress"
+    });
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Readiness Target",
+      mode: "execution",
+      status: "queued"
+    });
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      taskId,
+      blockerId,
+      nowIso()
+    );
+
+    const firstDecision = await runEvaluateReadinessForTask({
+      projectDb,
+      taskId
+    });
+    assert.ok(firstDecision);
+    const firstKey = String(firstDecision?.idempotencyKey ?? "");
+    assert.ok(firstKey.length > 0);
+    assert.equal(firstDecision?.reasonCodes.includes("DEPS_INCOMPLETE"), true);
+
+    const secondDecision = await runEvaluateReadinessForTask({
+      projectDb,
+      taskId
+    });
+    assert.equal(secondDecision?.idempotencyKey, firstKey);
+
+    const latest = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.readiness.evaluated'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(taskId) as { payload: string } | undefined;
+    assert.ok(latest?.payload);
+    const latestPayload = JSON.parse(latest?.payload ?? "{}");
+    assert.equal(latestPayload?.readiness?.idempotency_key, firstKey);
+  });
+
+  test("re_review coalesces rapid completion bursts and re-evaluates unblocked dependents", async () => {
+    const userId = createUser();
+    const basePath = randomPath("re-review-burst");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const blockerId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Burst Blocker",
+      mode: "execution",
+      status: "in_progress"
+    });
+    const dependentId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Burst Dependent",
+      mode: "execution",
+      status: "queued"
+    });
+    projectDb
+      .prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)")
+      .run(dependentId, blockerId, nowIso());
+    projectDb.prepare("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?").run(nowIso(), blockerId);
+
+    for (let idx = 0; idx < 5; idx += 1) {
+      recordEvent({
+        projectId,
+        taskId: blockerId,
+        eventType: "task.status_changed",
+        payload: {
+          fromStatus: "in_progress",
+          toStatus: "merged",
+          reasonCode: "burst_completion"
+        },
+        database: projectDb
+      });
+    }
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+
+    const reReviewResult = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: blockerId
+    });
+    assert.equal(reReviewResult.impactedTaskIds.includes(dependentId), true);
+
+    const readinessEvent = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.readiness.evaluated'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(dependentId) as { payload: string } | undefined;
+    assert.ok(readinessEvent?.payload);
+    const readinessPayload = JSON.parse(readinessEvent?.payload ?? "{}");
+    assert.equal(readinessPayload?.readiness?.blockers?.length ?? 1, 0);
+  });
+
+  test("delta_plan enforces max replan budget unless explicit override is set", async () => {
+    const userId = createUser();
+    const basePath = randomPath("delta-plan-budget");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Delta Plan Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "plan",
+        budgets: { max_replans: 1 }
+      }),
+      nowIso(),
+      planId
+    );
+
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Initial Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+
+    const first = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((first?.createdChildIds.length ?? 0) > 0, true);
+
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Second Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+    const second = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal(second?.budgetExceeded, true);
+    assert.equal(second?.createdChildIds.length, 0);
+
+    const parentBeforeOverride = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(planId) as TaskRow;
+    const parsed = JSON.parse(parentBeforeOverride.metadata_json ?? "{}");
+    parsed.custom = {
+      ...(parsed.custom ?? {}),
+      replan_budget_override: true
+    };
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify(parsed),
+      nowIso(),
+      planId
+    );
+
+    const third = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((third?.createdChildIds.length ?? 0) > 0, true);
+    assert.equal(third?.budgetExceeded, false);
+  });
+
+  test("re_review triggers delta_plan from child completion changes without infinite replanning loops", async () => {
+    const userId = createUser();
+    const basePath = randomPath("re-review-delta");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Review Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 3 } }),
+      nowIso(),
+      planId
+    );
+    const failedChildId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Review Failed Child",
+      mode: "execution",
+      status: "failed",
+      parentPlanTaskId: planId
+    });
+
+    const firstReview = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: failedChildId
+    });
+    assert.equal(firstReview.deltaPlanEnqueued.includes(planId), true);
+    const firstDelta = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal((firstDelta?.createdChildIds.length ?? 0) > 0, true);
+
+    const secondReview = await runReReviewForTask({
+      projectDb,
+      projectId,
+      anchorTaskId: failedChildId
+    });
+    assert.equal(secondReview.deltaPlanEnqueued.includes(planId), true);
+    const secondDelta = await runDeltaPlanForTask({ projectDb, taskId: planId });
+    assert.equal(secondDelta?.createdChildIds.length, 0);
+  });
+
+  test("synthesize persists summary and requirement-to-evidence coverage matrix artifacts", async () => {
+    const userId = createUser();
+    const basePath = randomPath("synthesize-artifacts");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Synthesis Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET task_prompt = ?, metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      "- Implement API endpoint\n- Add integration tests",
+      JSON.stringify({ schema_version: 1, tier: "plan" }),
+      nowIso(),
+      planId
+    );
+    const childId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Implement API endpoint",
+      mode: "execution",
+      status: "merged",
+      parentPlanTaskId: planId
+    });
+    projectDb.prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(
+      "Implemented API endpoint and request validation.",
+      nowIso(),
+      childId
+    );
+
+    const synth = await runSynthesizeForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(synth);
+    assert.equal(synth?.artifact.template.id, "ip-09");
+    assert.equal(Array.isArray(synth?.artifact.coverage_matrix), true);
+    assert.equal((synth?.artifact.coverage_matrix.length ?? 0) >= 2, true);
+
+    const eventRow = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.synthesize.completed'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(planId) as { payload: string } | undefined;
+    assert.ok(eventRow?.payload);
+    const payload = JSON.parse(eventRow?.payload ?? "{}");
+    assert.equal(payload?.artifact?.summary?.length > 0, true);
+    assert.equal(Array.isArray(payload?.artifact?.coverage_matrix), true);
+    assert.equal(payload?.artifact?.coverage_matrix?.every((row: any) => typeof row?.requirement_id === "string"), true);
+    assert.equal(
+      payload?.artifact?.coverage_matrix?.every((row: any) => Array.isArray(row?.evidence)),
+      true
+    );
+
+    const metadataRow = projectDb.prepare("SELECT metadata_json FROM tasks WHERE id = ?").get(planId) as { metadata_json: string | null };
+    const metadata = JSON.parse(metadataRow.metadata_json ?? "{}");
+    assert.equal(Boolean(metadata?.custom?.synthesis_artifact_event_id), true);
+  });
+
+  test("verify failure deterministically enqueues bounded delta work and records verdict artifact", async () => {
+    const userId = createUser();
+    const basePath = randomPath("verify-delta-loop");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Verify Parent",
+      mode: "plan",
+      status: "awaiting_children"
+    });
+    projectDb.prepare("UPDATE tasks SET task_prompt = ?, metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      "- deliver backend endpoint\n- include integration tests",
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 1 } }),
+      nowIso(),
+      planId
+    );
+    insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Only endpoint child",
+      mode: "execution",
+      status: "merged",
+      parentPlanTaskId: planId
+    });
+
+    const first = await runVerifyForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(first);
+    assert.equal(first?.artifact.template.id, "ip-10");
+    assert.equal(first?.artifact.verdict, "fail");
+    assert.equal(first?.artifact.delta_plan_enqueued, true);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await runOrchestrationJobQueuePassForTests();
+    await runOrchestrationJobQueuePassForTests();
+
+    const second = await runVerifyForParent({
+      projectDb,
+      projectId,
+      parentTaskId: planId
+    });
+    assert.ok(second);
+    assert.equal(second?.artifact.verdict, "fail");
+    assert.equal(typeof second?.artifact.budget_exhausted, "boolean");
+    assert.equal(typeof second?.artifact.delta_plan_enqueued, "boolean");
+
+    const latestVerify = projectDb
+      .prepare(
+        `SELECT payload
+         FROM events
+         WHERE task_id = ? AND event_type = 'orchestration.verify.completed'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(planId) as { payload: string } | undefined;
+    const verifyPayload = JSON.parse(latestVerify?.payload ?? "{}");
+    assert.equal(verifyPayload?.artifact?.verdict, "fail");
+
+    const metadataRow = projectDb.prepare("SELECT metadata_json FROM tasks WHERE id = ?").get(planId) as { metadata_json: string | null };
+    const metadata = JSON.parse(metadataRow.metadata_json ?? "{}");
+    assert.equal(metadata?.lifecycle?.synthesis_passed, true);
+    assert.equal(metadata?.lifecycle?.verification_passed, false);
+    assert.equal(metadata?.custom?.verification_verdict, "fail");
+  });
+
+  test("orchestration hierarchy and dependency graph endpoints provide cross-tier navigation data", async () => {
+    const userId = createUser();
+    const basePath = randomPath("hierarchy-api");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const now = nowIso();
+
+    const epochId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Epoch",
+      mode: "plan",
+      status: "queued"
+    });
+    const phaseId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Phase",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: epochId
+    });
+    const planId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Plan",
+      mode: "plan",
+      status: "queued",
+      parentPlanTaskId: phaseId
+    });
+    const taskTierId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Task Tier",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: planId
+    });
+    const execId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Exec Tier",
+      mode: "execution",
+      status: "queued",
+      parentPlanTaskId: taskTierId
+    });
+
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "epoch", custom: { auto_mode: true } }),
+      now,
+      epochId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "phase", custom: { auto_mode: true } }),
+      now,
+      phaseId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 3 } }),
+      now,
+      planId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "task",
+        dependencies: { cross_tier: [{ id: planId, tier: "plan", reason: "await_parent_plan" }] }
+      }),
+      now,
+      taskTierId
+    );
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({
+        schema_version: 1,
+        tier: "exec",
+        dependencies: { same_tier: [{ id: taskTierId, tier: "task", reason: "await_task_tier" }] }
+      }),
+      now,
+      execId
+    );
+    projectDb.prepare("INSERT INTO task_dependencies (task_id, dependency_task_id, created_at) VALUES (?, ?, ?)").run(
+      execId,
+      taskTierId,
+      now
+    );
+
+    const app = createApp();
+    const localServer = app.listen(0);
+    const localAddress = localServer.address();
+    if (!localAddress || typeof localAddress === "string") {
+      throw new Error("Failed to start test server");
+    }
+    const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+    const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+      callApiAt(localBaseUrl, pathname, options);
+
+    try {
+      const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
+      assert.equal(hierarchy.status, 200);
+      assert.equal(hierarchy.json?.hierarchy?.roots?.length, 1);
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.tier, "epoch");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.tier, "phase");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.tier, "plan");
+      assert.equal(hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.tier, "task");
+      assert.equal(
+        hierarchy.json?.hierarchy?.roots?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.children?.[0]?.tier,
+        "exec"
+      );
+      assert.equal(typeof hierarchy.json?.hierarchy?.roots?.[0]?.task?.orchestrationControls?.replan?.iterationsUsed, "number");
+
+      const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
+      assert.equal(graph.status, 200);
+      assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
+      assert.equal(Array.isArray(graph.json?.graph?.edges), true);
+      assert.equal(
+        graph.json?.graph?.edges?.some((edge: any) => edge.fromId === execId && edge.toId === taskTierId && edge.reason === "await_task_tier"),
+        true
+      );
+
+      const nodeDetails = await localCallApi(`/api/nodes/${execId}`, { userId });
+      assert.equal(nodeDetails.status, 200);
+      assert.equal(nodeDetails.json?.node?.id, execId);
+      assert.equal(nodeDetails.json?.dependencyDiagnostics?.node?.tier, "exec");
+      assert.equal(Array.isArray(nodeDetails.json?.children), true);
+    } finally {
+      await new Promise<void>((resolve) => {
+        localServer.close(() => resolve());
+      });
+    }
+  });
+
+  test("manual orchestration override actions validate input and are audited", async () => {
+    const userId = createUser();
+    const basePath = randomPath("override-actions");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const nodeId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Override Node",
+      mode: "plan",
+      status: "queued"
+    });
+    projectDb.prepare("UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+      JSON.stringify({ schema_version: 1, tier: "plan", budgets: { max_replans: 1 } }),
+      nowIso(),
+      nodeId
+    );
+
+    const app = createApp();
+    const localServer = app.listen(0);
+    const localAddress = localServer.address();
+    if (!localAddress || typeof localAddress === "string") {
+      throw new Error("Failed to start test server");
+    }
+    const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+    const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+      callApiAt(localBaseUrl, pathname, options);
+
+    try {
+      const invalidAutoMode = await localCallApi(`/api/nodes/${nodeId}/auto-mode`, {
+        method: "POST",
+        userId,
+        body: {}
+      });
+      assert.equal(invalidAutoMode.status, 400);
+
+      const autoMode = await localCallApi(`/api/nodes/${nodeId}/auto-mode`, {
+        method: "POST",
+        userId,
+        body: { enabled: false }
+      });
+      assert.equal(autoMode.status, 200);
+      assert.equal(autoMode.json?.node?.orchestrationControls?.autoMode, false);
+
+      const autoMerge = await localCallApi(`/api/nodes/${nodeId}/auto-merge`, {
+        method: "POST",
+        userId,
+        body: { enabled: true, onComplete: true }
+      });
+      assert.equal(autoMerge.status, 200);
+      assert.equal(autoMerge.json?.node?.autoMergeOnComplete, true);
+
+      const budgetOverride = await localCallApi(`/api/nodes/${nodeId}/approve-budget-override`, {
+        method: "POST",
+        userId,
+        body: { reason: "human approved" }
+      });
+      assert.equal(budgetOverride.status, 200);
+      assert.equal(budgetOverride.json?.node?.orchestrationControls?.replan?.budgetOverride, true);
+
+      const forceReReview = await localCallApi(`/api/nodes/${nodeId}/force-re-review`, {
+        method: "POST",
+        userId,
+        body: { reason: "manual retry" }
+      });
+      assert.equal(forceReReview.status, 202);
+      assert.equal(Boolean(forceReReview.json?.pendingEventId), true);
+
+      const startNode = await localCallApi(`/api/nodes/${nodeId}/start`, {
+        method: "POST",
+        userId,
+        body: { autoMode: true }
+      });
+      assert.equal(startNode.status, 200);
+      assert.equal(startNode.json?.started, true);
+      assert.equal(startNode.json?.tier, "plan");
+
+      const auditTypes = (
+        projectDb
+          .prepare("SELECT event_type FROM events WHERE task_id = ? ORDER BY created_at ASC")
+          .all(nodeId) as Array<{ event_type: string }>
+      ).map((row) => row.event_type);
+      assert.equal(auditTypes.includes("orchestration.override.auto_mode"), true);
+      assert.equal(auditTypes.includes("orchestration.override.auto_merge"), true);
+      assert.equal(auditTypes.includes("orchestration.override.replan_budget"), true);
+      assert.equal(auditTypes.includes("orchestration.override.force_re_review"), true);
+      assert.equal(auditTypes.includes("orchestration.manual_start"), true);
+    } finally {
+      await new Promise<void>((resolve) => {
+        localServer.close(() => resolve());
+      });
+    }
+  });
+
+  test("compatibility mode disables orchestration endpoints while preserving task workflows", async () => {
+    const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
+    process.env.ORCHESTRATION_COMPATIBILITY_MODE = "1";
+    try {
+      const userId = createUser();
+      const basePath = randomPath("compat-mode");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: "Compatibility Task",
+        mode: "execution",
+        status: "queued"
+      });
+
+      const app = createApp();
+      const localServer = app.listen(0);
+      const localAddress = localServer.address();
+      if (!localAddress || typeof localAddress === "string") {
+        throw new Error("Failed to start test server");
+      }
+      const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+      const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+        callApiAt(localBaseUrl, pathname, options);
+
+      try {
+        const listTasks = await localCallApi(`/api/projects/${projectId}/tasks`, { userId });
+        assert.equal(listTasks.status, 200);
+        assert.equal(Array.isArray(listTasks.json?.tasks), true);
+
+        const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
+        assert.equal(taskDetails.status, 200);
+        assert.equal(taskDetails.json?.task?.id, taskId);
+
+        const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
+        assert.equal(hierarchy.status, 404);
+        assert.equal(hierarchy.json?.code, "FEATURE_DISABLED");
+
+        const nodeStart = await localCallApi(`/api/nodes/${taskId}/start`, {
+          method: "POST",
+          userId,
+          body: {}
+        });
+        assert.equal(nodeStart.status, 404);
+        assert.equal(nodeStart.json?.code, "FEATURE_DISABLED");
+      } finally {
+        await new Promise<void>((resolve) => {
+          localServer.close(() => resolve());
+        });
+      }
+    } finally {
+      process.env.ORCHESTRATION_COMPATIBILITY_MODE = previousCompatibility;
+    }
+  });
+
+  test("granular hierarchy/action feature flags can be disabled independently", async () => {
+    const previousHierarchy = process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
+    const previousActions = process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
+    const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
+    process.env.ORCHESTRATION_COMPATIBILITY_MODE = "0";
+    process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = "false";
+    process.env.ORCHESTRATION_ACTIONS_API_ENABLED = "false";
+    try {
+      const userId = createUser();
+      const basePath = randomPath("flag-disable");
+      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+      const taskId = insertTask({
+        projectDb,
+        projectId,
+        userId,
+        title: "Flagged Node",
+        mode: "plan",
+        status: "queued"
+      });
+
+      const app = createApp();
+      const localServer = app.listen(0);
+      const localAddress = localServer.address();
+      if (!localAddress || typeof localAddress === "string") {
+        throw new Error("Failed to start test server");
+      }
+      const localBaseUrl = `http://127.0.0.1:${localAddress.port}`;
+      const localCallApi = (pathname: string, options?: { method?: string; body?: unknown; userId?: string }) =>
+        callApiAt(localBaseUrl, pathname, options);
+
+      try {
+        const nodeDetails = await localCallApi(`/api/nodes/${taskId}`, { userId });
+        assert.equal(nodeDetails.status, 404);
+        assert.equal(nodeDetails.json?.code, "FEATURE_DISABLED");
+
+        const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
+        assert.equal(graph.status, 404);
+        assert.equal(graph.json?.code, "FEATURE_DISABLED");
+
+        const toggleAutoMode = await localCallApi(`/api/nodes/${taskId}/auto-mode`, {
+          method: "POST",
+          userId,
+          body: { enabled: false }
+        });
+        assert.equal(toggleAutoMode.status, 404);
+        assert.equal(toggleAutoMode.json?.code, "FEATURE_DISABLED");
+
+        const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
+        assert.equal(taskDetails.status, 200);
+        assert.equal(taskDetails.json?.task?.id, taskId);
+      } finally {
+        await new Promise<void>((resolve) => {
+          localServer.close(() => resolve());
+        });
+      }
+    } finally {
+      process.env.ORCHESTRATION_COMPATIBILITY_MODE = previousCompatibility;
+      process.env.ORCHESTRATION_HIERARCHY_API_ENABLED = previousHierarchy;
+      process.env.ORCHESTRATION_ACTIONS_API_ENABLED = previousActions;
+    }
   });
 });

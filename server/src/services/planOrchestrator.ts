@@ -7,11 +7,20 @@ import { approvePlan, extractPlan } from "../application/cliServices.js";
 import type { PlanOrchestrationStateRow, PlanRevisionRow, TaskRow } from "../types.js";
 import { nowIso } from "../utils/time.js";
 import { recordEvent } from "./events.js";
+import { observeNodeOutputMaterialChange } from "./orchestration/outputMonitor.js";
+import { runOrchestrationWatchdog } from "./orchestration/watchdog.js";
+import {
+  enqueueOrchestrationJob,
+  kickOrchestrationJobQueueProcessing,
+  registerOrchestrationJobHandler,
+  type OrchestrationJobType
+} from "./orchestration/jobQueue.js";
 
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
-const PLAN_ORCHESTRATION_INTERVAL_MS = 10_000;
 const PLAN_LOCK_TTL_MS = 3 * 60 * 1000;
 const MAX_PLANS_PER_PASS = 8;
+const PLAN_ORCHESTRATION_JOB_TYPE: OrchestrationJobType = "plan_orchestration_pass";
+const PLAN_ORCHESTRATION_IDEMPOTENCY_KEY = "plan-orchestration:global";
 
 type EligiblePlanRow = {
   id: string;
@@ -21,6 +30,7 @@ type EligiblePlanRow = {
 };
 
 let running = false;
+let planJobRegistered = false;
 
 function planOutputFilePath(workspacePath: string): string {
   return path.join(workspacePath, PLAN_OUTPUT_RELATIVE_PATH);
@@ -316,6 +326,26 @@ async function processPlanOrchestrationPass(): Promise<void> {
       if (!output) {
         continue;
       }
+      const outputMonitor = observeNodeOutputMaterialChange({
+        projectDb: scoped.database,
+        taskId: row.id,
+        source: "plan_file",
+        rawOutput: output.normalized,
+        debounceMs: 1_500
+      });
+      if (outputMonitor.materialChanged) {
+        recordEvent({
+          projectId: row.project_id,
+          taskId: row.id,
+          eventType: "task.output.material_changed",
+          payload: {
+            source: outputMonitor.source,
+            outputHash: outputMonitor.outputHash,
+            previousOutputHash: outputMonitor.previousOutputHash
+          },
+          database: scoped.database
+        });
+      }
       candidates.push({
         projectId: project.id,
         basePath: project.base_path,
@@ -370,14 +400,43 @@ async function runPlanOrchestrationPass(): Promise<void> {
 }
 
 export function kickPlanOrchestrationProcessing(): void {
-  void runPlanOrchestrationPass();
+  const projects = appDb
+    .prepare("SELECT id, base_path FROM projects ORDER BY created_at ASC")
+    .all() as Array<{ id: string; base_path: string }>;
+  for (const project of projects) {
+    const scoped = resolveProjectDatabase({
+      appDb,
+      projectId: project.id,
+      basePath: project.base_path,
+      intent: "write"
+    });
+    enqueueOrchestrationJob({
+      projectId: project.id,
+      jobType: PLAN_ORCHESTRATION_JOB_TYPE,
+      idempotencyKey: `${PLAN_ORCHESTRATION_IDEMPOTENCY_KEY}:${project.id}`,
+      debounceMs: 400,
+      dedupeWindowMs: 2_500,
+      database: scoped.database
+    });
+  }
+  kickOrchestrationJobQueueProcessing();
 }
 
 export function startPlanOrchestrationWorker(): void {
-  void runPlanOrchestrationPass();
-  setInterval(() => {
-    void runPlanOrchestrationPass();
-  }, PLAN_ORCHESTRATION_INTERVAL_MS);
+  if (!planJobRegistered) {
+    registerOrchestrationJobHandler(PLAN_ORCHESTRATION_JOB_TYPE, async (context) => {
+      if (context.payload.metadata?.hookName === "on_timer_tick") {
+        runOrchestrationWatchdog({
+          projectId: context.projectId,
+          projectDb: context.projectDb,
+          trigger: "timer_tick"
+        });
+      }
+      await runPlanOrchestrationPass();
+    });
+    planJobRegistered = true;
+  }
+  kickPlanOrchestrationProcessing();
 }
 
 export async function runPlanOrchestrationPassForTests(): Promise<void> {

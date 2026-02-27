@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "../utils/time.js";
 import { logWarn } from "../utils/structuredLog.js";
-import { projectBaselineMigration } from "./migrations.js";
+import { projectBaselineMigration, projectTaskMetadataMigration } from "./migrations.js";
 import { recordProjectDbFailure } from "./projectDbDiagnostics.js";
 import { openSqliteDatabase } from "./sqlite.js";
 
@@ -105,6 +105,12 @@ function tableExists(db: Database.Database, table: string): boolean {
   return Boolean(row?.ok);
 }
 
+function tableHasColumn(db: Database.Database, table: string, column: string): boolean {
+  if (!tableExists(db, table)) return false;
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
 function getUserVersion(db: Database.Database): number {
   return Number(db.pragma("user_version", { simple: true }) ?? 0);
 }
@@ -136,6 +142,7 @@ function upgradeProjectDbToV2(db: Database.Database): void {
     "auto_merge_on_complete",
     "ALTER TABLE tasks ADD COLUMN auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1))"
   );
+  ensureColumn(db, "tasks", "metadata_json", projectTaskMetadataMigration);
   ensureColumn(
     db,
     "plan_revision_items",

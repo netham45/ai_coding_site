@@ -18,10 +18,28 @@ import { parsePlanOutput } from "../services/planParser.js";
 import { buildEffectivePrompt } from "../services/promptBuilder.js";
 import { kickTaskQueueProcessing } from "../services/queue.js";
 import { buildAutomationVisibility } from "../services/automationVisibility.js";
+import { buildInitialNodeMetadata, readNodeMetadata, serializeNodeMetadata, writeNodeMetadata } from "../services/orchestration/metadata.js";
+import { readReplanControl } from "../services/orchestration/idempotency.js";
+import { runParentCompletionFeedbackLoop } from "../services/orchestration/completion.js";
+import {
+  buildConflictResolutionArtifact,
+  buildMergeGateChecklist,
+  describeFailedMergeGates,
+  requiredMergeGatesPassed
+} from "../services/orchestration/conflictResolution.js";
+import {
+  buildDependencyDiagnostics,
+  partitionDependenciesByTier,
+  resolveAndValidateNodeDependencies,
+  validateProposedNodeGraph
+} from "../services/orchestration/dependencyGraph.js";
+import { enqueueOrchestrationJob, kickOrchestrationJobQueueProcessing } from "../services/orchestration/jobQueue.js";
+import { assertTaskStatusTransition, evaluateParentCompletionGuards } from "../services/orchestration/stateMachine.js";
 import { sendTaskRuntimeInputWorker, startTaskRuntimeWorker } from "../services/runtimeWorker.js";
 import type {
   IdeInstanceRow,
   MergeRecordRow,
+  NodeDependencyRef,
   PlanRevisionItemDependencyRow,
   PlanRevisionItemRow,
   PlanRevisionRow,
@@ -37,7 +55,6 @@ import { nowIso } from "../utils/time.js";
 const mergeLocks = new Set<string>();
 const PLAN_OUTPUT_RELATIVE_PATH = ".ai-plan/latest-plan.yaml";
 const MAX_SUB_PLAN_RECURSION_DEPTH = 6;
-const MERGE_READY_ALLOWED_FROM = new Set<TaskStatus>(["in_progress", "waiting_input", "awaiting_children", "merge_conflict", "merge_ready"]);
 
 export type CliServiceErrorCode = "VALIDATION" | "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE";
 
@@ -220,6 +237,15 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
        ORDER BY dep.created_at ASC`
     )
     .all(task.id) as Array<{ dependency_task_id: string }>;
+  const { metadata: nodeMetadata } = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id)
+  });
+  const replan = readReplanControl(nodeMetadata);
+  const autoMode = typeof nodeMetadata.custom?.auto_mode === "boolean"
+    ? Boolean(nodeMetadata.custom?.auto_mode)
+    : true;
 
   return {
     id: task.id,
@@ -233,6 +259,7 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     autoStart: Boolean(task.auto_start),
     autoMergeOnComplete: Boolean(task.auto_merge_on_complete),
     mode: task.mode,
+    nodeMetadata,
     parentPlanTaskId: task.parent_plan_task_id,
     sourcePlanRevisionId: task.source_plan_revision_id,
     sourcePlanItemKey: task.source_plan_item_key,
@@ -246,6 +273,16 @@ function serializeTask(projectDb: Database.Database, task: TaskRow) {
     dependencyTaskIds: dependencyTaskIds.map((x) => x.dependency_task_id),
     blockedByTaskIds: blockedByTaskIds.map((x) => x.dependency_task_id),
     isBlocked: task.status === "queued" && blockedByTaskIds.length > 0,
+    orchestrationControls: {
+      autoMode,
+      replan: {
+        maxIterations: replan.maxIterations,
+        iterationsUsed: replan.iterationsUsed,
+        remainingIterations: Math.max(0, replan.maxIterations - replan.iterationsUsed),
+        budgetOverride: replan.budgetOverride,
+        gapHashesSeen: replan.gapHashesSeen
+      }
+    },
     createdByUserId: task.created_by_user_id,
     createdAt: task.created_at,
     updatedAt: task.updated_at
@@ -320,38 +357,81 @@ function recordTaskTransition(params: {
   taskId: string;
   fromStatus: string;
   toStatus: string;
-  reason: string;
+  reasonCode: string;
+  reasonDetail?: string;
   actorUserId: string;
 }): void {
+  const reason = params.reasonDetail ? `${params.reasonCode}: ${params.reasonDetail}` : params.reasonCode;
   params.projectDb.prepare(
     `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, params.reason, params.actorUserId, nowIso());
+  ).run(makeId(), params.taskId, params.fromStatus, params.toStatus, reason, params.actorUserId, nowIso());
 }
 
 function setTaskStatus(
   projectDb: Database.Database,
   task: TaskRow,
   nextStatus: TaskStatus,
-  reason: string,
-  actorUserId: string
+  reasonCode: string,
+  actorUserId: string,
+  updates?: {
+    mergedAt?: string | null;
+    mergedByUserId?: string | null;
+    headCommitSha?: string | null;
+    cancelReason?: string | null;
+  }
 ): TaskRow {
   const now = nowIso();
+  const hasBlockingDependencies = taskIsBlocked(projectDb, task.id);
+  const hasPendingChildren = task.mode === "plan" ? hasUnmergedPlanChildren(projectDb, task.id) : false;
+  const parentGuards = evaluateParentCompletionGuards(projectDb, task);
+  let transitionLifecycles: { fromLifecycle: string; toLifecycle: string };
+  try {
+    transitionLifecycles = assertTaskStatusTransition({
+      mode: task.mode,
+      fromStatus: task.status,
+      toStatus: nextStatus,
+      hasBlockingDependencies,
+      hasPendingChildren,
+      parentGuards
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
+  }
+
   projectDb.transaction(() => {
+    const fromStatus = task.status;
     if (nextStatus === "merged") {
-      projectDb.prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, updated_at = ? WHERE id = ?").run(nextStatus, now, task.id);
+      projectDb
+        .prepare(
+          "UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
+        )
+        .run(nextStatus, updates?.mergedAt ?? now, updates?.mergedByUserId ?? actorUserId, updates?.headCommitSha ?? null, now, task.id);
     } else {
       projectDb
-        .prepare("UPDATE tasks SET status = ?, cancel_reason = NULL, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?")
-        .run(nextStatus, now, task.id);
+        .prepare("UPDATE tasks SET status = ?, cancel_reason = ?, merged_at = NULL, merged_by_user_id = NULL, updated_at = ? WHERE id = ?")
+        .run(nextStatus, updates?.cancelReason ?? null, now, task.id);
     }
     recordTaskTransition({
       projectDb,
       taskId: task.id,
-      fromStatus: task.status,
+      fromStatus,
       toStatus: nextStatus,
-      reason,
+      reasonCode,
+      reasonDetail: `lifecycle ${transitionLifecycles.fromLifecycle}->${transitionLifecycles.toLifecycle}`,
       actorUserId
+    });
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "task.status_changed",
+      payload: {
+        fromStatus,
+        toStatus: nextStatus,
+        reasonCode,
+        lifecycle: transitionLifecycles
+      },
+      database: projectDb
     });
   })();
   return projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
@@ -369,33 +449,6 @@ function latestIde(projectDb: Database.Database, taskId: string): IdeInstanceRow
     .get(taskId) as IdeInstanceRow | undefined;
 }
 
-function resolveTaskDependencies(params: {
-  projectDb: Database.Database;
-  projectId: string;
-  dependencyTaskIds: string[];
-  taskId?: string;
-}): TaskRow[] {
-  const unique = [...new Set(params.dependencyTaskIds)];
-  if (unique.length !== params.dependencyTaskIds.length) {
-    throw new CliServiceError("VALIDATION", "Duplicate dependency ids are not allowed");
-  }
-  if (params.taskId && unique.includes(params.taskId)) {
-    throw new CliServiceError("VALIDATION", "A task cannot depend on itself");
-  }
-  if (unique.length === 0) {
-    return [];
-  }
-
-  const placeholders = unique.map(() => "?").join(", ");
-  const rows = params.projectDb
-    .prepare(`SELECT * FROM tasks WHERE project_id = ? AND id IN (${placeholders})`)
-    .all(params.projectId, ...unique) as TaskRow[];
-  if (rows.length !== unique.length) {
-    throw new CliServiceError("VALIDATION", "One or more dependencies were not found in this project");
-  }
-  return rows;
-}
-
 function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
   const row = projectDb
     .prepare(
@@ -409,11 +462,31 @@ function taskIsBlocked(projectDb: Database.Database, taskId: string): boolean {
   return Boolean(row?.task_id);
 }
 
+function dependencyTaskIdsFor(projectDb: Database.Database, taskId: string): string[] {
+  return (
+    projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(taskId) as Array<{ dependency_task_id: string }>
+  ).map((row) => row.dependency_task_id);
+}
+
+function nodeTierForTask(projectDb: Database.Database, task: TaskRow): "epoch" | "phase" | "plan" | "task" | "exec" {
+  return readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata.tier;
+}
+
 function hasUnmergedPlanChildren(projectDb: Database.Database, planTaskId: string): boolean {
   const row = projectDb
     .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' LIMIT 1")
     .get(planTaskId) as { id: string } | undefined;
   return Boolean(row?.id);
+}
+
+function workspaceIsClean(status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>): boolean {
+  return status.untracked === 0 && status.staged === 0 && status.unstaged === 0 && status.conflicted === 0;
 }
 
 function refreshTaskRow(projectDb: Database.Database, taskId: string): TaskRow | undefined {
@@ -472,20 +545,52 @@ async function maybeAdvanceParentPlanAfterChildMerge(params: {
   }
 
   if (latestParent.status !== "merge_ready") {
-    latestParent = setTaskStatus(
-      params.projectDb,
-      latestParent,
-      "merge_ready",
-      "plan_children_merged_auto_merge_ready",
-      params.actorUserId
-    );
-    recordEvent({
+    const completion = await runParentCompletionFeedbackLoop({
+      projectDb: params.projectDb,
       projectId: latestParent.project_id,
-      taskId: latestParent.id,
-      eventType: "plan.mark_merge_ready",
-      payload: { auto: true, reason: "children_merged" },
-      database: params.projectDb
+      parentTaskId: latestParent.id
     });
+    if (!completion?.verified) {
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.parent_completion.blocked",
+        payload: {
+          reason: completion?.budgetExhausted ? "verification_failed_budget_exhausted" : "verification_failed_delta_planned"
+        },
+        database: params.projectDb
+      });
+      return;
+    }
+
+    latestParent = refreshTaskRow(params.projectDb, latestParent.id);
+    if (!latestParent) return;
+
+    try {
+      latestParent = setTaskStatus(
+        params.projectDb,
+        latestParent,
+        "merge_ready",
+        "plan_children_merged_auto_merge_ready",
+        params.actorUserId
+      );
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.mark_merge_ready",
+        payload: { auto: true, reason: "children_merged" },
+        database: params.projectDb
+      });
+    } catch (error: any) {
+      recordEvent({
+        projectId: latestParent.project_id,
+        taskId: latestParent.id,
+        eventType: "plan.parent_completion.blocked",
+        payload: { reason: String(error?.message ?? "parent completion guard failed") },
+        database: params.projectDb
+      });
+      return;
+    }
   }
 
   if (!latestParent.auto_merge_on_complete) {
@@ -601,6 +706,21 @@ function readPlanOutputSource(projectDb: Database.Database, plan: TaskRow): { ra
 
   const raw = getLatestSessionOutput(projectDb, plan.id);
   return { raw, source: "session_output", filePath };
+}
+
+function markPlanLifecycleFlags(projectDb: Database.Database, plan: TaskRow, updates: { synthesisPassed?: boolean; verificationPassed?: boolean; reasonCode: string }): void {
+  const metadataRead = readNodeMetadata({ projectDb, task: plan, dependencyTaskIds: [] });
+  const metadata = metadataRead.metadata;
+  metadata.lifecycle = {
+    synthesis_passed: updates.synthesisPassed ?? metadata.lifecycle?.synthesis_passed,
+    verification_passed: updates.verificationPassed ?? metadata.lifecycle?.verification_passed,
+    last_transition_reason_code: updates.reasonCode
+  };
+  writeNodeMetadata({
+    projectDb,
+    taskId: plan.id,
+    metadata
+  });
 }
 
 function nextRevisionNumber(projectDb: Database.Database, planTaskId: string): number {
@@ -774,6 +894,7 @@ export async function createTask(params: {
   aiCommand?: string;
   autoMerge?: boolean;
   dependencyTaskIds?: string[];
+  dependencyNodeRefs?: NodeDependencyRef[];
 }) {
   const project = projectForUser(params.projectId, params.userId);
   if (!project) {
@@ -797,9 +918,23 @@ export async function createTask(params: {
   const effectivePrompt = buildEffectivePrompt(project, params.taskPrompt);
   const dependencyTaskIds = params.dependencyTaskIds ?? [];
   const autoMerge = Boolean(params.autoMerge);
-  const dependencies = resolveTaskDependencies({ projectDb, projectId: project.id, dependencyTaskIds, taskId: id });
-  const unresolvedDependencies = dependencies.filter((x) => x.status !== "merged");
+  let dependencyResolution: ReturnType<typeof resolveAndValidateNodeDependencies>;
+  try {
+    dependencyResolution = resolveAndValidateNodeDependencies({
+      projectDb,
+      projectId: project.id,
+      nodeId: id,
+      nodeTier: "task",
+      dependencyTaskIds,
+      dependencyNodeRefs: params.dependencyNodeRefs
+    });
+  } catch (error: any) {
+    throw new CliServiceError("VALIDATION", String(error?.message ?? "Invalid dependencies"));
+  }
+  const dependencies = dependencyResolution.taskDependencies;
+  const unresolvedDependencies = dependencyResolution.unresolvedTaskDependencies;
   const isBlocked = unresolvedDependencies.length > 0;
+  const partitionedDeps = partitionDependenciesByTier(dependencyResolution.normalizedDependencies, "task");
 
   let baseCommitSha: string;
   try {
@@ -813,15 +948,49 @@ export async function createTask(params: {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "execution",
+          metadata_json: null,
+          auto_merge: autoMerge ? 1 : 0,
+          auto_start: 0,
+          auto_merge_on_complete: 0,
+          parent_plan_task_id: null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: dependencies.map((dependency) => dependency.id),
+        tier: "task",
+        sameTierDependencies: partitionedDeps.sameTierDependencies,
+        crossTierDependencies: partitionedDeps.crossTierDependencies
+      })
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge,
+        auto_merge, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
-    ).run(id, project.id, params.title, params.taskPrompt, effectivePrompt, aiCommand, autoMerge ? 1 : 0, workspacePath, baseCommitSha, params.userId, now, now);
+      ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 'execution', NULL, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+    ).run(
+      id,
+      project.id,
+      params.title,
+      params.taskPrompt,
+      effectivePrompt,
+      aiCommand,
+      autoMerge ? 1 : 0,
+      metadataJson,
+      workspacePath,
+      baseCommitSha,
+      params.userId,
+      now,
+      now
+    );
 
     projectDb.prepare(
       `INSERT INTO task_state_transitions (id, task_id, from_status, to_status, reason, actor_user_id, created_at)
@@ -845,6 +1014,7 @@ export async function createTask(params: {
       workspacePath,
       baseCommitShaAtCreate: baseCommitSha,
       dependencyTaskIds: dependencies.map((x) => x.id),
+      dependencyNodeRefs: dependencyResolution.normalizedDependencies,
       blockedByTaskIds: unresolvedDependencies.map((x) => x.id),
       blocked: isBlocked
     }
@@ -875,6 +1045,7 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     gitStatus = null;
   }
   const visibility = buildAutomationVisibility(projectDb, task);
+  const dependencyDiagnostics = buildDependencyDiagnostics({ projectDb, task });
 
   return {
     task: serializeTask(projectDb, task),
@@ -883,6 +1054,7 @@ export async function getTaskInfo(params: { userId: string; taskId: string }) {
     ide: serializeIde(latestIde(projectDb, task.id)),
     gitStatus,
     mergeRecords: mergeRecords.map(serializeMergeRecord),
+    dependencyDiagnostics,
     automation: visibility.automation,
     waiting: visibility.waiting,
     orchestration: visibility.orchestration
@@ -959,6 +1131,239 @@ export async function getTaskSummary(params: { userId: string; taskId: string; p
   };
 }
 
+export async function startNode(params: { userId: string; nodeId: string; autoMode?: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, project, projectDb } = scopedTask;
+  const diagnostics = buildDependencyDiagnostics({ projectDb, task });
+  if (diagnostics.unresolved.length > 0) {
+    throw new CliServiceError("CONFLICT", "Node is blocked by unresolved dependencies");
+  }
+  const tier = nodeTierForTask(projectDb, task);
+
+  if (tier === "exec") {
+    try {
+      await startTaskRuntimeWorker(task.id, params.userId, {
+        projectId: project.id,
+        basePath: project.base_path,
+        projectDb
+      });
+    } catch (error: any) {
+      throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
+    }
+  } else {
+    const metadata = readNodeMetadata({
+      projectDb,
+      task,
+      dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+    }).metadata;
+    const autoMode = params.autoMode
+      ?? (typeof metadata.custom?.auto_mode === "boolean" ? Boolean(metadata.custom?.auto_mode) : true);
+    enqueueOrchestrationJob({
+      database: projectDb,
+      projectId: task.project_id,
+      taskId: task.id,
+      jobType: "decompose",
+      idempotencyKey: `manual_start:${task.id}:${makeId()}`,
+      debounceMs: 0,
+      dedupeWindowMs: 250,
+      metadata: {
+        source: "cli.manual_start",
+        actorUserId: params.userId,
+        autoMode
+      }
+    });
+    kickOrchestrationJobQueueProcessing();
+    recordEvent({
+      projectId: task.project_id,
+      taskId: task.id,
+      eventType: "orchestration.manual_start",
+      database: projectDb,
+      payload: {
+        source: "cli",
+        autoMode,
+        actorUserId: params.userId
+      }
+    });
+  }
+
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated), tier };
+}
+
+export async function toggleNodeAutoMode(params: { userId: string; nodeId: string; enabled: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      orchestration: {
+        ...(metadata.orchestration ?? {}),
+        auto_start: params.enabled
+      },
+      custom: {
+        ...(metadata.custom ?? {}),
+        auto_mode: params.enabled
+      }
+    }
+  });
+  projectDb.prepare("UPDATE tasks SET auto_start = ?, updated_at = ? WHERE id = ?").run(params.enabled ? 1 : 0, nowIso(), task.id);
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_mode",
+    database: projectDb,
+    payload: {
+      enabled: params.enabled,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
+}
+
+export async function toggleNodeAutoMerge(params: { userId: string; nodeId: string; enabled: boolean; onComplete?: boolean }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const onComplete = params.onComplete ?? task.mode === "plan";
+  if (onComplete) {
+    projectDb.prepare("UPDATE tasks SET auto_merge_on_complete = ?, updated_at = ? WHERE id = ?").run(
+      params.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  } else {
+    projectDb.prepare("UPDATE tasks SET auto_merge = ?, updated_at = ? WHERE id = ?").run(
+      params.enabled ? 1 : 0,
+      nowIso(),
+      task.id
+    );
+  }
+
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      orchestration: {
+        ...(metadata.orchestration ?? {}),
+        auto_merge: onComplete ? metadata.orchestration?.auto_merge : params.enabled,
+        auto_merge_on_complete: onComplete ? params.enabled : metadata.orchestration?.auto_merge_on_complete
+      }
+    }
+  });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.auto_merge",
+    database: projectDb,
+    payload: {
+      enabled: params.enabled,
+      onComplete,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
+}
+
+export async function forceNodeReReview(params: { userId: string; nodeId: string; reason?: string }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const { pendingEventId } = enqueueOrchestrationJob({
+    database: projectDb,
+    projectId: task.project_id,
+    taskId: task.id,
+    jobType: "re_review",
+    idempotencyKey: `manual_re_review:${task.id}:${makeId()}`,
+    debounceMs: 0,
+    dedupeWindowMs: 250,
+    metadata: {
+      source: "cli.manual_re_review",
+      reason: params.reason ?? null,
+      actorUserId: params.userId
+    }
+  });
+  kickOrchestrationJobQueueProcessing();
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.force_re_review",
+    database: projectDb,
+    payload: {
+      pendingEventId,
+      reason: params.reason ?? null,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  return { ok: true, pendingEventId };
+}
+
+export async function approveNodeBudgetOverride(params: { userId: string; nodeId: string; enabled?: boolean; reason?: string }) {
+  const scopedTask = taskForUser(params.nodeId, params.userId, "write");
+  if (!scopedTask) {
+    throw new CliServiceError("NOT_FOUND", "Node not found");
+  }
+  const { task, projectDb } = scopedTask;
+  const enabled = params.enabled ?? true;
+  const metadata = readNodeMetadata({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
+  }).metadata;
+  writeNodeMetadata({
+    projectDb,
+    taskId: task.id,
+    metadata: {
+      ...metadata,
+      custom: {
+        ...(metadata.custom ?? {}),
+        replan_budget_override: enabled
+      }
+    }
+  });
+  recordEvent({
+    projectId: task.project_id,
+    taskId: task.id,
+    eventType: "orchestration.override.replan_budget",
+    database: projectDb,
+    payload: {
+      enabled,
+      reason: params.reason ?? null,
+      source: "cli",
+      actorUserId: params.userId
+    }
+  });
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  return { node: serializeTask(projectDb, updated) };
+}
+
 export async function startTaskSession(params: { userId: string; taskId: string }) {
   const scopedTask = taskForUser(params.taskId, params.userId, "write");
   if (!scopedTask) {
@@ -1009,8 +1414,17 @@ export async function markTaskMergeReady(params: { userId: string; taskId: strin
     throw new CliServiceError("NOT_FOUND", "Task not found");
   }
   const { task, projectDb } = scopedTask;
-  if (!MERGE_READY_ALLOWED_FROM.has(task.status)) {
-    throw new CliServiceError("CONFLICT", `Task cannot be marked merge-ready from status ${task.status}`);
+  try {
+    assertTaskStatusTransition({
+      mode: task.mode,
+      fromStatus: task.status,
+      toStatus: "merge_ready",
+      hasBlockingDependencies: taskIsBlocked(projectDb, task.id),
+      hasPendingChildren: false,
+      parentGuards: evaluateParentCompletionGuards(projectDb, task)
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
   }
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
   try {
@@ -1050,6 +1464,22 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
   if (task.status !== "merge_ready") {
     throw new CliServiceError("CONFLICT", "Task must be merge_ready before merge");
   }
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
+  try {
+    gitStatus = await getWorkspaceGitStatus(task.workspace_path);
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to read task git status"));
+  }
+  const mergeGateChecklist = buildMergeGateChecklist({
+    task,
+    hasBlockingDependencies: taskIsBlocked(projectDb, task.id),
+    hasPendingChildren: false,
+    workspaceClean: workspaceIsClean(gitStatus),
+    parentGuards: evaluateParentCompletionGuards(projectDb, task)
+  });
+  if (!requiredMergeGatesPassed(mergeGateChecklist)) {
+    throw new CliServiceError("CONFLICT", `Merge gates failed: ${describeFailedMergeGates(mergeGateChecklist)}`);
+  }
 
   const parentPlanTask = parentPlanTaskFor(projectDb, task);
   const topology = resolveTaskGitTopology({ task, project, parentPlanTask });
@@ -1083,51 +1513,43 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
       const completedAt = nowIso();
 
       if (mergeResult.conflicted) {
+        const resolutionArtifact = buildConflictResolutionArtifact({
+          task,
+          parentTask: parentPlanTask,
+          conflictFiles: mergeResult.conflictFiles,
+          mergeGateChecklist,
+          mergeTargetBranch: topology.mergeTargetBranch,
+          sourceCommitSha,
+          targetBaseCommitSha
+        });
         const conflictSummary = mergeResult.conflictFiles.join("\n");
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
-            conflictSummary || "conflicts detected",
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, task.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: task.id,
-            fromStatus: "merge_ready",
-            toStatus: "merge_conflict",
-            reason: "merge_conflict",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
+          conflictSummary || "conflicts detected",
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, task, "merge_conflict", "merge_conflict", params.userId);
         recordEvent({
           projectId: project.id,
           taskId: task.id,
           eventType: "task.merge_conflict",
           database: projectDb,
           payload: {
-            conflictFiles: mergeResult.conflictFiles
+            conflictFiles: mergeResult.conflictFiles,
+            conflictResolution: resolutionArtifact
           }
         });
       } else {
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
-            mergeResult.mergeCommitSha,
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare(
-            "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
-          ).run(completedAt, params.userId, mergeResult.mergeCommitSha, completedAt, task.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: task.id,
-            fromStatus: "merge_ready",
-            toStatus: "merged",
-            reason: "merge_success",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+          mergeResult.mergeCommitSha,
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, task, "merged", "merge_success", params.userId, {
+          mergedAt: completedAt,
+          mergedByUserId: params.userId,
+          headCommitSha: mergeResult.mergeCommitSha
+        });
         recordEvent({
           projectId: project.id,
           taskId: task.id,
@@ -1143,12 +1565,20 @@ export async function mergeTask(params: { userId: string; taskId: string }) {
       }
     } catch (error: any) {
       const completedAt = nowIso();
+      const message = String(error?.message ?? "merge failed");
       projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
-        String(error?.message ?? "merge failed"),
+        message,
         completedAt,
         mergeRecordId
       );
-      throw new CliServiceError("CONFLICT", String(error?.message ?? "Merge failed"));
+      recordEvent({
+        projectId: project.id,
+        taskId: task.id,
+        eventType: "task.merge_failed",
+        database: projectDb,
+        payload: { error: message }
+      });
+      throw new CliServiceError("CONFLICT", message);
     }
 
     const updatedTask = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
@@ -1183,11 +1613,20 @@ export async function markPlanMergeReady(params: { userId: string; planId: strin
     throw new CliServiceError("NOT_FOUND", "Plan not found");
   }
   const { plan, projectDb } = scopedPlan;
-  if (!MERGE_READY_ALLOWED_FROM.has(plan.status)) {
-    throw new CliServiceError("CONFLICT", `Plan cannot be marked merge-ready from status ${plan.status}`);
-  }
   if (hasUnmergedPlanChildren(projectDb, plan.id)) {
     throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
+  }
+  try {
+    assertTaskStatusTransition({
+      mode: plan.mode,
+      fromStatus: plan.status,
+      toStatus: "merge_ready",
+      hasBlockingDependencies: taskIsBlocked(projectDb, plan.id),
+      hasPendingChildren: false,
+      parentGuards: evaluateParentCompletionGuards(projectDb, plan)
+    });
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "illegal transition"));
   }
 
   let status: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
@@ -1231,6 +1670,22 @@ export async function mergePlan(params: { userId: string; planId: string }) {
   if (hasUnmergedPlanChildren(projectDb, plan.id)) {
     throw new CliServiceError("CONFLICT", "Plan has child tasks that are not merged");
   }
+  let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>>;
+  try {
+    gitStatus = await getWorkspaceGitStatus(plan.workspace_path);
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to read plan git status"));
+  }
+  const mergeGateChecklist = buildMergeGateChecklist({
+    task: plan,
+    hasBlockingDependencies: taskIsBlocked(projectDb, plan.id),
+    hasPendingChildren: hasUnmergedPlanChildren(projectDb, plan.id),
+    workspaceClean: workspaceIsClean(gitStatus),
+    parentGuards: evaluateParentCompletionGuards(projectDb, plan)
+  });
+  if (!requiredMergeGatesPassed(mergeGateChecklist)) {
+    throw new CliServiceError("CONFLICT", `Merge gates failed: ${describeFailedMergeGates(mergeGateChecklist)}`);
+  }
 
   const parentPlanTask = parentPlanTaskFor(projectDb, plan);
   const topology = resolveTaskGitTopology({ task: plan, project, parentPlanTask });
@@ -1264,51 +1719,43 @@ export async function mergePlan(params: { userId: string; planId: string }) {
       const completedAt = nowIso();
 
       if (mergeResult.conflicted) {
+        const resolutionArtifact = buildConflictResolutionArtifact({
+          task: plan,
+          parentTask: parentPlanTask,
+          conflictFiles: mergeResult.conflictFiles,
+          mergeGateChecklist,
+          mergeTargetBranch: topology.mergeTargetBranch,
+          sourceCommitSha,
+          targetBaseCommitSha
+        });
         const conflictSummary = mergeResult.conflictFiles.join("\n");
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
-            conflictSummary || "conflicts detected",
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare("UPDATE tasks SET status = 'merge_conflict', updated_at = ? WHERE id = ?").run(completedAt, plan.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: plan.id,
-            fromStatus: "merge_ready",
-            toStatus: "merge_conflict",
-            reason: "merge_conflict",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'conflict', conflict_summary = ?, completed_at = ? WHERE id = ?").run(
+          conflictSummary || "conflicts detected",
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, plan, "merge_conflict", "merge_conflict", params.userId);
         recordEvent({
           projectId: project.id,
           taskId: plan.id,
           eventType: "plan.merge_conflict",
           database: projectDb,
           payload: {
-            conflictFiles: mergeResult.conflictFiles
+            conflictFiles: mergeResult.conflictFiles,
+            conflictResolution: resolutionArtifact
           }
         });
       } else {
-        projectDb.transaction(() => {
-          projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
-            mergeResult.mergeCommitSha,
-            completedAt,
-            mergeRecordId
-          );
-          projectDb.prepare(
-            "UPDATE tasks SET status = 'merged', merged_at = ?, merged_by_user_id = ?, head_commit_sha = ?, updated_at = ? WHERE id = ?"
-          ).run(completedAt, params.userId, mergeResult.mergeCommitSha, completedAt, plan.id);
-          recordTaskTransition({
-            projectDb,
-            taskId: plan.id,
-            fromStatus: "merge_ready",
-            toStatus: "merged",
-            reason: "merge_success",
-            actorUserId: params.userId
-          });
-        })();
+        projectDb.prepare("UPDATE merge_records SET status = 'merged', merge_commit_sha = ?, completed_at = ? WHERE id = ?").run(
+          mergeResult.mergeCommitSha,
+          completedAt,
+          mergeRecordId
+        );
+        setTaskStatus(projectDb, plan, "merged", "merge_success", params.userId, {
+          mergedAt: completedAt,
+          mergedByUserId: params.userId,
+          headCommitSha: mergeResult.mergeCommitSha
+        });
         recordEvent({
           projectId: project.id,
           taskId: plan.id,
@@ -1324,12 +1771,20 @@ export async function mergePlan(params: { userId: string; planId: string }) {
       }
     } catch (error: any) {
       const completedAt = nowIso();
+      const message = String(error?.message ?? "merge failed");
       projectDb.prepare("UPDATE merge_records SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").run(
-        String(error?.message ?? "merge failed"),
+        message,
         completedAt,
         mergeRecordId
       );
-      throw new CliServiceError("CONFLICT", String(error?.message ?? "Merge failed"));
+      recordEvent({
+        projectId: project.id,
+        taskId: plan.id,
+        eventType: "plan.merge_failed",
+        database: projectDb,
+        payload: { error: message }
+      });
+      throw new CliServiceError("CONFLICT", message);
     }
 
     const updatedPlan = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(plan.id) as TaskRow;
@@ -1526,14 +1981,33 @@ export async function createPlan(params: {
   }
 
   projectDb.transaction(() => {
+    const metadataJson = serializeNodeMetadata(
+      buildInitialNodeMetadata({
+        task: {
+          id,
+          project_id: project.id,
+          mode: "plan",
+          metadata_json: null,
+          auto_merge: 0,
+          auto_start: autoStart ? 1 : 0,
+          auto_merge_on_complete: autoMergeOnComplete ? 1 : 0,
+          parent_plan_task_id: parentPlanTask?.id ?? null,
+          source_plan_revision_id: null,
+          source_plan_item_key: null
+        },
+        dependencyTaskIds: [],
+        tier: "plan",
+        crossTierDependencies: parentPlanTask ? [{ id: parentPlanTask.id, tier: "plan", reason: "parent_plan" }] : []
+      })
+    );
     projectDb.prepare(
       `INSERT INTO tasks (
         id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-        auto_merge, auto_start, auto_merge_on_complete,
+        auto_merge, auto_start, auto_merge_on_complete, metadata_json,
         mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
         status, workspace_path, base_commit_sha_at_create, head_commit_sha,
         cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, '', ?, ?, 0, ?, ?, ?, 'plan', ?, NULL, NULL, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
     ).run(
       id,
       project.id,
@@ -1543,6 +2017,7 @@ export async function createPlan(params: {
       aiCommand,
       autoStart ? 1 : 0,
       autoMergeOnComplete ? 1 : 0,
+      metadataJson,
       parentPlanTask?.id ?? null,
       workspacePath,
       baseCommitSha,
@@ -1712,6 +2187,10 @@ export async function extractPlan(params: { userId: string; planId: string }) {
         }
       }
     })();
+    markPlanLifecycleFlags(projectDb, plan, {
+      synthesisPassed: true,
+      reasonCode: "plan_synthesis_passed"
+    });
 
     recordEvent({
       projectId: plan.project_id,
@@ -1901,6 +2380,7 @@ export async function approvePlan(params: {
     taskId: string;
     workspacePath: string;
     dependencyTaskIds: string[];
+    dependencyNodeRefs: NodeDependencyRef[];
     mode: "execution" | "plan";
     parentPlanTaskId: string | null;
     autoStart: boolean;
@@ -1965,6 +2445,7 @@ export async function approvePlan(params: {
       taskId,
       workspacePath: path.join(path.dirname(project.base_path), "tasks", taskId),
       dependencyTaskIds: [],
+      dependencyNodeRefs: [],
       mode,
       parentPlanTaskId,
       autoStart,
@@ -1985,27 +2466,29 @@ export async function approvePlan(params: {
       }
       return depTaskId;
     });
+    row.dependencyNodeRefs = depKeys.map((depKey, idx) => {
+      const depTaskId = row.dependencyTaskIds[idx];
+      const depRow = taskRows.find((candidate) => candidate.taskId === depTaskId);
+      const depTier = depRow?.mode === "plan" ? "plan" : "exec";
+      return {
+        id: depTaskId,
+        tier: depTier,
+        reason: `plan_item:${depKey}`
+      };
+    });
   }
-  const rowByTaskId = new Map(taskRows.map((row) => [row.taskId, row]));
-  for (const row of taskRows) {
-    for (const dependencyTaskId of row.dependencyTaskIds) {
-      const dependencyRow = rowByTaskId.get(dependencyTaskId);
-      if (!dependencyRow) {
-        throw new CliServiceError("CONFLICT", "Revision dependency resolution failed");
-      }
-      if (row.parentPlanTaskId !== dependencyRow.parentPlanTaskId) {
-        throw new CliServiceError(
-          "VALIDATION",
-          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different parent plans`
-        );
-      }
-      if (row.sourcePath !== dependencyRow.sourcePath || row.sourceBranch !== dependencyRow.sourceBranch) {
-        throw new CliServiceError(
-          "VALIDATION",
-          `Invalid dependency topology: ${row.item.item_key} depends on ${dependencyRow.item.item_key} across different merge targets`
-        );
-      }
-    }
+  try {
+    validateProposedNodeGraph({
+      projectDb,
+      projectId: project.id,
+      proposedNodes: taskRows.map((row) => ({
+        id: row.taskId,
+        tier: row.mode === "plan" ? "plan" : "exec",
+        dependencies: row.dependencyNodeRefs
+      }))
+    });
+  } catch (error: any) {
+    throw new CliServiceError("VALIDATION", String(error?.message ?? "Invalid dependency graph"));
   }
 
   try {
@@ -2037,15 +2520,41 @@ export async function approvePlan(params: {
       const basePrompt = [description, prompt].filter(Boolean).join("\n\n");
       const taskPrompt = row.mode === "plan" ? buildPlanTaskPrompt(basePrompt) : basePrompt;
       const aiCommand = resolveAiCommand(edit?.aiCommand?.trim() || undefined, params.userId);
+      const nodeTier = row.mode === "plan" ? "plan" : "exec";
+      const materializedDependencies = [
+        ...row.dependencyNodeRefs,
+        { id: plan.id, tier: "plan" as const, reason: "created_from_plan_revision" }
+      ];
+      const partitionedDeps = partitionDependenciesByTier(materializedDependencies, nodeTier);
+      const metadataJson = serializeNodeMetadata(
+        buildInitialNodeMetadata({
+          task: {
+            id: row.taskId,
+            project_id: project.id,
+            mode: row.mode,
+            metadata_json: null,
+            auto_merge: row.autoMerge ? 1 : 0,
+            auto_start: row.autoStart ? 1 : 0,
+            auto_merge_on_complete: row.autoMergeOnComplete ? 1 : 0,
+            parent_plan_task_id: row.parentPlanTaskId,
+            source_plan_revision_id: latestRevision.id,
+            source_plan_item_key: row.item.item_key
+          },
+          dependencyTaskIds: row.dependencyTaskIds,
+          tier: nodeTier,
+          sameTierDependencies: partitionedDeps.sameTierDependencies,
+          crossTierDependencies: partitionedDeps.crossTierDependencies
+        })
+      );
 
       projectDb.prepare(
         `INSERT INTO tasks (
           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
-          auto_merge, auto_start, auto_merge_on_complete,
+          auto_merge, auto_start, auto_merge_on_complete, metadata_json,
           mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
           status, workspace_path, base_commit_sha_at_create, head_commit_sha,
           cancel_reason, merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
       ).run(
         row.taskId,
         project.id,
@@ -2056,6 +2565,7 @@ export async function approvePlan(params: {
         row.autoMerge ? 1 : 0,
         row.autoStart ? 1 : 0,
         row.autoMergeOnComplete ? 1 : 0,
+        metadataJson,
         row.mode,
         row.parentPlanTaskId,
         latestRevision.id,
@@ -2089,6 +2599,11 @@ export async function approvePlan(params: {
       }
     }
   })();
+  markPlanLifecycleFlags(projectDb, plan, {
+    synthesisPassed: true,
+    verificationPassed: true,
+    reasonCode: "plan_verification_passed"
+  });
 
   recordEvent({
     projectId: project.id,
