@@ -63,7 +63,7 @@ type RuntimeProjectContext = {
 };
 
 const tmuxRoot = path.join(os.tmpdir(), "ai-coding-site-tmux");
-const WAITING_INPUT_IDLE_MS = 65_000;
+const WAITING_INPUT_IDLE_MS = 10_000;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const OUTPUT_PERSIST_INTERVAL_MS = 15000;
 const AUTO_MERGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
