@@ -11,7 +11,9 @@ import type {
   SetNodeAutoMergePayload,
   SetNodeAutoModePayload,
   StartNodePayload,
-  StartNodeResult
+  StartNodeResult,
+  WorkflowDefinition,
+  WorkflowRunState
 } from "./types";
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -98,4 +100,53 @@ export function approveNodeBudgetOverride(
     method: "POST",
     body: JSON.stringify(payload ?? {})
   });
+}
+
+export function listWorkflowDefinitions(projectId: string): Promise<{ definitions: WorkflowDefinition[] }> {
+  return api<{ definitions: WorkflowDefinition[] }>(`/api/projects/${projectId}/workflow-definitions`);
+}
+
+export function getNodeWorkflowStatus(nodeId: string): Promise<{ nodeId: string; workflow: WorkflowRunState | null }> {
+  return api<{ nodeId: string; workflow: WorkflowRunState | null }>(`/api/nodes/${nodeId}/workflow-status`);
+}
+
+export function startWorkflowRun(
+  projectId: string,
+  payload: { workflowDefinitionId: string; taskId?: string | null }
+): Promise<{ workflow: WorkflowRunState }> {
+  return api<{ workflow: WorkflowRunState }>(`/api/projects/${projectId}/workflow-runs/start`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function tickWorkflowRun(projectId: string, runId: string): Promise<{ workflow: WorkflowRunState; progressed: boolean }> {
+  return api<{ workflow: WorkflowRunState; progressed: boolean }>(`/api/projects/${projectId}/workflow-runs/${runId}/tick`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export function cancelWorkflowRun(
+  projectId: string,
+  runId: string,
+  payload?: { reason?: string }
+): Promise<{ workflow: WorkflowRunState }> {
+  return api<{ workflow: WorkflowRunState }>(`/api/projects/${projectId}/workflow-runs/${runId}/cancel`, {
+    method: "POST",
+    body: JSON.stringify(payload ?? {})
+  });
+}
+
+export function setNodeWorkflowAssignment(
+  nodeId: string,
+  payload: { mode: "builtin" | "custom"; workflowDefinitionId?: string | null }
+): Promise<{ workflowAssignment: { mode: "builtin" | "custom"; workflowDefinitionId: string | null } }> {
+  return api<{ workflowAssignment: { mode: "builtin" | "custom"; workflowDefinitionId: string | null } }>(
+    `/api/nodes/${nodeId}/workflow-assignment`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }
+  );
 }
