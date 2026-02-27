@@ -13,6 +13,7 @@ export type TaskStatus =
 
 export type TaskMode = "execution" | "plan";
 export type NodeTier = "epoch" | "phase" | "plan" | "task" | "exec";
+export type UserNodeTier = "epoch" | "phase" | "plan" | "task";
 
 export type NodeDependencyRef = {
   id: string;
