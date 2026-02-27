@@ -1164,39 +1164,17 @@ export async function startNode(params: { userId: string; nodeId: string; autoMo
   }
   const tier = nodeTierForTask(projectDb, task);
 
-  if (tier === "exec") {
-    try {
-      await startTaskRuntimeWorker(task.id, params.userId, {
-        projectId: project.id,
-        basePath: project.base_path,
-        projectDb
-      });
-    } catch (error: any) {
-      throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
-    }
-  } else {
-    const metadata = readNodeMetadata({
-      projectDb,
-      task,
-      dependencyTaskIds: dependencyTaskIdsFor(projectDb, task.id)
-    }).metadata;
-    const autoMode = params.autoMode
-      ?? (typeof metadata.custom?.auto_mode === "boolean" ? Boolean(metadata.custom?.auto_mode) : true);
-    enqueueOrchestrationJob({
-      database: projectDb,
-      projectId: task.project_id,
-      taskId: task.id,
-      jobType: "decompose",
-      idempotencyKey: `manual_start:${task.id}:${makeId()}`,
-      debounceMs: 0,
-      dedupeWindowMs: 250,
-      metadata: {
-        source: "cli.manual_start",
-        actorUserId: params.userId,
-        autoMode
-      }
+  try {
+    await startTaskRuntimeWorker(task.id, params.userId, {
+      projectId: project.id,
+      basePath: project.base_path,
+      projectDb
     });
-    kickOrchestrationJobQueueProcessing();
+  } catch (error: any) {
+    throw new CliServiceError("CONFLICT", String(error?.message ?? "Failed to start node runtime"));
+  }
+
+  if (tier !== "exec") {
     recordEvent({
       projectId: task.project_id,
       taskId: task.id,
@@ -1204,8 +1182,9 @@ export async function startNode(params: { userId: string; nodeId: string; autoMo
       database: projectDb,
       payload: {
         source: "cli",
-        autoMode,
-        actorUserId: params.userId
+        requestedAutoMode: typeof params.autoMode === "boolean" ? params.autoMode : null,
+        actorUserId: params.userId,
+        strategy: "runtime_session"
       }
     });
   }

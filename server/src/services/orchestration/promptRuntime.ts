@@ -11,8 +11,8 @@ const decompositionTemplateByTier: Record<NodeTier, string> = {
   epoch: path.join(workspaceRoot, "prompts", "epoch-to-phases.md"),
   phase: path.join(workspaceRoot, "prompts", "phase-to-plans.md"),
   plan: path.join(workspaceRoot, "prompts", "plan-to-subplans-and-tasks.md"),
-  task: path.join(workspaceRoot, "prompts", "task-execution.md"),
-  exec: path.join(workspaceRoot, "prompts", "exec-task-runner.md")
+  task: path.join(workspaceRoot, "prompts", "task-to-exec-tasks.md"),
+  exec: path.join(workspaceRoot, "prompts", "task-to-exec-tasks.md")
 };
 
 const readinessTemplatePath = path.join(workspaceRoot, "prompts", "readiness-evaluation.md");

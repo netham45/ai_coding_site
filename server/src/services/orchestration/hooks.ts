@@ -93,7 +93,7 @@ function isChildWorkFinishedChange(context: EventContext): boolean {
 
 function jobsForHook(hookName: OrchestrationHookName, context: EventContext): OrchestrationJobRequest[] {
   const taskScopedJobs: OrchestrationJobRequest[] =
-    context.taskId && context.projectId
+    context.taskId && context.projectId && hookName !== "on_node_created"
       ? [
           {
             jobType: "evaluate_readiness",
@@ -106,18 +106,6 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
           }
         ]
       : [];
-
-  if (hookName === "on_node_created" && context.taskId && context.projectId) {
-    taskScopedJobs.push({
-      jobType: "decompose",
-      idempotencyKey: buildKey(`hook:${hookName}:decompose`, context),
-      debounceMs: DEFAULT_DEBOUNCE_MS,
-      dedupeWindowMs: DEFAULT_DEDUPE_WINDOW_MS,
-      projectId: context.projectId,
-      taskId: context.taskId,
-      payload: { hookName, eventType: context.eventType, autoMode: true }
-    });
-  }
 
   if (hookName === "on_status_changed" && context.taskId && context.projectId && isCompletionStatusChange(context)) {
     taskScopedJobs.push({
