@@ -24,11 +24,27 @@ import {
   Textarea,
   useToast
 } from "@chakra-ui/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link as RouterLink, useSearchParams, useParams } from "react-router-dom";
-import { api } from "../api/client";
+import { api, getDependencyGraph, getHierarchy } from "../api/client";
+import { NodeDependencyPicker, type DependencyPickerCandidate } from "../components/NodeDependencyPicker";
 import { TaskSidebar } from "../components/TaskSidebar";
-import type { GitStatusSummary, IdeInstance, MergeRecord, PlanRevision, Project, Task, TaskSession, TaskTransition, UserSettings } from "../api/types";
+import type {
+  DependencyGraphEdge,
+  DependencyGraphNode,
+  GitStatusSummary,
+  HierarchyNodeRow,
+  IdeInstance,
+  MergeRecord,
+  NodeDependencyRef,
+  NodeTier,
+  PlanRevision,
+  Project,
+  Task,
+  TaskSession,
+  TaskTransition,
+  UserSettings
+} from "../api/types";
 
 type TaskDetailResponse = {
   task: Task;
@@ -69,6 +85,7 @@ type PlanItemDraft = {
   prompt: string;
   aiCommandSelection: string;
   aiCommandOverride: string;
+  dependencyNodeRefs: NodeDependencyRef[];
 };
 
 const AI_COMMAND_OTHER = "__other__";
@@ -96,6 +113,9 @@ export function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null);
   const [projectName, setProjectName] = useState<string>("");
   const [projectTasks, setProjectTasks] = useState<Task[]>([]);
+  const [hierarchyRows, setHierarchyRows] = useState<HierarchyNodeRow[]>([]);
+  const [dependencyGraphNodes, setDependencyGraphNodes] = useState<DependencyGraphNode[]>([]);
+  const [dependencyGraphEdges, setDependencyGraphEdges] = useState<DependencyGraphEdge[]>([]);
   const [transitions, setTransitions] = useState<TaskTransition[]>([]);
   const [mergeRecords, setMergeRecords] = useState<MergeRecord[]>([]);
   const [session, setSession] = useState<TaskSession | null>(null);
@@ -124,6 +144,52 @@ export function TaskDetailPage() {
   const autoStartedForTaskRef = useRef<Set<string>>(new Set());
   const latestFailedTransition = transitions.find((item) => item.toStatus === "failed");
   const runtimeFailureReason = session?.failureReason || latestFailedTransition?.reason || null;
+  const dependencyCandidates = useMemo<DependencyPickerCandidate[]>(() => {
+    const unresolvedByNodeId = new Map<string, number>();
+    for (const edge of dependencyGraphEdges) {
+      if (!edge.unresolved) continue;
+      unresolvedByNodeId.set(edge.fromId, (unresolvedByNodeId.get(edge.fromId) ?? 0) + 1);
+    }
+
+    const byId = new Map<string, DependencyPickerCandidate>();
+    for (const row of hierarchyRows) {
+      byId.set(row.task.id, {
+        id: row.task.id,
+        title: row.task.title,
+        tier: row.tier,
+        status: row.task.status,
+        isBlocked: row.task.isBlocked || row.waiting.waiting,
+        unresolvedDependencyCount: row.waiting.unresolvedDependencyDetails.length || unresolvedByNodeId.get(row.task.id) || 0
+      });
+    }
+
+    for (const node of dependencyGraphNodes) {
+      if (byId.has(node.id)) continue;
+      byId.set(node.id, {
+        id: node.id,
+        title: node.title,
+        tier: node.tier,
+        status: node.status,
+        isBlocked: unresolvedByNodeId.has(node.id),
+        unresolvedDependencyCount: unresolvedByNodeId.get(node.id) ?? 0
+      });
+    }
+
+    for (const item of projectTasks) {
+      if (byId.has(item.id)) continue;
+      const tier: NodeTier = item.mode === "plan" ? "plan" : "task";
+      byId.set(item.id, {
+        id: item.id,
+        title: item.title,
+        tier,
+        status: item.status,
+        isBlocked: item.isBlocked || unresolvedByNodeId.has(item.id),
+        unresolvedDependencyCount: unresolvedByNodeId.get(item.id) ?? 0
+      });
+    }
+
+    return Array.from(byId.values()).sort((a, b) => a.title.localeCompare(b.title));
+  }, [dependencyGraphEdges, dependencyGraphNodes, hierarchyRows, projectTasks]);
 
   async function loadTask() {
     if (!entityId) return;
@@ -150,12 +216,17 @@ export function TaskDetailPage() {
   }
 
   async function loadProjectContext(projectId: string) {
-    const [tasksRes, projectRes] = await Promise.all([
+    const [tasksRes, projectRes, hierarchyRes, dependencyGraphRes] = await Promise.all([
       api<TasksResponse>(`/api/projects/${projectId}/tasks`),
-      api<ProjectResponse>(`/api/projects/${projectId}`)
+      api<ProjectResponse>(`/api/projects/${projectId}`),
+      getHierarchy(projectId).catch(() => null),
+      getDependencyGraph(projectId).catch(() => null)
     ]);
     setProjectTasks(tasksRes.tasks);
     setProjectName(projectRes.project.name);
+    setHierarchyRows(hierarchyRes?.hierarchy.nodes ?? []);
+    setDependencyGraphNodes(dependencyGraphRes?.graph.nodes ?? []);
+    setDependencyGraphEdges(dependencyGraphRes?.graph.edges ?? []);
   }
 
   async function loadAiCommandOptions() {
@@ -179,6 +250,7 @@ export function TaskDetailPage() {
           prompt: existing?.prompt ?? "",
           aiCommandSelection: existing?.aiCommandSelection ?? fallbackCommand,
           aiCommandOverride: existing?.aiCommandOverride ?? "",
+          dependencyNodeRefs: existing?.dependencyNodeRefs ?? [],
           ...updates
         }
       };
@@ -465,7 +537,8 @@ export function TaskDetailPage() {
         description: item.prompt,
         prompt: "",
         aiCommandSelection: taskAiCommandOptions[0] || DEFAULT_AI_COMMAND,
-        aiCommandOverride: ""
+        aiCommandOverride: "",
+        dependencyNodeRefs: []
       };
       const aiCommand = draft.aiCommandSelection === AI_COMMAND_OTHER ? draft.aiCommandOverride.trim() : draft.aiCommandSelection.trim();
       return {
@@ -473,7 +546,14 @@ export function TaskDetailPage() {
         title: draft.title.trim(),
         description: draft.description.trim(),
         prompt: draft.prompt.trim(),
-        aiCommand
+        aiCommand,
+        dependencyNodeRefs: draft.dependencyNodeRefs
+          .map((ref) => ({
+            id: ref.id.trim(),
+            tier: ref.tier,
+            reason: ref.reason?.trim() || undefined
+          }))
+          .filter((ref) => ref.id.length > 0)
       };
     });
 
@@ -548,7 +628,8 @@ export function TaskDetailPage() {
         description: item.prompt,
         prompt: "",
         aiCommandSelection: defaultCommand,
-        aiCommandOverride: ""
+        aiCommandOverride: "",
+        dependencyNodeRefs: []
       };
     }
     setPlanItemDrafts(next);
@@ -576,6 +657,8 @@ export function TaskDetailPage() {
   const synthesisArtifact = task.completion?.synthesisArtifact;
   const verificationArtifact = task.completion?.verificationArtifact;
   const deltaLoopHistory = task.completion?.deltaLoopHistory ?? [];
+  const currentHierarchyRow = hierarchyRows.find((row) => row.task.id === task.id);
+  const unresolvedUpstreamRefs = currentHierarchyRow?.waiting.unresolvedDependencyDetails ?? [];
 
   const renderIdePanel = (height: string) => {
     if (ideLaunchUrl) {
@@ -988,6 +1071,19 @@ export function TaskDetailPage() {
                                         placeholder="Task description"
                                       />
                                     </Box>
+                                    <NodeDependencyPicker
+                                      label="Dependency Node Refs"
+                                      value={getPlanItemDraft(item.itemKey)?.dependencyNodeRefs ?? []}
+                                      candidates={dependencyCandidates}
+                                      onChange={(refs) => {
+                                        updatePlanItemDraft(
+                                          item.itemKey,
+                                          { dependencyNodeRefs: refs },
+                                          { title: item.title, description: item.prompt }
+                                        );
+                                      }}
+                                      helperText="Select cross-tier upstream refs. Blocked/unresolved candidates are highlighted before approval."
+                                    />
                                     <Box>
                                       <Text fontSize="sm" color="gray.700" mb={1}>
                                         AI Command
@@ -1100,7 +1196,23 @@ export function TaskDetailPage() {
                         {title}
                       </Text>
                     ))}
-                    {!task.dependencyTaskIds.length && <Text color="gray.600">No dependencies.</Text>}
+                    {!!unresolvedUpstreamRefs.length && (
+                      <Box border="1px solid" borderColor="orange.200" borderRadius="md" bg="orange.50" p={3}>
+                        <Text fontSize="sm" color="orange.800" fontWeight="600">
+                          unresolved upstream refs: {unresolvedUpstreamRefs.length}
+                        </Text>
+                        <Stack spacing={1} mt={1}>
+                          {unresolvedUpstreamRefs.map((ref, index) => (
+                            <Text key={`${ref.id}-${index}`} fontSize="sm" color="orange.800">
+                              [{ref.tier}] {ref.id}
+                              {ref.reason ? ` - ${ref.reason}` : ""}
+                              {ref.status ? ` (${ref.status})` : ""}
+                            </Text>
+                          ))}
+                        </Stack>
+                      </Box>
+                    )}
+                    {!task.dependencyTaskIds.length && !unresolvedUpstreamRefs.length && <Text color="gray.600">No dependencies.</Text>}
                   </Stack>
                 </Box>
 
