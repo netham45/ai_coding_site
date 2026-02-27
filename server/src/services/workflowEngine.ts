@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
 import type { WorkflowRunRow, WorkflowStageRunRow } from "../types.js";
+import type { DeterministicWorkflowCheck } from "./workflowChecks.js";
+import { runDeterministicChecksForStageRun } from "./workflowChecks.js";
 import {
   createWorkflowEvent,
   createWorkflowStageRun,
@@ -18,12 +20,14 @@ export type WorkflowEngineStageDefinition = {
   key: string;
   dependsOn: string[];
   maxAttempts: number;
+  deterministicChecks: DeterministicWorkflowCheck[];
 };
 
 export type WorkflowEngineHandleEventInput = {
   db: Database.Database;
   workflowRunId: string;
   eventType:
+    | "workflow.node.merged"
     | "workflow.stage.waiting_input"
     | "workflow.stage.input_received"
     | "workflow.stage.verifying"
@@ -76,6 +80,134 @@ function normalizeMaxAttempts(raw: unknown): number {
   return 1;
 }
 
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function readStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const strings = value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+  return strings.length === value.length ? strings : null;
+}
+
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readComparator(value: unknown): "eq" | "gte" | "lte" {
+  return value === "gte" || value === "lte" ? value : "eq";
+}
+
+function parseDeterministicCheck(entry: unknown): DeterministicWorkflowCheck | null {
+  if (!entry || typeof entry !== "object") return null;
+  const row = entry as Record<string, unknown>;
+  const type = readString(row.type);
+  const name = readString(row.name);
+  if (!type || !name) return null;
+
+  if (type === "file_created") {
+    const relativePath = readString(row.relativePath);
+    if (!relativePath) return null;
+    return {
+      type,
+      name,
+      relativePath,
+      baselineExists: typeof row.baselineExists === "boolean" ? row.baselineExists : undefined,
+      since: readString(row.since) ?? undefined
+    };
+  }
+  if (type === "file_exists") {
+    const relativePath = readString(row.relativePath);
+    return relativePath ? { type, name, relativePath } : null;
+  }
+  if (type === "file_modified_within") {
+    const relativePath = readString(row.relativePath);
+    const withinSeconds = readNumber(row.withinSeconds);
+    if (!relativePath || withinSeconds === null) return null;
+    return {
+      type,
+      name,
+      relativePath,
+      withinSeconds,
+      now: readString(row.now) ?? undefined
+    };
+  }
+  if (type === "line_present_in_file") {
+    const relativePath = readString(row.relativePath);
+    const line = readString(row.line);
+    if (!relativePath || !line) return null;
+    return {
+      type,
+      name,
+      relativePath,
+      line,
+      caseSensitive: typeof row.caseSensitive === "boolean" ? row.caseSensitive : undefined
+    };
+  }
+  if (type === "json_path_equals") {
+    const relativePath = readString(row.relativePath);
+    const jsonPath = readString(row.jsonPath);
+    if (!relativePath || !jsonPath) return null;
+    return {
+      type,
+      name,
+      relativePath,
+      jsonPath,
+      expected: row.expected
+    };
+  }
+  if (type === "command_exit_code") {
+    const command = readStringArray(row.command);
+    const expectedExitCode = readNumber(row.expectedExitCode);
+    if (!command || expectedExitCode === null) return null;
+    return {
+      type,
+      name,
+      command,
+      expectedExitCode,
+      cwdRelative: readString(row.cwdRelative) ?? undefined,
+      timeoutMs: readNumber(row.timeoutMs) ?? undefined
+    };
+  }
+  if (type === "stage_complete") {
+    const stageRunId = readString(row.stageRunId);
+    if (!stageRunId) return null;
+    const expectedStatus = row.expectedStatus;
+    const validExpected = expectedStatus === "succeeded" || expectedStatus === "failed" || expectedStatus === "skipped"
+      || expectedStatus === "cancelled"
+      ? expectedStatus
+      : undefined;
+    return {
+      type,
+      name,
+      stageRunId,
+      expectedStatus: validExpected
+    };
+  }
+  if (type === "node_merged") {
+    const nodeId = readString(row.nodeId);
+    return nodeId ? { type, name, nodeId } : null;
+  }
+  if (type === "child_nodes_created_count") {
+    const parentNodeId = readString(row.parentNodeId);
+    const expectedCount = readNumber(row.expectedCount);
+    if (!parentNodeId || expectedCount === null) return null;
+    return {
+      type,
+      name,
+      parentNodeId,
+      expectedCount,
+      comparator: readComparator(row.comparator)
+    };
+  }
+  return null;
+}
+
+function normalizeDeterministicChecks(raw: unknown): DeterministicWorkflowCheck[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(parseDeterministicCheck).filter((entry): entry is DeterministicWorkflowCheck => Boolean(entry));
+}
+
 function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefinition[] {
   const asJson = safeParseJson(definitionYaml);
   if (asJson && typeof asJson === "object" && Array.isArray((asJson as { stages?: unknown[] }).stages)) {
@@ -88,7 +220,10 @@ function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefin
         return {
           key,
           dependsOn: normalizeDependsOn(row.depends_on ?? row.dependsOn),
-          maxAttempts: normalizeMaxAttempts(row.max_attempts ?? row.maxAttempts)
+          maxAttempts: normalizeMaxAttempts(row.max_attempts ?? row.maxAttempts),
+          deterministicChecks: normalizeDeterministicChecks(
+            row.deterministic_checks ?? row.deterministicChecks ?? row.checks
+          )
         } satisfies WorkflowEngineStageDefinition;
       })
       .filter((entry): entry is WorkflowEngineStageDefinition => Boolean(entry));
@@ -108,7 +243,7 @@ function parseStageDefinitions(definitionYaml: string): WorkflowEngineStageDefin
     }
     if (line.startsWith("- ")) {
       if (current && current.key) out.push(current);
-      current = { key: "", dependsOn: [], maxAttempts: 1 };
+      current = { key: "", dependsOn: [], maxAttempts: 1, deterministicChecks: [] };
       const content = line.slice(2).trim();
       if (content.startsWith("id:")) current.key = content.slice(3).trim();
       if (content.startsWith("key:")) current.key = content.slice(4).trim();
@@ -168,6 +303,38 @@ function stageAttemptCount(db: Database.Database, stageRunId: string): number {
 
 function stageDefinitionByKey(definitions: WorkflowEngineStageDefinition[]): Map<string, WorkflowEngineStageDefinition> {
   return new Map(definitions.map((row) => [row.key, row]));
+}
+
+function runWorkspacePath(db: Database.Database, run: WorkflowRunRow): string {
+  if (!run.task_id) return process.cwd();
+  const row = db.prepare("SELECT workspace_path FROM tasks WHERE id = ? LIMIT 1").get(run.task_id) as
+    | { workspace_path: string }
+    | undefined;
+  return row?.workspace_path || process.cwd();
+}
+
+function deterministicCheckGate(params: {
+  db: Database.Database;
+  run: WorkflowRunRow;
+  stageRunId: string;
+  checks: DeterministicWorkflowCheck[];
+}): { passed: true; failedCheckNames: [] } | { passed: false; failedCheckNames: string[] } {
+  if (params.checks.length === 0) {
+    return { passed: true, failedCheckNames: [] };
+  }
+  const evaluated = runDeterministicChecksForStageRun({
+    db: params.db,
+    workflowStageRunId: params.stageRunId,
+    workspacePath: runWorkspacePath(params.db, params.run),
+    checks: params.checks
+  });
+  if (evaluated.allPassed) {
+    return { passed: true, failedCheckNames: [] };
+  }
+  return {
+    passed: false,
+    failedCheckNames: evaluated.checkResults.filter((row) => row.status !== "pass").map((row) => row.check_name)
+  };
 }
 
 function createLifecycleEventIfChanged(
@@ -241,6 +408,20 @@ function hasDuplicateEventByIdempotency(
   });
 }
 
+function hasDuplicateRunEventByIdempotency(
+  db: Database.Database,
+  params: { workflowRunId: string; eventType: string; idempotencyKey: string }
+): boolean {
+  const events = db
+    .prepare("SELECT event_type, payload FROM workflow_events WHERE workflow_run_id = ? ORDER BY created_at ASC")
+    .all(params.workflowRunId) as Array<{ event_type: string; payload: string }>;
+  return events.some((event) => {
+    if (event.event_type !== params.eventType) return false;
+    const payload = safeParseJson(event.payload) as { idempotencyKey?: unknown } | null;
+    return payload?.idempotencyKey === params.idempotencyKey;
+  });
+}
+
 export function startWorkflowRun(params: { db: Database.Database; workflowRunId: string }): WorkflowRunRow {
   const run = getWorkflowRunById(params.db, params.workflowRunId);
   if (!run) {
@@ -286,14 +467,24 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
       const definitionForStage = definitionsByKey.get(pending.stage_key);
       const deps = definitionForStage?.dependsOn ?? [];
       const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-      if (unresolved.length === 0) continue;
+      const checks = definitionForStage?.deterministicChecks ?? [];
+      const checkGate = deterministicCheckGate({
+        db: params.db,
+        run,
+        stageRunId: pending.id,
+        checks
+      });
+      if (unresolved.length === 0 && checkGate.passed) continue;
       if (
         createLifecycleEventIfChanged(params.db, {
           workflowRunId: run.id,
           stageRunId: pending.id,
           state: "blocked",
-          reason: "dependency_gate",
-          extra: { unresolvedDependsOn: unresolved }
+          reason: unresolved.length > 0 ? "dependency_gate" : "deterministic_checks_pending",
+          extra: {
+            unresolvedDependsOn: unresolved,
+            failedChecks: checkGate.failedCheckNames
+          }
         })
       ) {
         gatedStateChanged = true;
@@ -327,14 +518,24 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const definitionForStage = definitionsByKey.get(pending.stage_key);
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-    if (unresolved.length === 0) continue;
+    const checks = definitionForStage?.deterministicChecks ?? [];
+    const checkGate = deterministicCheckGate({
+      db: params.db,
+      run,
+      stageRunId: pending.id,
+      checks
+    });
+    if (unresolved.length === 0 && checkGate.passed) continue;
     if (
       createLifecycleEventIfChanged(params.db, {
         workflowRunId: run.id,
         stageRunId: pending.id,
         state: "blocked",
-        reason: "dependency_gate",
-        extra: { unresolvedDependsOn: unresolved }
+        reason: unresolved.length > 0 ? "dependency_gate" : "deterministic_checks_pending",
+        extra: {
+          unresolvedDependsOn: unresolved,
+          failedChecks: checkGate.failedCheckNames
+        }
       })
     ) {
       progressed = true;
@@ -346,6 +547,14 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
     if (unresolved.length > 0) continue;
+    const checks = definitionForStage?.deterministicChecks ?? [];
+    const checkGate = deterministicCheckGate({
+      db: params.db,
+      run,
+      stageRunId: pending.id,
+      checks
+    });
+    if (!checkGate.passed) continue;
 
     createLifecycleEventIfChanged(params.db, {
       workflowRunId: run.id,
@@ -398,28 +607,39 @@ export function handleEvent(input: WorkflowEngineHandleEventInput): { run: Workf
   if (!definition) {
     throw new Error(`workflow definition not found: ${run.workflow_definition_id}`);
   }
-  const stageDefinitions = stageDefinitionByKey(parseStageDefinitions(definition.definition_yaml));
+  const parsedStages = parseStageDefinitions(definition.definition_yaml);
+  const stageDefinitions = stageDefinitionByKey(parsedStages);
   const stageRuns = listWorkflowStageRunsByRun(input.db, run.id);
-  const stageRun = findStageRun(stageRuns, { stageRunId: input.stageRunId, stageKey: input.stageKey });
-  if (!stageRun) {
+  const requiresStageRun = input.eventType !== "workflow.node.merged";
+  const stageRun = requiresStageRun ? findStageRun(stageRuns, { stageRunId: input.stageRunId, stageKey: input.stageKey }) : null;
+  if (requiresStageRun && !stageRun) {
     throw new Error("event requires a valid stageRunId or stageKey");
   }
-  if (stageRun.workflow_run_id !== run.id) {
+  if (stageRun && stageRun.workflow_run_id !== run.id) {
     throw new Error(`stage run ${stageRun.id} does not belong to workflow run ${run.id}`);
   }
 
-  if (input.idempotencyKey && hasDuplicateEventByIdempotency(input.db, {
-    stageRunId: stageRun.id,
-    eventType: input.eventType,
-    idempotencyKey: input.idempotencyKey
-  })) {
-    return { run: getWorkflowRunById(input.db, input.workflowRunId)!, applied: false, idempotent: true };
+  if (input.idempotencyKey) {
+    const duplicate = stageRun
+      ? hasDuplicateEventByIdempotency(input.db, {
+        stageRunId: stageRun.id,
+        eventType: input.eventType,
+        idempotencyKey: input.idempotencyKey
+      })
+      : hasDuplicateRunEventByIdempotency(input.db, {
+        workflowRunId: run.id,
+        eventType: input.eventType,
+        idempotencyKey: input.idempotencyKey
+      });
+    if (duplicate) {
+      return { run: getWorkflowRunById(input.db, input.workflowRunId)!, applied: false, idempotent: true };
+    }
   }
 
   createWorkflowEvent(input.db, {
     id: input.eventId,
     workflowRunId: run.id,
-    workflowStageRunId: stageRun.id,
+    workflowStageRunId: stageRun?.id,
     eventType: input.eventType,
     payload: {
       ...(input.payload ?? {}),
@@ -429,35 +649,37 @@ export function handleEvent(input: WorkflowEngineHandleEventInput): { run: Workf
 
   let applied = false;
 
-  if (input.eventType === "workflow.stage.waiting_input" && stageRun.status === "running") {
+  if (input.eventType === "workflow.node.merged") {
+    applied = true;
+  } else if (input.eventType === "workflow.stage.waiting_input" && stageRun?.status === "running") {
     applied = createLifecycleEventIfChanged(input.db, {
       workflowRunId: run.id,
       stageRunId: stageRun.id,
       state: "waiting_input",
       reason: "runtime_requested_input"
     });
-  } else if (input.eventType === "workflow.stage.input_received" && stageRun.status === "running") {
+  } else if (input.eventType === "workflow.stage.input_received" && stageRun?.status === "running") {
     applied = createLifecycleEventIfChanged(input.db, {
       workflowRunId: run.id,
       stageRunId: stageRun.id,
       state: "running",
       reason: "input_received"
     });
-  } else if (input.eventType === "workflow.stage.verifying" && stageRun.status === "running") {
+  } else if (input.eventType === "workflow.stage.verifying" && stageRun?.status === "running") {
     applied = createLifecycleEventIfChanged(input.db, {
       workflowRunId: run.id,
       stageRunId: stageRun.id,
       state: "verifying",
       reason: "verification_started"
     });
-  } else if (input.eventType === "workflow.stage.verify_succeeded" && stageRun.status === "running") {
+  } else if (input.eventType === "workflow.stage.verify_succeeded" && stageRun?.status === "running") {
     transitionWorkflowStageRunStatus(input.db, {
       stageRunId: stageRun.id,
       toStatus: "succeeded",
       reason: "verification_passed"
     });
     applied = true;
-  } else if (input.eventType === "workflow.stage.verify_failed" && stageRun.status === "running") {
+  } else if (input.eventType === "workflow.stage.verify_failed" && stageRun?.status === "running") {
     const definitionForStage = stageDefinitions.get(stageRun.stage_key);
     const maxAttempts = definitionForStage?.maxAttempts ?? 1;
     const retryable = input.payload?.retryable === true;
