@@ -4,6 +4,7 @@ import { db as appDb, resolveProjectDatabase } from "../../db/index.js";
 import { runInKeyedAsyncWorker } from "../asyncWorker.js";
 import { nowIso } from "../../utils/time.js";
 import { legacyPlanOrchestrationPassOwnershipEnabled } from "../../config/featureFlags.js";
+import { legacyJobSuppressedByWorkflowOwnership } from "./ownership.js";
 
 const JOB_EVENT_TYPE = "orchestration.job.pending";
 const JOB_DONE_EVENT_TYPE = "orchestration.job.completed";
@@ -227,6 +228,24 @@ async function processProjectJobs(params: { projectId: string; basePath: string 
         taskId: row.task_id,
         status: "skipped",
         message: `no handler for ${payload.jobType}`
+      });
+      continue;
+    }
+    const hintTaskId = typeof payload.hintTaskId === "string" ? payload.hintTaskId : null;
+    if (
+      legacyJobSuppressedByWorkflowOwnership({
+        projectDb,
+        jobType: payload.jobType,
+        hintTaskId
+      })
+    ) {
+      markCompleted({
+        projectDb,
+        pendingEventId: row.id,
+        projectId: row.project_id,
+        taskId: row.task_id,
+        status: "skipped",
+        message: `workflow-ownership suppresses ${payload.jobType}`
       });
       continue;
     }

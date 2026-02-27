@@ -25,6 +25,11 @@ Ship hierarchical orchestration capabilities with staged rollout controls, prese
     - `POST /api/nodes/:nodeId/auto-merge`
     - `POST /api/nodes/:nodeId/force-re-review`
     - `POST /api/nodes/:nodeId/approve-budget-override`
+- `ORCHESTRATION_LEGACY_JOB_OWNERSHIP_ENABLED`
+  - Default: `false`
+  - When `false`, active workflow runs own planning automation and suppress legacy orchestration jobs
+    (`decompose`, `re_review`, `delta_plan`, `synthesize`, `verify`) to prevent double ownership.
+  - Set to `true` only for temporary fallback while migrating legacy behavior.
 
 ## Staged Rollout Plan
 1. Baseline validation
