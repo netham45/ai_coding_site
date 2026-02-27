@@ -10,6 +10,15 @@ This walkthrough demonstrates:
 - Hook/job timeline (`readiness`, `decompose`, `re_review`, `synthesize`, `verify`, `delta_plan`, merge outcomes).
 - Verification fail -> delta_plan -> pass within bounded iteration budget.
 - Idempotency and auto-merge defaults with user override points.
+- UI-driven creation evidence for higher tiers (epoch + phase) and orchestration controls.
+
+## Dependency Gate
+The scenario is executed after these UI fixes are present:
+- `ui-fix-06`: hierarchy tree rendering + tier badges
+- `ui-fix-07`: node detail orchestration panel + node action endpoints
+- `ui-fix-08`: cross-tier dependency picker (`id`, `tier`, `reason`)
+- `ui-fix-09`: auto-merge defaults and visibility in tree/detail
+- `ui-fix-10`: prompt artifact completeness + research-first behavior
 
 ## Global Defaults
 - `bounded_iteration.max_iterations`: `3`
@@ -39,12 +48,22 @@ This walkthrough demonstrates:
   - `ip-12` Exec task runner template.
   - `ip-27` Completion evidence UX.
 - `children_ids`: `ph-platform-spike-001`, `ph-streaming-core-001`, `ph-hardening-release-001`
+- `created_via_ui`:
+  - Project page `Create Node` -> tier `epoch`
+  - title: `WebRTC Remote Desktop (WGC + WMF)`
+  - prompt: `Create a remote desktop application that uses WebRTC to stream Windows to browsers captured via WGC and converted using WMF`
+  - automation toggles at create-time: `auto_mode=on`, `auto_merge=on`, `auto_merge_on_complete=on`
 
 ### Phase
 1. `ph-platform-spike-001` (Platform/Toolkit decisions)
 - `status`: `merged`
 - `deps`: `ip-08`, `ip-09`
 - `children_ids`: `pl-capture-stack-001`, `pl-signaling-stack-001`
+- `created_via_ui`:
+  - Project page `Create Node` -> tier `phase`
+  - parent: `ep-webrtc-rd-001`
+  - dependency refs entered in picker:
+    - `id=ep-webrtc-rd-001`, `tier=epoch`, `reason=phase starts only after epoch approval`
 
 2. `ph-streaming-core-001` (MVP streaming path)
 - `status`: `merged`
@@ -55,6 +74,20 @@ This walkthrough demonstrates:
 - `status`: `merge_ready`
 - `deps`: `ph-streaming-core-001`
 - `children_ids`: `pl-observability-001`, `pl-deployment-security-001`
+
+## UI Creation + Control Evidence
+The following actions are recorded in [webrtc-remote-desktop-events.json](/mnt/c/Users/Nathan/Documents/GitHub/ai_coding_site/repos/ai-coding-site-2/tasks/a3aeeb6d-1988-4982-91cb-5b1342269dab/docs/examples/webrtc-remote-desktop-events.json):
+- `evt-ui-0001`: Project page create-node creates `ep-webrtc-rd-001` (tier `epoch`).
+- `evt-ui-0002`: Project page create-node creates `ph-platform-spike-001` under epoch parent.
+- `evt-ui-0003`: Node detail panel starts epoch orchestration (`POST /api/nodes/ep-webrtc-rd-001/start`).
+- `evt-ui-0004`: Node detail panel toggles `auto_mode` on for epoch.
+- `evt-ui-0005`: Node detail panel toggles `auto_merge` on for phase.
+- `evt-ui-0006`: Node detail panel triggers force re-review on blocked plan after dependency merge.
+
+Observed status transitions from those UI actions:
+- `ep-webrtc-rd-001`: `queued -> in_progress -> awaiting_children -> merge_ready -> merged`
+- `pl-host-capture-pipeline-001`: `queued -> blocked -> ready -> in_progress -> merge_ready -> merged`
+- `tsk-host-webrtc-publisher-001`: `in_progress -> verify_failed -> delta_planned -> merge_ready -> merged`
 
 ### Plan
 1. `pl-capture-stack-001` (WGC/WMF toolkit selection and prototype)
