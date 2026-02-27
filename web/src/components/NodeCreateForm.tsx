@@ -3,18 +3,17 @@ import {
   Box,
   Button,
   Checkbox,
-  Flex,
   FormControl,
   FormLabel,
   Grid,
   Input,
   Select,
   Stack,
-  Text,
   Textarea
 } from "@chakra-ui/react";
 import { useEffect, useMemo, useState } from "react";
-import type { CreateNodePayload, CreateNodeTier, NodeTier, TaskStatus } from "../api/types";
+import type { CreateNodePayload, CreateNodeTier, NodeDependencyRef, NodeTier, TaskStatus } from "../api/types";
+import { NodeDependencyPicker, type DependencyPickerCandidate } from "./NodeDependencyPicker";
 
 const AI_COMMAND_OTHER = "__other__";
 
@@ -31,6 +30,7 @@ type NodeOption = {
   tier: NodeTier;
   status: TaskStatus;
   isBlocked: boolean;
+  unresolvedDependencyCount?: number;
 };
 
 type NodeCreateFormProps = {
@@ -51,7 +51,7 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
   const [nodeTier, setNodeTier] = useState<CreateNodeTier>(presetTier);
   const [autoMerge, setAutoMerge] = useState(false);
   const [parentNodeId, setParentNodeId] = useState("");
-  const [dependencySelections, setDependencySelections] = useState<string[]>([""]);
+  const [dependencyNodeRefs, setDependencyNodeRefs] = useState<NodeDependencyRef[]>([]);
   const [aiCommandSelection, setAiCommandSelection] = useState(aiCommandOptions[0] || "codex --yolo {prompt}");
   const [aiCommandOverride, setAiCommandOverride] = useState("");
 
@@ -98,10 +98,9 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
 
   useEffect(() => {
     const selectableIds = new Set(nodeOptions.map((option) => option.id));
-    setDependencySelections((prev) => {
-      const next = prev.map((id) => (id && selectableIds.has(id) ? id : ""));
-      const changed = next.length !== prev.length || next.some((id, index) => id !== prev[index]);
-      return changed ? next : prev;
+    setDependencyNodeRefs((prev) => {
+      const next = prev.filter((ref) => selectableIds.has(ref.id));
+      return next.length === prev.length ? prev : next;
     });
   }, [nodeOptions]);
 
@@ -113,11 +112,17 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
       return;
     }
 
-    const uniqueDependencyIds = [...new Set(dependencySelections.filter(Boolean))];
-    const dependencyNodeRefs = uniqueDependencyIds
-      .map((id) => optionById.get(id))
-      .filter((option): option is NodeOption => Boolean(option))
-      .map((option) => ({ id: option.id, tier: option.tier }));
+    const resolvedDependencyNodeRefs: NodeDependencyRef[] = dependencyNodeRefs.flatMap((ref) => {
+      const option = optionById.get(ref.id);
+      if (!option) return [];
+      return [
+        {
+          id: ref.id,
+          tier: ref.tier ?? option.tier,
+          reason: ref.reason?.trim() || undefined
+        }
+      ];
+    });
 
     await onCreate({
       title: title.trim(),
@@ -126,7 +131,7 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
       aiCommand,
       autoMerge: nodeTier === "task" ? autoMerge : undefined,
       parentNodeId: parentNodeId || undefined,
-      dependencyNodeRefs
+      dependencyNodeRefs: resolvedDependencyNodeRefs
     });
 
     setTitle("");
@@ -134,10 +139,12 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
     setNodeTier(presetTier);
     setAutoMerge(false);
     setParentNodeId("");
-    setDependencySelections([""]);
+    setDependencyNodeRefs([]);
     setAiCommandSelection(aiCommandOptions[0] || "codex --yolo {prompt}");
     setAiCommandOverride("");
   }
+
+  const dependencyCandidates: DependencyPickerCandidate[] = nodeOptions;
 
   return (
     <form onSubmit={onSubmit}>
@@ -198,52 +205,14 @@ export function NodeCreateForm(props: NodeCreateFormProps) {
             ))}
           </Select>
         </FormControl>
-        <FormControl>
-          <FormLabel>Dependencies</FormLabel>
-          <Stack spacing={2}>
-            {dependencySelections.map((selectedId, index) => (
-              <Flex key={`dependency-${index}`} gap={2}>
-                <Select
-                  placeholder="Select dependency"
-                  value={selectedId}
-                  onChange={(event) => {
-                    const selected = event.target.value;
-                    setDependencySelections((prev) => prev.map((id, rowIndex) => (rowIndex === index ? selected : id)));
-                  }}
-                >
-                  {nodeOptions.map((option) => {
-                    const selectedElsewhere = dependencySelections.includes(option.id) && selectedId !== option.id;
-                    return (
-                      <option key={option.id} value={option.id} disabled={selectedElsewhere}>
-                        [{option.tier}] {option.title} ({option.isBlocked ? "blocked" : option.status})
-                      </option>
-                    );
-                  })}
-                </Select>
-                <Button type="button" size="sm" minW="40px" onClick={() => setDependencySelections((prev) => [...prev, ""])}>
-                  +
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  minW="40px"
-                  isDisabled={dependencySelections.length === 1}
-                  onClick={() => {
-                    setDependencySelections((prev) => {
-                      if (prev.length === 1) return [""];
-                      return prev.filter((_, rowIndex) => rowIndex !== index);
-                    });
-                  }}
-                >
-                  -
-                </Button>
-              </Flex>
-            ))}
-          </Stack>
-          <Text mt={1} fontSize="sm" color="gray.600">
-            Dependencies can reference any node tier.
-          </Text>
-        </FormControl>
+        <Box>
+          <NodeDependencyPicker
+            value={dependencyNodeRefs}
+            candidates={dependencyCandidates}
+            onChange={setDependencyNodeRefs}
+            helperText="Dependencies can reference any node tier with an optional reason."
+          />
+        </Box>
         <FormControl>
           <FormLabel>Automation</FormLabel>
           <Checkbox isChecked={autoMerge} isDisabled={nodeTier !== "task"} onChange={(event) => setAutoMerge(event.target.checked)}>
