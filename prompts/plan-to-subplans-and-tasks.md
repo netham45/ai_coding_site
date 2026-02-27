@@ -1,103 +1,144 @@
-# Plan -> Sub-Plans and Tasks Template
+# Plan to Subplans and Tasks Runtime Prompt
 
-Use this template when decomposing a single Plan node into a DAG of `sub_plan` and `execution_task` items.
+## Goal
+Decompose one `plan` into a DAG of `sub_plan` and `execution_task` items that is parser-compatible and safe to materialize.
 
-## Include Shared Section
+## Non-Goals
+- Executing code changes.
+- Producing cyclic or unresolved dependencies.
+- Emitting ambiguous item types.
 
-Include `prompts/shared-input-output.md`.
+## Definition of Done
+- Narrative, structured payload, and parser-compatible YAML item list are all present.
+- Every item has stable id, title, prompt, `item_type`, and `depends_on`.
+- Automation fields follow type-specific rules.
 
-## Inputs Required For This Template
+## Dependencies
+- `prompts/shared-input-output.md`
+- `docs/architecture/prompt-contract.md`
+- `server/src/services/planParser.ts`
+- `server/src/application/cliServices.ts`
+- CLI tree/context inspection prior to decomposition:
+  - `npm run cli -- plans get <planId> --json`
+  - `npm run cli -- plans list --project-id <projectId> --json`
+  - `npm run cli -- tasks all --project-id <projectId> --json`
+  - `npm run cli -- info <taskId> --project-id <projectId> --json` (sample relevant tasks)
+- Code/docs review for modules and docs touched by candidate items.
 
-- Plan node context (`node.id`, `node.tier=plan`, `node.parent_id`, `node.children_ids`, `node.status`).
-- Parent plan lineage depth (integer) and `max_sub_plan_recursion_depth` (currently `6`).
-- Merge target context for each candidate item (workspace/branch or equivalent merge target identity).
-- Constraints from parser/materializer behavior:
-  - YAML must parse via `server/src/services/planParser.ts`.
-  - Materialization constraints must satisfy `server/src/application/cliServices.ts` approval checks.
+## Artifacts
+- `docs/plans/<plan-id>/items.yaml`
+- `docs/plans/<plan-id>/decomposition-rationale.md`
 
-## Decision Rules For `item_type`
+## Risks
+- Recursion depth overflow for `sub_plan` expansion.
+- Invalid YAML causing parser/materializer failure.
+- Merge-topology mismatch for dependencies.
 
-Choose `item_type` deterministically per item:
+## Idempotency
+- Stable item keys for unchanged intent.
+- Deterministic decomposition fingerprints per item.
 
-1. Set `item_type: sub_plan` only if the item itself requires additional planning/orchestration rounds, independent review/approval, or staged child DAG expansion.
-2. Set `item_type: execution_task` for directly executable engineering work that can be completed in one task runtime.
-3. If uncertain, default to `execution_task`.
-4. Never use both automation models on one item:
-- `execution_task` may set `auto_merge` only.
-- `sub_plan` may set `auto_start` and/or `auto_merge_on_complete` only.
-5. Enforce depth guard before emitting `sub_plan`:
-- `next_depth = parent_depth + 1` (or `0` when targeting root/no parent plan).
-- If `next_depth > max_sub_plan_recursion_depth`, emit as `execution_task` instead and record risk/escalation in structured payload.
+## Bounded Iteration
+- `max_iterations: 3`
+- `max_replans: 1`
+- If depth or topology constraints fail, downgrade to `execution_task` and record escalation.
 
-## YAML Output Contract (Parser-Compatible)
+## Auto-Merge Guidance
+- `execution_task` items may use `auto_merge`.
+- `sub_plan` items may use `auto_start`/`auto_merge_on_complete`.
+- Never mix automation models on one item.
 
-Emit YAML in a fenced block with top-level `tasks:` (or `items:` for compatibility).
+## Runtime Prompt Text
+You are decomposing one `plan` into parser-compatible child items.
 
-Top-level defaults (required in this template output):
+Research before layout is mandatory:
+1. Use CLI to inspect related branches/nodes in the project tree.
+2. Review relevant code and documentation for existing constraints and interfaces.
+3. Base item boundaries on that evidence, then emit the DAG.
 
-- `auto_start: <bool>` default for all `sub_plan` items that do not override.
-- `auto_merge_on_complete: <bool>` default for all `sub_plan` items that do not override.
-- `auto_merge_item_keys: [<item_key>, ...]` execution items eligible for auto-merge by default.
+Choose `item_type` deterministically: use `sub_plan` only when more orchestration is required; default to `execution_task` when uncertain. Emit a valid DAG, enforce recursion limits, and keep output idempotent.
 
-Each item MUST include:
-
-- `id` (item key; unique, stable, non-empty)
-- `title`
-- `prompt` (non-empty; may use block scalar)
-- `item_type` (`execution_task` or `sub_plan`)
-- `depends_on` (explicit list, `[]` when none)
-
-Item-level automation fields:
-
-- `execution_task`: optional `auto_merge: true|false`; must not set `auto_start` or `auto_merge_on_complete`.
-- `sub_plan`: optional `auto_start: true|false`, `auto_merge_on_complete: true|false`; must not set `auto_merge`.
-
-## Dependency and Topology Safeguards
-
-Before finalizing output, validate and only emit a DAG that satisfies all checks:
-
-1. No self-dependencies.
-2. No unknown dependencies (every `depends_on` key exists in emitted items).
-3. No cycles.
-4. Dependency edges must remain within compatible parent-plan/merge-target topology boundaries so approval does not fail.
-5. Use stable, lowercase-friendly item keys to prevent alias drift.
-
-## Required Structured Payload Additions
-
-In addition to `docs/architecture/prompt-contract.md`, include these fields:
+## Structured Output Contract
+Return three sections:
+1. Narrative rationale.
+2. Structured payload (shared contract + `plan_decomposition`).
+3. Parser-compatible YAML (`tasks:` or `items:`).
 
 ```yaml
+schema_version: "1.0"
+node:
+  id: "<plan-id>"
+  tier: plan
+  parent_id: "<parent-id-or-null>"
+  children_ids: ["<item-id>"]
+  status: awaiting_children
+
+goals: ["<goal>"]
+non_goals: ["<non-goal>"]
+definition_of_done: ["<DoD>"]
+deps:
+  - id: "<dependency-id>"
+    reason: "<why required>"
+artifacts:
+  - path: "docs/plans/<plan-id>/items.yaml"
+    kind: file
+    required: true
+risks:
+  - risk: "<risk>"
+    impact: medium
+    mitigation: "<mitigation>"
+idempotency:
+  input_fingerprint: "<hash>"
+  output_fingerprint: "<hash>"
+  dedupe_key: "plan-to-subplans-and-tasks:<plan-id>:<input-fingerprint>"
+  idempotent: true
+bounded_iteration:
+  max_iterations: 3
+  max_replans: 1
+  stop_conditions:
+    - "All dependencies resolve to emitted items or known nodes"
+    - "No cycles"
+  escalation_on_limit: "Escalate with blocked item IDs and cause"
+auto_merge_guidance:
+  eligible: false
+  strategy: manual
+  required_checks:
+    - "YAML parse success"
+    - "Materialization constraints pass"
+  blockers:
+    - "Depth guard exceeded without downgrade"
+
 plan_decomposition:
-  parent_plan_id: string
-  parent_depth: number
+  parent_plan_id: "<plan-id>"
+  parent_depth: 0
   max_sub_plan_recursion_depth: 6
   defaults:
-    auto_start: boolean
-    auto_merge_on_complete: boolean
-    auto_merge_item_keys:
-      - string
+    auto_start: false
+    auto_merge_on_complete: false
+    auto_merge_item_keys: ["<execution-item-key>"]
   items:
-    - item_key: string
-      item_type: execution_task | sub_plan
-      depends_on:
-        - string
+    - item_key: "<item-key>"
+      item_type: execution_task
+      depends_on: []
       topology_scope:
-        parent_plan_id: string | null
-        merge_target: string
+        parent_plan_id: "<plan-id-or-null>"
+        merge_target: "<target>"
       automation:
-        auto_merge: boolean
-        auto_start: boolean
-        auto_merge_on_complete: boolean
+        auto_merge: false
+        auto_start: false
+        auto_merge_on_complete: false
       idempotency:
-        decomposition_fingerprint: string
+        decomposition_fingerprint: "<hash>"
+research_evidence:
+  cli_queries:
+    - command: "npm run cli -- plans get <planId> --json"
+      findings: "<what was learned>"
+    - command: "npm run cli -- tasks all --project-id <projectId> --json"
+      findings: "<what was learned>"
+  repo_reads:
+    - path: "<file-or-dir>"
+      findings: "<what was learned>"
+  tree_coverage:
+    reviewed_related_nodes: ["<node-id>"]
+    coverage_note: "Confirm upstream/downstream context was reviewed before emitting items"
 ```
-
-`decomposition_fingerprint` must be deterministic from normalized inputs (parent plan id, item key, normalized prompt intent, dependency set, item type, automation flags).
-
-## Output
-
-Return all three sections:
-
-1. Natural-language rationale
-2. Structured payload (prompt-contract compliant + `plan_decomposition` extension)
-3. Parser-compatible YAML task list
