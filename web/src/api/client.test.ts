@@ -2,14 +2,20 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   api,
   approveNodeBudgetOverride,
+  cancelWorkflowRun,
   createNode,
   forceNodeReReview,
   getDependencyGraph,
   getHierarchy,
   getNode,
+  getNodeWorkflowStatus,
+  listWorkflowDefinitions,
+  setNodeWorkflowAssignment,
   setNodeAutoMerge,
   setNodeAutoMode,
-  startNode
+  startWorkflowRun,
+  startNode,
+  tickWorkflowRun
 } from "./client";
 
 describe("api client", () => {
@@ -75,6 +81,12 @@ describe("api client", () => {
     await setNodeAutoMerge("n1", { enabled: true, onComplete: true, reason: "manual" });
     await forceNodeReReview("n1", { reason: "stale" });
     await approveNodeBudgetOverride("n1", { enabled: true, reason: "needed" });
+    await listWorkflowDefinitions("p1");
+    await getNodeWorkflowStatus("n1");
+    await startWorkflowRun("p1", { workflowDefinitionId: "w1", taskId: "n1" });
+    await tickWorkflowRun("p1", "r1");
+    await cancelWorkflowRun("p1", "r1", { reason: "manual" });
+    await setNodeWorkflowAssignment("n1", { mode: "custom", workflowDefinitionId: "w1" });
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/projects/p1/nodes", expect.objectContaining({ method: "POST" }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/projects/p1/hierarchy", expect.anything());
@@ -85,5 +97,11 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(7, "/api/nodes/n1/auto-merge", expect.objectContaining({ method: "POST" }));
     expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/nodes/n1/force-re-review", expect.objectContaining({ method: "POST" }));
     expect(fetchMock).toHaveBeenNthCalledWith(9, "/api/nodes/n1/approve-budget-override", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(10, "/api/projects/p1/workflow-definitions", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(11, "/api/nodes/n1/workflow-status", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(12, "/api/projects/p1/workflow-runs/start", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(13, "/api/projects/p1/workflow-runs/r1/tick", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(14, "/api/projects/p1/workflow-runs/r1/cancel", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(15, "/api/nodes/n1/workflow-assignment", expect.objectContaining({ method: "POST" }));
   });
 });

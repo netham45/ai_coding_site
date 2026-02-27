@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
-import type { TaskRow, WorkflowRunRow, WorkflowStageRunRow } from "../types.js";
+import type { WorkflowRunRow, WorkflowStageRunRow } from "../types.js";
 import {
   createWorkflowEvent,
   createWorkflowStageRun,
@@ -410,41 +408,6 @@ function stageDefinitionByKey(definitions: WorkflowEngineStageDefinition[]): Map
   return new Map(definitions.map((row) => [row.key, row]));
 }
 
-function workflowTask(db: Database.Database, run: WorkflowRunRow): TaskRow | null {
-  if (!run.task_id) return null;
-  return db.prepare("SELECT * FROM tasks WHERE id = ? LIMIT 1").get(run.task_id) as TaskRow | null;
-}
-
-function planYamlExists(task: TaskRow): boolean {
-  const yamlPath = path.join(task.workspace_path, ".ai-plan", "latest-plan.yaml");
-  try {
-    const content = fs.readFileSync(yamlPath, "utf8").trim();
-    return content.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-function unresolvedStageRules(db: Database.Database, run: WorkflowRunRow, stageKey: string): string[] {
-  if (!run.task_id) return [];
-  const task = workflowTask(db, run);
-  if (!task) {
-    return ["missing_parent_task"];
-  }
-  if (stageKey === "ingest_child_nodes" && !planYamlExists(task)) {
-    return ["missing_plan_yaml"];
-  }
-  if (stageKey === "wait_for_child_completion") {
-    const unresolved = db
-      .prepare("SELECT id FROM tasks WHERE parent_plan_task_id = ? AND status != 'merged' ORDER BY created_at ASC")
-      .all(task.id) as Array<{ id: string }>;
-    if (unresolved.length > 0) {
-      return unresolved.map((row) => `child_not_merged:${row.id}`);
-    }
-  }
-  return [];
-}
-
 function createLifecycleEventIfChanged(
   db: Database.Database,
   params: {
@@ -574,15 +537,14 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
       const definitionForStage = definitionsByKey.get(pending.stage_key);
       const deps = definitionForStage?.dependsOn ?? [];
       const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-      const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
-      if (unresolved.length === 0 && unresolvedRules.length === 0) continue;
+      if (unresolved.length === 0) continue;
       if (
         createLifecycleEventIfChanged(params.db, {
           workflowRunId: run.id,
           stageRunId: pending.id,
           state: "blocked",
           reason: "dependency_gate",
-          extra: { unresolvedDependsOn: unresolved, unresolvedStageRules: unresolvedRules }
+          extra: { unresolvedDependsOn: unresolved }
         })
       ) {
         gatedStateChanged = true;
@@ -616,15 +578,14 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const definitionForStage = definitionsByKey.get(pending.stage_key);
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-    const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
-    if (unresolved.length === 0 && unresolvedRules.length === 0) continue;
+    if (unresolved.length === 0) continue;
     if (
       createLifecycleEventIfChanged(params.db, {
         workflowRunId: run.id,
         stageRunId: pending.id,
         state: "blocked",
         reason: "dependency_gate",
-        extra: { unresolvedDependsOn: unresolved, unresolvedStageRules: unresolvedRules }
+        extra: { unresolvedDependsOn: unresolved }
       })
     ) {
       progressed = true;
@@ -635,8 +596,7 @@ export function tickWorkflowRun(params: { db: Database.Database; workflowRunId: 
     const definitionForStage = definitionsByKey.get(pending.stage_key);
     const deps = definitionForStage?.dependsOn ?? [];
     const unresolved = deps.filter((depKey) => byKey.get(depKey)?.status !== "succeeded");
-    const unresolvedRules = unresolvedStageRules(params.db, run, pending.stage_key);
-    if (unresolved.length > 0 || unresolvedRules.length > 0) continue;
+    if (unresolved.length > 0) continue;
 
     createLifecycleEventIfChanged(params.db, {
       workflowRunId: run.id,

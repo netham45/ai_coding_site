@@ -148,6 +148,21 @@ const approveBudgetOverrideSchema = z.object({
   enabled: z.boolean().optional()
 });
 
+const workflowAssignmentSchema = z
+  .object({
+    mode: z.enum(["builtin", "custom"]),
+    workflowDefinitionId: z.string().min(1).optional().nullable()
+  })
+  .superRefine((value, ctx) => {
+    if (value.mode === "custom" && !value.workflowDefinitionId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["workflowDefinitionId"],
+        message: "workflowDefinitionId is required when mode is custom"
+      });
+    }
+  });
+
 function respondFeatureDisabled(res: any, feature: string): void {
   res.status(404).json({ error: `Feature disabled: ${feature}`, code: "FEATURE_DISABLED" });
 }
@@ -996,6 +1011,55 @@ function serializeWorkflowRunState(projectDb: Database.Database, workflowRunId: 
   };
 
   return workflowRunStateSchema.parse(responsePayload);
+}
+
+function readWorkflowAssignment(metadata: NodeMetadata): { mode: "builtin" | "custom"; workflowDefinitionId: string | null } {
+  const custom = metadata.custom;
+  if (!custom || typeof custom !== "object") {
+    return { mode: "builtin", workflowDefinitionId: null };
+  }
+  const assignment =
+    "workflow_assignment" in custom && custom.workflow_assignment && typeof custom.workflow_assignment === "object"
+      ? (custom.workflow_assignment as Record<string, unknown>)
+      : null;
+  if (!assignment) {
+    return { mode: "builtin", workflowDefinitionId: null };
+  }
+  const mode = assignment.mode === "custom" ? "custom" : "builtin";
+  const workflowDefinitionId =
+    typeof assignment.workflow_definition_id === "string" && assignment.workflow_definition_id.trim().length > 0
+      ? assignment.workflow_definition_id
+      : null;
+  if (mode === "custom" && !workflowDefinitionId) {
+    return { mode: "builtin", workflowDefinitionId: null };
+  }
+  return { mode, workflowDefinitionId };
+}
+
+function writeWorkflowAssignment(params: {
+  projectDb: Database.Database;
+  task: TaskRow;
+  dependencyTaskIds: string[];
+  assignment: { mode: "builtin" | "custom"; workflowDefinitionId: string | null };
+}) {
+  const { metadata } = readNodeMetadata({
+    projectDb: params.projectDb,
+    task: params.task,
+    dependencyTaskIds: params.dependencyTaskIds
+  });
+  const custom = { ...(metadata.custom ?? {}) } as Record<string, unknown>;
+  custom.workflow_assignment = {
+    mode: params.assignment.mode,
+    workflow_definition_id: params.assignment.workflowDefinitionId
+  };
+  writeNodeMetadata({
+    projectDb: params.projectDb,
+    taskId: params.task.id,
+    metadata: {
+      ...metadata,
+      custom
+    }
+  });
 }
 
 function hashToken(token: string): string {
@@ -2025,14 +2089,67 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
   }
 
   if (depState.nodeTier === "epoch" || depState.nodeTier === "phase" || depState.nodeTier === "plan") {
-    try {
-      startBuiltinWorkflowForTierTask({
-        db: projectDb,
-        projectId: project.id,
+    const dependencyTaskIds = projectDb
+      .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+      .all(task.id) as Array<{ dependency_task_id: string }>;
+    const dependencyIds = dependencyTaskIds
+      .map((row: { dependency_task_id: string }) => row.dependency_task_id);
+    const { metadata } = readNodeMetadata({
+      projectDb,
+      task,
+      dependencyTaskIds: dependencyIds
+    });
+    const assignment = readWorkflowAssignment(metadata);
+    const existingRun = projectDb
+      .prepare(
+        `SELECT * FROM workflow_runs
+         WHERE task_id = ?
+           AND status IN ('queued', 'running')
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(task.id) as { id: string } | undefined;
+    if (existingRun) {
+      startWorkflowRun({ db: projectDb, workflowRunId: existingRun.id });
+      const requestedAutoMode = typeof parsed.data.autoMode === "boolean" ? parsed.data.autoMode : null;
+      recordEvent({
+        projectId: task.project_id,
         taskId: task.id,
-        tier: depState.nodeTier as BuiltinWorkflowTier,
-        createdByUserId: req.user.id
+        eventType: "orchestration.manual_start",
+        database: projectDb,
+        payload: {
+          requestedAutoMode,
+          actorUserId: req.user.id,
+          strategy: assignment.mode === "custom" ? "workflow_engine_custom" : "workflow_engine"
+        }
       });
+      const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+      res.json({ node: serializeTask(projectDb, updated), started: true, tier: depState.nodeTier });
+      return;
+    }
+    try {
+      if (assignment.mode === "custom" && assignment.workflowDefinitionId) {
+        const definition = getWorkflowDefinitionById(projectDb, assignment.workflowDefinitionId);
+        if (!definition || definition.project_id !== project.id) {
+          res.status(409).json({ error: "Assigned custom workflow definition not found for project" });
+          return;
+        }
+        const createdRun = createWorkflowRun(projectDb, {
+          workflowDefinitionId: definition.id,
+          projectId: project.id,
+          taskId: task.id,
+          status: "queued"
+        });
+        startWorkflowRun({ db: projectDb, workflowRunId: createdRun.id });
+      } else {
+        startBuiltinWorkflowForTierTask({
+          db: projectDb,
+          projectId: project.id,
+          taskId: task.id,
+          tier: depState.nodeTier as BuiltinWorkflowTier,
+          createdByUserId: req.user.id
+        });
+      }
     } catch (error: any) {
       res.status(409).json({ error: String(error?.message ?? "Failed to start node workflow") });
       return;
@@ -2046,7 +2163,7 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
       payload: {
         requestedAutoMode,
         actorUserId: req.user.id,
-        strategy: "workflow_engine"
+        strategy: assignment.mode === "custom" ? "workflow_engine_custom" : "workflow_engine"
       }
     });
   } else {
@@ -2078,6 +2195,62 @@ tasksRouter.post("/nodes/:nodeId/start", async (req, res) => {
 
   const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
   res.json({ node: serializeTask(projectDb, updated), started: true, tier: depState.nodeTier });
+});
+
+tasksRouter.post("/nodes/:nodeId/workflow-assignment", (req, res) => {
+  const parsed = workflowAssignmentSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const scopedTask = getTaskAccessOrRespond(
+    { taskId: req.params.nodeId, userId: req.user.id, notFoundMessage: "Node not found", intent: "write" },
+    res
+  );
+  if (!scopedTask) return;
+  const { task, projectDb, project } = scopedTask;
+  const depState = directDependencies(projectDb, task);
+  if (!["epoch", "phase", "plan"].includes(depState.nodeTier)) {
+    res.status(409).json({ error: "Workflow assignment is only supported for epoch, phase, and plan nodes" });
+    return;
+  }
+
+  const workflowDefinitionId = parsed.data.mode === "custom" ? parsed.data.workflowDefinitionId ?? null : null;
+  if (parsed.data.mode === "custom") {
+    const definition = workflowDefinitionId ? getWorkflowDefinitionById(projectDb, workflowDefinitionId) : undefined;
+    if (!definition || definition.project_id !== project.id) {
+      res.status(404).json({ error: "Workflow definition not found" });
+      return;
+    }
+  }
+
+  const dependencyTaskIds = projectDb
+    .prepare("SELECT dependency_task_id FROM task_dependencies WHERE task_id = ? ORDER BY created_at ASC")
+    .all(task.id) as Array<{ dependency_task_id: string }>;
+  const dependencyIds = dependencyTaskIds
+    .map((row: { dependency_task_id: string }) => row.dependency_task_id);
+
+  writeWorkflowAssignment({
+    projectDb,
+    task,
+    dependencyTaskIds: dependencyIds,
+    assignment: {
+      mode: parsed.data.mode,
+      workflowDefinitionId
+    }
+  });
+
+  const updated = projectDb.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id) as TaskRow;
+  const updatedMetadata = readNodeMetadata({
+    projectDb,
+    task: updated,
+    dependencyTaskIds: dependencyIds
+  }).metadata;
+  const assignment = readWorkflowAssignment(updatedMetadata);
+  res.json({
+    node: serializeTask(projectDb, updated),
+    workflowAssignment: assignment
+  });
 });
 
 tasksRouter.post("/nodes/:nodeId/auto-mode", (req, res) => {

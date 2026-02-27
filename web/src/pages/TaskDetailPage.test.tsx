@@ -13,6 +13,12 @@ const setNodeAutoModeMock = vi.fn();
 const setNodeAutoMergeMock = vi.fn();
 const forceNodeReReviewMock = vi.fn();
 const approveNodeBudgetOverrideMock = vi.fn();
+const listWorkflowDefinitionsMock = vi.fn();
+const getNodeWorkflowStatusMock = vi.fn();
+const startWorkflowRunMock = vi.fn();
+const tickWorkflowRunMock = vi.fn();
+const cancelWorkflowRunMock = vi.fn();
+const setNodeWorkflowAssignmentMock = vi.fn();
 
 vi.mock("../api/client", () => ({
   api: (...args: unknown[]) => apiMock(...args),
@@ -21,7 +27,13 @@ vi.mock("../api/client", () => ({
   setNodeAutoMode: (...args: unknown[]) => setNodeAutoModeMock(...args),
   setNodeAutoMerge: (...args: unknown[]) => setNodeAutoMergeMock(...args),
   forceNodeReReview: (...args: unknown[]) => forceNodeReReviewMock(...args),
-  approveNodeBudgetOverride: (...args: unknown[]) => approveNodeBudgetOverrideMock(...args)
+  approveNodeBudgetOverride: (...args: unknown[]) => approveNodeBudgetOverrideMock(...args),
+  listWorkflowDefinitions: (...args: unknown[]) => listWorkflowDefinitionsMock(...args),
+  getNodeWorkflowStatus: (...args: unknown[]) => getNodeWorkflowStatusMock(...args),
+  startWorkflowRun: (...args: unknown[]) => startWorkflowRunMock(...args),
+  tickWorkflowRun: (...args: unknown[]) => tickWorkflowRunMock(...args),
+  cancelWorkflowRun: (...args: unknown[]) => cancelWorkflowRunMock(...args),
+  setNodeWorkflowAssignment: (...args: unknown[]) => setNodeWorkflowAssignmentMock(...args)
 }));
 
 vi.mock("../components/NodeActionsPanel", () => ({
@@ -172,6 +184,12 @@ describe("TaskDetailPage node actions", () => {
     setNodeAutoMergeMock.mockResolvedValue({ node: { ...task, autoMerge: false } });
     forceNodeReReviewMock.mockResolvedValue({ ok: true, pendingEventId: "evt-1" });
     approveNodeBudgetOverrideMock.mockResolvedValue({ node: task });
+    listWorkflowDefinitionsMock.mockResolvedValue({ definitions: [] });
+    getNodeWorkflowStatusMock.mockResolvedValue({ nodeId: task.id, workflow: null });
+    startWorkflowRunMock.mockResolvedValue({});
+    tickWorkflowRunMock.mockResolvedValue({});
+    cancelWorkflowRunMock.mockResolvedValue({});
+    setNodeWorkflowAssignmentMock.mockResolvedValue({ workflowAssignment: { mode: "builtin", workflowDefinitionId: null } });
   });
 
   test("executes node actions and refreshes task + node detail", async () => {
