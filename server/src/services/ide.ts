@@ -234,16 +234,25 @@ export async function prepareIdeWorkspace(params: {
   workspacePath: string;
   tmuxSocketPath?: string | null;
   tmuxSessionName?: string | null;
+  hasSessionHistory?: boolean;
 }): Promise<string> {
   const hasTmuxTarget = Boolean(params.tmuxSocketPath && params.tmuxSessionName);
-  if (!hasTmuxTarget) {
+  const hasSessionHistory = Boolean(params.hasSessionHistory);
+  if (!hasTmuxTarget && !hasSessionHistory) {
     return params.workspacePath;
   }
 
   const workspaceFilePath = path.join(params.workspacePath, `.ai-coding-site-${compactId(params.taskId)}.code-workspace`);
-  const tmuxSocketPath = params.tmuxSocketPath as string;
-  const tmuxSessionName = params.tmuxSessionName as string;
-  const attachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+  let attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && true`;
+  if (hasTmuxTarget) {
+    const tmuxSocketPath = params.tmuxSocketPath as string;
+    const tmuxSessionName = params.tmuxSessionName as string;
+    const tmuxAttachCommand = `tmux -S ${shellSingleQuote(tmuxSocketPath)} set-option -g mouse on \\; attach-session -t ${shellSingleQuote(tmuxSessionName)}`;
+    attachCommand = tmuxAttachCommand;
+  } else if (hasSessionHistory) {
+    // Preserve workspace-task shape for historical sessions, but never auto-resume.
+    attachCommand = `cd ${shellSingleQuote(params.workspacePath)} && echo \"No active tmux session to attach.\"`;
+  }
 
   const workspaceSpec = {
     folders: [{ path: params.workspacePath }],

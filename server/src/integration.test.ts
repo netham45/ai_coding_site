@@ -11,6 +11,9 @@ import type Database from "better-sqlite3";
 import { createApp } from "./app.js";
 import { db as appDb } from "./db/index.js";
 import {
+  PROJECT_DB_DIRNAME,
+  PROJECT_DB_FILENAME,
+  PROJECT_DB_SCHEMA_VERSION,
   ProjectDbError,
   closeAllProjectDbs,
   detectProjectDbMetadata,
@@ -23,6 +26,7 @@ import {
 import { runProjectDataMigrationBackfill } from "./db/projectDataMigration.js";
 import { resetProjectDbDiagnosticsForTests } from "./db/projectDbDiagnostics.js";
 import { projectBaselineMigration, projectTaskMetadataMigration } from "./db/migrations.js";
+import { openSqliteDatabase } from "./db/sqlite.js";
 import { CliServiceError, approvePlan } from "./application/cliServices.js";
 import { buildDependencyDiagnostics } from "./services/orchestration/dependencyGraph.js";
 import { assertTaskStatusTransition, canTransitionLifecycle, evaluateParentCompletionGuards } from "./services/orchestration/stateMachine.js";
@@ -128,6 +132,14 @@ function runGit(args: string[], cwd: string): void {
   if (result.status !== 0) {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
   }
+}
+
+function gitHead(cwd: string): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git rev-parse HEAD failed: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
 }
 
 function createUser(userId = randomUUID()): string {
@@ -625,6 +637,136 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
     assert.ok(tableExists(appDb, "project_data_migrations"));
   });
 
+  test("task rerun resets task without violating base commit NOT NULL constraint", async () => {
+    const userId = createUser();
+    const basePath = randomPath("rerun-base-commit");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "one\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+    const initialSha = gitHead(basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "two\n", "utf8");
+    runGit(["commit", "-am", "second"], basePath);
+    const latestSha = gitHead(basePath);
+
+    const taskId = randomUUID();
+    const workspacePath = path.join(path.dirname(basePath), "tasks", taskId);
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO tasks (
+           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+           auto_merge, mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+           status, workspace_path, base_commit_sha_at_create, head_commit_sha, cancel_reason,
+           merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      )
+      .run(
+        taskId,
+        projectId,
+        "Rerun Task",
+        "prompt",
+        "done",
+        "effective",
+        "codex --yolo {prompt}",
+        0,
+        "execution",
+        "failed",
+        workspacePath,
+        initialSha,
+        userId,
+        now,
+        now
+      );
+
+    const rerun = await callApi(`/api/tasks/${taskId}/rerun`, { method: "POST", userId });
+    assert.equal(rerun.status, 200);
+    assert.equal(rerun.json?.task?.baseCommitShaAtCreate, latestSha);
+
+    const updated = projectDb
+      .prepare("SELECT status, base_commit_sha_at_create FROM tasks WHERE id = ?")
+      .get(taskId) as { status: string; base_commit_sha_at_create: string };
+    assert.equal(updated.status, "queued");
+    assert.equal(updated.base_commit_sha_at_create, latestSha);
+  });
+
+  test("task rerun clears active runtime session records so restart uses a new session", async () => {
+    const userId = createUser();
+    const basePath = randomPath("rerun-clears-runtime");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+
+    runGit(["init", "-b", "main"], basePath);
+    runGit(["config", "user.email", "tests@example.com"], basePath);
+    runGit(["config", "user.name", "Tests"], basePath);
+    fs.writeFileSync(path.join(basePath, "README.md"), "one\n", "utf8");
+    runGit(["add", "."], basePath);
+    runGit(["commit", "-m", "initial"], basePath);
+    const initialSha = gitHead(basePath);
+
+    const taskId = randomUUID();
+    const workspacePath = path.join(path.dirname(basePath), "tasks", taskId);
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const now = nowIso();
+    projectDb
+      .prepare(
+        `INSERT INTO tasks (
+           id, project_id, title, task_prompt, result, effective_prompt, ai_command,
+           auto_merge, mode, parent_plan_task_id, source_plan_revision_id, source_plan_item_key,
+           status, workspace_path, base_commit_sha_at_create, head_commit_sha, cancel_reason,
+           merged_at, merged_by_user_id, created_by_user_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)`
+      )
+      .run(
+        taskId,
+        projectId,
+        "Rerun Runtime Reset",
+        "prompt",
+        "done",
+        "effective",
+        "codex --yolo {prompt}",
+        0,
+        "execution",
+        "failed",
+        workspacePath,
+        initialSha,
+        userId,
+        now,
+        now
+      );
+
+    const sessionId = randomUUID();
+    projectDb
+      .prepare(
+        `INSERT INTO task_sessions (
+           id, task_id, tmux_session_name, tmux_socket_path, pane_id, detected_tool,
+           backend_command, status, started_at, ended_at, last_heartbeat_at, last_output, exit_code, failure_reason
+         ) VALUES (?, ?, ?, ?, NULL, NULL, ?, 'running', ?, NULL, ?, '', NULL, NULL)`
+      )
+      .run(sessionId, taskId, `task_${taskId}_oldrun`, path.join(os.tmpdir(), `${taskId}.sock`), "codex --yolo prompt", now, now);
+
+    const rerun = await callApi(`/api/tasks/${taskId}/rerun`, { method: "POST", userId });
+    assert.equal(rerun.status, 200);
+    assert.equal(rerun.json?.task?.status, "queued");
+
+    const session = projectDb
+      .prepare("SELECT status, failure_reason, ended_at FROM task_sessions WHERE id = ?")
+      .get(sessionId) as { status: string; failure_reason: string | null; ended_at: string | null } | undefined;
+    assert.equal(session, undefined);
+    const sessionCount = projectDb
+      .prepare("SELECT COUNT(*) AS count FROM task_sessions WHERE task_id = ?")
+      .get(taskId) as { count: number };
+    assert.equal(sessionCount.count, 0);
+  });
+
   test("cached project DB handle reuse does not rerun baseline migrations", () => {
     const projectId = randomUUID();
     const basePath = randomPath("cached-no-migrate");
@@ -669,6 +811,91 @@ describe("integration: ownership, auth, migration, portability, diagnostics", ()
         }),
       (error: unknown) => error instanceof ProjectDbError && error.code === "PROJECT_DB_CORRUPT"
     );
+  });
+
+  test("legacy project DB migrates missing orchestration columns and metadata schema version", () => {
+    const userId = createUser();
+    const basePath = randomPath("legacy-project-db-upgrade");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const dbDir = path.join(basePath, PROJECT_DB_DIRNAME);
+    const dbPath = path.join(dbDir, PROJECT_DB_FILENAME);
+    const createdAt = nowIso();
+    const updatedAt = nowIso();
+    fs.mkdirSync(dbDir, { recursive: true });
+
+    const legacyDb = openSqliteDatabase(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS project_config (
+        project_id TEXT PRIMARY KEY,
+        project_prompt TEXT NOT NULL DEFAULT '',
+        project_rules TEXT NOT NULL DEFAULT '',
+        coding_standard TEXT NOT NULL DEFAULT '',
+        coding_standard_other TEXT NOT NULL DEFAULT '',
+        project_other TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_prompt TEXT NOT NULL,
+        result TEXT NOT NULL DEFAULT '',
+        effective_prompt TEXT NOT NULL,
+        ai_command TEXT NOT NULL DEFAULT 'codex --yolo {prompt}',
+        auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0,1)),
+        mode TEXT NOT NULL DEFAULT 'execution' CHECK (mode IN ('execution','plan')),
+        parent_plan_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+        source_plan_item_key TEXT,
+        status TEXT NOT NULL CHECK (status IN ('queued','in_progress','waiting_input','merge_ready','merged','cancelled','failed','merge_conflict')),
+        workspace_path TEXT NOT NULL,
+        base_commit_sha_at_create TEXT NOT NULL,
+        head_commit_sha TEXT,
+        cancel_reason TEXT,
+        merged_at TEXT,
+        merged_by_user_id TEXT,
+        created_by_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS project_metadata (
+        project_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO project_config (
+        project_id,
+        project_prompt,
+        project_rules,
+        coding_standard,
+        coding_standard_other,
+        project_other,
+        created_at,
+        updated_at
+      ) VALUES ('${projectId}', '', '', '', '', '', '${createdAt}', '${updatedAt}');
+      INSERT INTO project_metadata (project_id, schema_version, created_at, updated_at)
+      VALUES ('${projectId}', 1, '${createdAt}', '${updatedAt}');
+    `);
+    legacyDb.pragma("user_version = 1");
+    legacyDb.close();
+
+    const handle = ensureProjectDb({
+      projectId,
+      basePath,
+      initializeIfMissing: false
+    });
+
+    const taskColumns = handle.db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    assert.equal(taskColumns.some((col) => col.name === "auto_start"), true);
+    assert.equal(taskColumns.some((col) => col.name === "auto_merge_on_complete"), true);
+    const hasOrchestrationTable = tableExists(handle.db, "plan_orchestration_state");
+    assert.equal(hasOrchestrationTable, true);
+    const schemaVersion = handle.db.pragma("user_version", { simple: true }) as number;
+    assert.equal(schemaVersion, PROJECT_DB_SCHEMA_VERSION);
+    assert.equal(handle.metadata.schema_version, PROJECT_DB_SCHEMA_VERSION);
+    assert.equal(handle.db.prepare("SELECT auto_start FROM tasks LIMIT 1").all().length, 0);
   });
 });
 

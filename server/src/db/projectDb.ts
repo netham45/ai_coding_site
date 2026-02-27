@@ -115,21 +115,77 @@ function getUserVersion(db: Database.Database): number {
   return Number(db.pragma("user_version", { simple: true }) ?? 0);
 }
 
-function runProjectMigrationsIfNeeded(db: Database.Database): void {
-  const currentVersion = getUserVersion(db);
-  if (currentVersion >= PROJECT_DB_SCHEMA_VERSION) {
+function columnExists(db: Database.Database, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((col) => col.name === column);
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, alterSql: string): void {
+  if (!tableExists(db, table)) {
     return;
   }
-  db.transaction(() => {
+  if (!columnExists(db, table, column)) {
+    db.exec(alterSql);
+  }
+}
+
+function upgradeProjectDbToV2(db: Database.Database): void {
+  ensureColumn(
+    db,
+    "tasks",
+    "auto_start",
+    "ALTER TABLE tasks ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0,1))"
+  );
+  ensureColumn(
+    db,
+    "tasks",
+    "auto_merge_on_complete",
+    "ALTER TABLE tasks ADD COLUMN auto_merge_on_complete INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge_on_complete IN (0,1))"
+  );
+  ensureColumn(db, "tasks", "metadata_json", projectTaskMetadataMigration);
+  ensureColumn(
+    db,
+    "plan_revision_items",
+    "item_type",
+    "ALTER TABLE plan_revision_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'execution_task' CHECK (item_type IN ('execution_task','sub_plan'))"
+  );
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS plan_orchestration_state (
+      plan_task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+      lock_token TEXT,
+      lock_expires_at TEXT,
+      last_output_sha256 TEXT,
+      last_extracted_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+      last_approved_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE SET NULL,
+      last_approved_output_sha256 TEXT,
+      last_failed_output_sha256 TEXT,
+      last_error TEXT,
+      last_error_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );`
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_plan_orchestration_state_lock_expires_at ON plan_orchestration_state(lock_expires_at)");
+}
+
+function syncProjectMetadataSchemaVersion(db: Database.Database): void {
+  if (!tableExists(db, "project_metadata")) {
+    return;
+  }
+  db.prepare("UPDATE project_metadata SET schema_version = ?, updated_at = ?").run(PROJECT_DB_SCHEMA_VERSION, nowIso());
+}
+
+function runProjectMigrationsIfNeeded(db: Database.Database): void {
+  const userVersion = getUserVersion(db);
+  if (userVersion < 1) {
     db.exec(projectBaselineMigration);
-    if (!tableHasColumn(db, "tasks", "metadata_json")) {
-      db.exec(projectTaskMetadataMigration);
-    }
-    db.pragma(`user_version = ${PROJECT_DB_SCHEMA_VERSION}`);
-    if (tableExists(db, "project_metadata")) {
-      db.prepare("UPDATE project_metadata SET schema_version = ?, updated_at = ?").run(PROJECT_DB_SCHEMA_VERSION, nowIso());
-    }
-  })();
+    db.pragma("user_version = 1");
+  }
+  if (userVersion < 2) {
+    upgradeProjectDbToV2(db);
+    db.pragma("user_version = 2");
+  }
+  syncProjectMetadataSchemaVersion(db);
 }
 
 function ensureProjectMetadataTable(db: Database.Database): void {

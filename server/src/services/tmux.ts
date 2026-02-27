@@ -2,8 +2,25 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { logError } from "../utils/structuredLog.js";
 
 const execFileAsync = promisify(execFile);
+
+function clampText(input: unknown, max = 2000): string {
+  const text = String(input ?? "").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}...<truncated:${text.length - max}>`;
+}
+
+function quoteShellArg(value: string): string {
+  if (value.length === 0) return "''";
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function renderCommand(args: string[]): string {
+  return ["tmux", ...args].map(quoteShellArg).join(" ");
+}
 
 async function runTmux(args: string[], timeout = 15000): Promise<string> {
   const { stdout } = await execFileAsync("tmux", args, { timeout });
@@ -57,8 +74,27 @@ export async function createSession(params: {
   try {
     await execFileAsync("tmux", tmuxArgs, { timeout: 20000, env: params.env ?? process.env });
   } catch (error: any) {
-    const stderr = String(error?.stderr || "").trim();
-    throw new Error(stderr || "failed to create tmux session");
+    const tmuxCommand = renderCommand(tmuxArgs);
+    const stderr = clampText(error?.stderr);
+    const stdout = clampText(error?.stdout);
+    const baseReason = stderr || stdout || "failed to create tmux session";
+    const reason = `${baseReason}\nTmux command: ${tmuxCommand}`;
+    const metadata = {
+      socketPath: params.socketPath,
+      sessionName: params.sessionName,
+      cwd: params.cwd,
+      command: params.command,
+      args: params.args,
+      tmuxCommand,
+      exitCode: error?.code ?? null,
+      signal: error?.signal ?? null,
+      stderr,
+      stdout
+    };
+    logError("tmux.create_session.failed", metadata);
+    const wrapped = new Error(reason);
+    (wrapped as any).meta = metadata;
+    throw wrapped;
   }
 }
 
