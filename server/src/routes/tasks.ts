@@ -163,7 +163,7 @@ const workflowAssignmentSchema = z
   });
 
 const mergeLocks = new Set<string>();
-const TASK_DETAIL_INCLUDE_GIT_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_GIT_DEFAULT ?? "");
+const TASK_DETAIL_INCLUDE_GIT_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_GIT_DEFAULT ?? "1");
 const TASK_DETAIL_INCLUDE_HEAVY_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_HEAVY_DEFAULT ?? "");
 
 function queryBoolFlag(input: unknown, fallback: boolean): boolean {
