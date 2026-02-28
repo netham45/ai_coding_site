@@ -163,7 +163,6 @@ const workflowAssignmentSchema = z
   });
 
 const mergeLocks = new Set<string>();
-const TASK_DETAIL_INCLUDE_GIT_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_GIT_DEFAULT ?? "1");
 const TASK_DETAIL_INCLUDE_HEAVY_DEFAULT = /^(1|true|yes)$/i.test(process.env.AI_CODING_TASK_DETAIL_INCLUDE_HEAVY_DEFAULT ?? "");
 
 function queryBoolFlag(input: unknown, fallback: boolean): boolean {
@@ -1912,7 +1911,6 @@ tasksRouter.get("/nodes/:nodeId/workflow-status", (req, res) => {
 });
 
 tasksRouter.get("/tasks/:taskId", async (req, res) => {
-  const includeGitStatus = queryBoolFlag(req.query.includeGitStatus, TASK_DETAIL_INCLUDE_GIT_DEFAULT);
   const includeHeavy = queryBoolFlag(req.query.includeHeavy, TASK_DETAIL_INCLUDE_HEAVY_DEFAULT);
   const startedAt = process.hrtime.bigint();
   const scopedTask = getTaskAccessOrRespond(
@@ -1936,24 +1934,17 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   });
 
   let gitStatus: Awaited<ReturnType<typeof getWorkspaceGitStatus>> | null = null;
-  if (includeGitStatus) {
-    const gitStartedAt = process.hrtime.bigint();
-    try {
-      gitStatus = await getWorkspaceGitStatusCached(task.workspace_path);
-    } catch {
-      gitStatus = null;
-    }
-    logRouteStage("/tasks/:taskId", "git-status", gitStartedAt, {
-      taskId: task.id,
-      included: true,
-      available: Boolean(gitStatus)
-    });
-  } else {
-    logRouteStage("/tasks/:taskId", "git-status", startedAt, {
-      taskId: task.id,
-      included: false
-    });
+  const gitStartedAt = process.hrtime.bigint();
+  try {
+    gitStatus = await getWorkspaceGitStatusCached(task.workspace_path);
+  } catch {
+    gitStatus = null;
   }
+  logRouteStage("/tasks/:taskId", "git-status", gitStartedAt, {
+    taskId: task.id,
+    included: true,
+    available: Boolean(gitStatus)
+  });
   const visibilityStartedAt = process.hrtime.bigint();
   const visibility = buildAutomationVisibility(projectDb, task);
   logRouteStage("/tasks/:taskId", "automation-visibility", visibilityStartedAt, { taskId: task.id });
@@ -1975,7 +1966,6 @@ tasksRouter.get("/tasks/:taskId", async (req, res) => {
   });
   logRouteStage("/tasks/:taskId", "response", startedAt, {
     taskId: task.id,
-    includeGitStatus,
     includeHeavy
   });
 });
