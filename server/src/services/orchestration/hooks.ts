@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { legacyPlanOrchestrationPassOwnershipEnabled } from "../../config/featureFlags.js";
 
 export type OrchestrationHookName =
   | "on_node_created"
@@ -14,7 +13,6 @@ export type OrchestrationHookName =
 export type OrchestrationJobRequest = {
   jobType:
     | "task_queue_dispatch"
-    | "plan_orchestration_pass"
     | "evaluate_readiness"
     | "decompose"
     | "re_review"
@@ -93,7 +91,6 @@ function isChildWorkFinishedChange(context: EventContext): boolean {
 }
 
 function jobsForHook(hookName: OrchestrationHookName, context: EventContext): OrchestrationJobRequest[] {
-  const includeLegacyPlanOwnership = legacyPlanOrchestrationPassOwnershipEnabled();
   const taskScopedJobs: OrchestrationJobRequest[] =
     context.taskId && context.projectId && hookName !== "on_node_created"
       ? [
@@ -143,7 +140,7 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
   }
 
   if (hookName === "on_timer_tick") {
-    const jobs: OrchestrationJobRequest[] = [
+    return [
       {
         jobType: "task_queue_dispatch",
         idempotencyKey: buildKey("timer:task", context),
@@ -155,25 +152,13 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
       },
       ...taskScopedJobs
     ];
-    if (includeLegacyPlanOwnership) {
-      jobs.splice(1, 0, {
-        jobType: "plan_orchestration_pass",
-        idempotencyKey: buildKey("timer:plan", context),
-        debounceMs: TIMER_TICK_DEBOUNCE_MS,
-        dedupeWindowMs: TIMER_TICK_DEDUPE_MS,
-        projectId: context.projectId ?? null,
-        taskId: context.taskId ?? null,
-        payload: { hookName, eventType: context.eventType }
-      });
-    }
-    return jobs;
   }
 
   if (hookName === "on_node_output_updated") {
     const payloadObj = (context.payload && typeof context.payload === "object" ? (context.payload as Record<string, unknown>) : null) ?? {};
     const outputHash = typeof payloadObj.outputHash === "string" ? payloadObj.outputHash : stableValue(context.payload);
     const source = typeof payloadObj.source === "string" ? payloadObj.source : "unknown";
-    const jobs: OrchestrationJobRequest[] = [
+    return [
       {
         jobType: "task_queue_dispatch",
         idempotencyKey: buildKey(`hook:${hookName}:task:${source}:${outputHash}`, context),
@@ -184,21 +169,9 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
         payload: { hookName, eventType: context.eventType, outputHash, source }
       }
     ];
-    if (includeLegacyPlanOwnership) {
-      jobs.push({
-        jobType: "plan_orchestration_pass",
-        idempotencyKey: buildKey(`hook:${hookName}:plan:${source}:${outputHash}`, context),
-        debounceMs: OUTPUT_UPDATE_DEBOUNCE_MS,
-        dedupeWindowMs: OUTPUT_UPDATE_DEDUPE_MS,
-        projectId: context.projectId ?? null,
-        taskId: context.taskId ?? null,
-        payload: { hookName, eventType: context.eventType, outputHash, source }
-      });
-    }
-    return jobs;
   }
 
-  const jobs: OrchestrationJobRequest[] = [
+  return [
     {
       jobType: "task_queue_dispatch",
       idempotencyKey: buildKey(`hook:${hookName}:task`, context),
@@ -210,18 +183,6 @@ function jobsForHook(hookName: OrchestrationHookName, context: EventContext): Or
     },
     ...taskScopedJobs
   ];
-  if (includeLegacyPlanOwnership) {
-    jobs.splice(1, 0, {
-      jobType: "plan_orchestration_pass",
-      idempotencyKey: buildKey(`hook:${hookName}:plan`, context),
-      debounceMs: DEFAULT_DEBOUNCE_MS,
-      dedupeWindowMs: DEFAULT_DEDUPE_WINDOW_MS,
-      projectId: context.projectId ?? null,
-      taskId: context.taskId ?? null,
-      payload: { hookName, eventType: context.eventType }
-    });
-  }
-  return jobs;
 }
 
 function mapEventToHooks(eventType: string): OrchestrationHookName[] {

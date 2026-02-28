@@ -56,15 +56,17 @@ Preserve non-overlapping ownership and ensure each plan is independently testabl
 
 ## Structured Output Contract
 Return exactly two sections:
-1. Narrative decomposition rationale.
-2. Structured payload (YAML preferred) compliant with shared contract plus:
+1. `## Natural-language rationale`
+2. `## Structured payload`
+
+The `## Structured payload` section must be YAML (preferred) or JSON and compliant with the shared contract plus:
 
 ```yaml
 schema_version: "1.0"
 node:
   id: "<phase-id>"
   tier: phase
-  parent_id: "<epoch-id>"
+  parent_id: "<epic-id>"
   children_ids: ["<plan-id>"]
   status: awaiting_children
 

@@ -3,14 +3,12 @@ import { db as appDb, ensureLocalUser, resolveProjectDatabase } from "./db/index
 import { startIdeHeartbeat } from "./services/ide.js";
 import { startOrchestrationJobQueueWorker } from "./services/orchestration/jobQueue.js";
 import { startHierarchicalOrchestrationJobs } from "./services/orchestration/jobs/index.js";
-import { startPlanOrchestrationWorker } from "./services/planOrchestrator.js";
 import { startTaskQueueWorker } from "./services/queue.js";
 import { startRuntimeHeartbeat } from "./services/runtime.js";
 import { setupDiagnosticsProfiler } from "./services/diagnosticsProfiler.js";
 import { createIdeProxyGateway } from "./ws/ideProxyGateway.js";
 import { nowIso } from "./utils/time.js";
 import { createApp } from "./app.js";
-import { orchestrationWorkersEnabled } from "./config/featureFlags.js";
 
 const profiler = setupDiagnosticsProfiler();
 const app = createApp({ profiler });
@@ -29,13 +27,8 @@ server.listen(port, host, () => {
 startRuntimeHeartbeat().catch((error) => {
   console.warn(`Runtime heartbeat disabled: ${String((error as Error).message || error)}`);
 });
-if (orchestrationWorkersEnabled()) {
-  startOrchestrationJobQueueWorker();
-  startHierarchicalOrchestrationJobs();
-  startPlanOrchestrationWorker();
-} else {
-  console.log("Orchestration workers disabled by feature flag");
-}
+startOrchestrationJobQueueWorker();
+startHierarchicalOrchestrationJobs();
 startTaskQueueWorker();
 
 startIdeHeartbeat((taskId) => {

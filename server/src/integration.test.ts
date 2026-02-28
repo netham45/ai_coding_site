@@ -2557,114 +2557,102 @@ describe("integration: orchestration hooks and job queue", () => {
     assert.equal(handledCount, 1);
   });
 
-  test("workflow engine ownership disables legacy plan_orchestration_pass by default", async () => {
-    const previousLegacyPlanOwnership = process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
-    delete process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
-    try {
-      const userId = createUser();
-      const basePath = randomPath("output-monitor-cutover-default");
-      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
-      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
-      const taskId = insertTask({
-        projectDb,
+  test("material output updates enqueue workflow-owned task_queue_dispatch jobs", async () => {
+    const userId = createUser();
+    const basePath = randomPath("output-monitor-cutover-default");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Output Monitor Cutover",
+      status: "in_progress"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    const changed = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started\nWorking..."
+    });
+    assert.equal(changed.materialChanged, true);
+    if (changed.materialChanged) {
+      recordEvent({
         projectId,
-        userId,
-        title: "Output Monitor Cutover",
-        status: "in_progress"
-      });
-
-      let handledCount = 0;
-      registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
-        handledCount += 1;
-      });
-
-      const changed = observeNodeOutputMaterialChange({
-        projectDb,
         taskId,
-        source: "runtime_session",
-        rawOutput: "Plan step started\nWorking..."
+        eventType: "task.output.material_changed",
+        payload: {
+          source: changed.source,
+          outputHash: changed.outputHash,
+          previousOutputHash: changed.previousOutputHash
+        },
+        database: projectDb
       });
-      assert.equal(changed.materialChanged, true);
-      if (changed.materialChanged) {
-        recordEvent({
-          projectId,
-          taskId,
-          eventType: "task.output.material_changed",
-          payload: {
-            source: changed.source,
-            outputHash: changed.outputHash,
-            previousOutputHash: changed.previousOutputHash
-          },
-          database: projectDb
-        });
-      }
-
-      await runOrchestrationJobQueuePassForTests();
-      await new Promise((resolve) => setTimeout(resolve, 1_750));
-      await runOrchestrationJobQueuePassForTests();
-      assert.equal(handledCount, 0);
-    } finally {
-      process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = previousLegacyPlanOwnership;
     }
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
   });
 
   test("non-material output updates do not thrash orchestration hooks", async () => {
-    const previousLegacyPlanOwnership = process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
-    process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "1";
-    try {
-      const userId = createUser();
-      const basePath = randomPath("output-monitor");
-      const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
-      const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
-      const taskId = insertTask({
-        projectDb,
+    const userId = createUser();
+    const basePath = randomPath("output-monitor");
+    const projectId = createProject({ userId, basePath, cloneStatus: "ready" });
+    const projectDb = ensureProjectDb({ projectId, basePath, initializeIfMissing: true }).db;
+    const taskId = insertTask({
+      projectDb,
+      projectId,
+      userId,
+      title: "Output Monitor Task",
+      status: "in_progress"
+    });
+
+    let handledCount = 0;
+    registerOrchestrationJobHandler("task_queue_dispatch", async () => {
+      handledCount += 1;
+    });
+
+    const first = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started\nWorking..."
+    });
+    assert.equal(first.materialChanged, true);
+    if (first.materialChanged) {
+      recordEvent({
         projectId,
-        userId,
-        title: "Output Monitor Task",
-        status: "in_progress"
-      });
-
-      let handledCount = 0;
-      registerOrchestrationJobHandler("plan_orchestration_pass", async () => {
-        handledCount += 1;
-      });
-
-      const first = observeNodeOutputMaterialChange({
-        projectDb,
         taskId,
-        source: "runtime_session",
-        rawOutput: "Plan step started\nWorking..."
+        eventType: "task.output.material_changed",
+        payload: {
+          source: first.source,
+          outputHash: first.outputHash,
+          previousOutputHash: first.previousOutputHash
+        },
+        database: projectDb
       });
-      assert.equal(first.materialChanged, true);
-      if (first.materialChanged) {
-        recordEvent({
-          projectId,
-          taskId,
-          eventType: "task.output.material_changed",
-          payload: {
-            source: first.source,
-            outputHash: first.outputHash,
-            previousOutputHash: first.previousOutputHash
-          },
-          database: projectDb
-        });
-      }
-
-      const nonMaterial = observeNodeOutputMaterialChange({
-        projectDb,
-        taskId,
-        source: "runtime_session",
-        rawOutput: "Plan step started  \r\nWorking...\n"
-      });
-      assert.equal(nonMaterial.materialChanged, false);
-
-      await runOrchestrationJobQueuePassForTests();
-      await new Promise((resolve) => setTimeout(resolve, 1_750));
-      await runOrchestrationJobQueuePassForTests();
-      assert.equal(handledCount, 1);
-    } finally {
-      process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = previousLegacyPlanOwnership;
     }
+
+    const nonMaterial = observeNodeOutputMaterialChange({
+      projectDb,
+      taskId,
+      source: "runtime_session",
+      rawOutput: "Plan step started  \r\nWorking...\n"
+    });
+    assert.equal(nonMaterial.materialChanged, false);
+
+    await runOrchestrationJobQueuePassForTests();
+    await new Promise((resolve) => setTimeout(resolve, 1_750));
+    await runOrchestrationJobQueuePassForTests();
+    assert.equal(handledCount, 1);
   });
 
   test("watchdog enqueues stale-node readiness and re-review actions with event audit trail", async () => {
@@ -3657,7 +3645,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     }
   });
 
-  test("compatibility mode disables orchestration endpoints while preserving task workflows", async () => {
+  test("compatibility mode env no longer disables orchestration endpoints", async () => {
     const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
     process.env.ORCHESTRATION_COMPATIBILITY_MODE = "1";
     try {
@@ -3694,16 +3682,16 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
         assert.equal(taskDetails.json?.task?.id, taskId);
 
         const hierarchy = await localCallApi(`/api/projects/${projectId}/hierarchy`, { userId });
-        assert.equal(hierarchy.status, 404);
-        assert.equal(hierarchy.json?.code, "FEATURE_DISABLED");
+        assert.equal(hierarchy.status, 200);
+        assert.equal(Array.isArray(hierarchy.json?.hierarchy?.nodes), true);
 
         const nodeStart = await localCallApi(`/api/nodes/${taskId}/start`, {
           method: "POST",
           userId,
           body: {}
         });
-        assert.equal(nodeStart.status, 404);
-        assert.equal(nodeStart.json?.code, "FEATURE_DISABLED");
+        assert.equal(nodeStart.status, 200);
+        assert.equal(nodeStart.json?.started, true);
       } finally {
         await new Promise<void>((resolve) => {
           localServer.close(() => resolve());
@@ -3714,7 +3702,7 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
     }
   });
 
-  test("granular hierarchy/action feature flags can be disabled independently", async () => {
+  test("hierarchy/action env flags no longer disable orchestration APIs", async () => {
     const previousHierarchy = process.env.ORCHESTRATION_HIERARCHY_API_ENABLED;
     const previousActions = process.env.ORCHESTRATION_ACTIONS_API_ENABLED;
     const previousCompatibility = process.env.ORCHESTRATION_COMPATIBILITY_MODE;
@@ -3747,20 +3735,20 @@ describe("integration: hierarchical decomposition and readiness jobs", () => {
 
       try {
         const nodeDetails = await localCallApi(`/api/nodes/${taskId}`, { userId });
-        assert.equal(nodeDetails.status, 404);
-        assert.equal(nodeDetails.json?.code, "FEATURE_DISABLED");
+        assert.equal(nodeDetails.status, 200);
+        assert.equal(nodeDetails.json?.node?.id, taskId);
 
         const graph = await localCallApi(`/api/projects/${projectId}/dependency-graph`, { userId });
-        assert.equal(graph.status, 404);
-        assert.equal(graph.json?.code, "FEATURE_DISABLED");
+        assert.equal(graph.status, 200);
+        assert.equal(Array.isArray(graph.json?.graph?.nodes), true);
 
         const toggleAutoMode = await localCallApi(`/api/nodes/${taskId}/auto-mode`, {
           method: "POST",
           userId,
           body: { enabled: false }
         });
-        assert.equal(toggleAutoMode.status, 404);
-        assert.equal(toggleAutoMode.json?.code, "FEATURE_DISABLED");
+        assert.equal(toggleAutoMode.status, 200);
+        assert.equal(toggleAutoMode.json?.node?.id, taskId);
 
         const taskDetails = await localCallApi(`/api/tasks/${taskId}`, { userId });
         assert.equal(taskDetails.status, 200);

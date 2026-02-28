@@ -9,7 +9,7 @@ function expectPathSuffix(actualPath: string, expectedSuffix: string): void {
 }
 
 describe("orchestration prompt runtime", () => {
-  test("decompose jobs use decomposition templates by tier", () => {
+  test("decompose jobs route to tier templates and preserve epic/phase contracts", () => {
     const expected: Record<NodeTier, string> = {
       epoch: "prompts/epoch-to-phases.md",
       phase: "prompts/phase-to-plans.md",
@@ -24,6 +24,17 @@ describe("orchestration prompt runtime", () => {
       assert.equal(selected.tierTemplate.length > 0, true);
       expectPathSuffix(selected.coordinatorTemplatePath, "prompts/shared-input-output.md");
       assert.equal(selected.coordinatorTemplate.length > 0, true);
+
+      if (tier === "epoch") {
+        assert.match(selected.tierTemplate, /tier:\s*epic/i);
+        assert.match(selected.tierTemplate, /epic-to-phases:/i);
+        assert.match(selected.tierTemplate, /prompt-contract\.md/i);
+      }
+      if (tier === "phase") {
+        assert.match(selected.tierTemplate, /tier:\s*phase/i);
+        assert.match(selected.tierTemplate, /phase-to-plans:/i);
+        assert.match(selected.tierTemplate, /prompt-contract\.md/i);
+      }
     }
   });
 

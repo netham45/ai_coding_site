@@ -8,40 +8,9 @@ function boolFromEnv(name: string): boolean | undefined {
 }
 
 export function legacyPlanOrchestrationPassOwnershipEnabled(): boolean {
-  if (orchestrationCompatibilityModeEnabled()) {
-    return false;
-  }
   return boolFromEnv("ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED") ?? false;
 }
 
-export function orchestrationCompatibilityModeEnabled(): boolean {
-  return boolFromEnv("ORCHESTRATION_COMPATIBILITY_MODE") === true;
-}
-
 export function orchestrationLegacyJobOwnershipEnabled(): boolean {
-  if (orchestrationCompatibilityModeEnabled()) {
-    return true;
-  }
   return boolFromEnv("ORCHESTRATION_LEGACY_JOB_OWNERSHIP_ENABLED") === true;
-}
-
-export function orchestrationWorkersEnabled(): boolean {
-  if (orchestrationCompatibilityModeEnabled()) {
-    return false;
-  }
-  return boolFromEnv("ORCHESTRATION_WORKERS_ENABLED") ?? true;
-}
-
-export function orchestrationHierarchyApiEnabled(): boolean {
-  if (orchestrationCompatibilityModeEnabled()) {
-    return false;
-  }
-  return boolFromEnv("ORCHESTRATION_HIERARCHY_API_ENABLED") ?? true;
-}
-
-export function orchestrationActionsApiEnabled(): boolean {
-  if (orchestrationCompatibilityModeEnabled()) {
-    return false;
-  }
-  return boolFromEnv("ORCHESTRATION_ACTIONS_API_ENABLED") ?? true;
 }

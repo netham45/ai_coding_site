@@ -1,23 +1,9 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, test } from "node:test";
+import { describe, test } from "node:test";
 import { deriveOrchestrationJobsFromEvent } from "./hooks.js";
 
-const ORIGINAL_ENV = { ...process.env };
-
-function resetEnv() {
-  for (const key of Object.keys(process.env)) {
-    delete process.env[key];
-  }
-  Object.assign(process.env, ORIGINAL_ENV);
-}
-
 describe("orchestration hooks", () => {
-  afterEach(() => {
-    resetEnv();
-  });
-
-  test("node-created events default to workflow-engine ownership for plan orchestration", () => {
-    delete process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED;
+  test("task-created events enqueue workflow-engine dispatch job", () => {
     const jobs = deriveOrchestrationJobsFromEvent({
       eventType: "task.created",
       projectId: "project-1",
@@ -31,18 +17,17 @@ describe("orchestration hooks", () => {
     );
   });
 
-  test("rollback flag re-enables legacy plan_orchestration_pass ownership", () => {
-    process.env.ORCHESTRATION_LEGACY_PLAN_ORCHESTRATION_PASS_ENABLED = "true";
+  test("plan-created events enqueue workflow-engine dispatch job", () => {
     const jobs = deriveOrchestrationJobsFromEvent({
-      eventType: "task.created",
+      eventType: "plan.created",
       projectId: "project-1",
-      taskId: "task-1",
+      taskId: "plan-1",
       payload: { any: "value" }
     });
 
     assert.deepEqual(
       jobs.map((job) => job.jobType),
-      ["task_queue_dispatch", "plan_orchestration_pass"]
+      ["task_queue_dispatch"]
     );
   });
 });
